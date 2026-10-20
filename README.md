@@ -1,0 +1,244 @@
+# BeatSync
+
+![icon](assets/icon.svg)
+
+把音乐批量转成你需要的速度。
+
+[English](README.en.md) | 中文
+
+- **跑者**：让音乐适配你的步频，每一步都踩在节拍上。
+- **乐手**：按指定 BPM 练习基本功时可以听着音乐；可以精确调整音乐 BPM
+
+BeatSync 避免大幅度改变音乐速度——**节拍器恒定以目标速度打拍，音乐只做最小幅度的变速。**
+
+## 变速逻辑详解
+
+把音乐挪到目标速度的 **1/n 倍或 n 倍**（n 为整数）
+
+1. **测速**：检测原速 A（或手动指定）。
+2. **选方案**：在所有候选里选使变速幅度最小方案行动。
+3. **守上限**：速度变化必须落在允许区间内，否则换方向；两个方向都超上限则跳过。
+
+### 示例
+
+目标 180 BPM，默认上限：放慢 20%、加快 50%（可调整）
+
+| 原速 | 结果                                |
+| ---- | ----------------------------------- |
+| 60   | 音乐 60 **不变速**，每拍敲 3 下     |
+| 85   | 音乐 90（+5.9%），每拍敲 2 下       |
+| 100  | 音乐 90（−10%），每拍敲 2 下        |
+| 120  | 音乐 180（+50%），每拍敲 1 下       |
+| 360  | 音乐 360 **不变速**，每 2 拍敲 1 下 |
+
+## 优势一览
+
+- **最小变速**：音乐只被挪到与目标速度成简单倍率（n 倍或 1/n 倍，n 为整数）的位置上，在保证节拍顺耳的前提下选择最小变速策略。
+- **加速 / 减速上限可选**：分别设定"最多放慢""最多加快"多少，超出上限的音乐宁可不处理，也不硬拉崩坏听感。
+- **精准测速 + 节拍器不漂移**：测速用自相关与梳状网格精修，稳定速度的歌曲能精确到 0.1 BPM 量级；节拍器不是按固定间隔机械叠加，而是直接落在音乐自己的节拍时间轴上，因此不会越敲越偏、错拍。
+- **音色可选、相对音量可选**：六种打击音色可试听挑选，音量按歌曲自身响度自动匹配、相对大小可调。
+- **批量处理：**批量操作，一键出歌。
+- **多种输出格式：**可选  WAV / MP3 / FLAC
+- **保持文件夹层级**：批量处理整个曲库时，输出目录完整镜像输入的文件夹结构，不会把所有歌堆成一层；不需要时可在界面上关掉（关掉后平铺在输出目录根部）。
+- **界面中英双语**：右上角"中 / EN"按钮一键切换
+
+## 安装要求
+
+| 项目 | 要求 |
+| --- | --- |
+| 系统 | **Windows 10（1803 及以上）或 Windows 11，64 位**（推荐，安装版适用）；Windows 7 / 8.1 从源码运行可用命令行与 tkinter 界面 |
+| 运行时 | **WebView2 运行时**（Win10/11 通常自带或随系统更新装上）与 **.NET Framework 4.x**（Win10/11 自带） |
+| 磁盘 | 安装后约 **700 MB**（含全部依赖；安装程序本身约 150 MB） |
+| 内存 | 4 GB 以上即可，处理超长音频时建议 8 GB |
+| 网络 | **安装与使用全程不需要联网** |
+| Python | **用安装程序不需要装 Python**；从源码运行需要 **Python 3.11+** |
+
+各平台可用情况：
+
+| 平台 | 命令行（`tempo_converter.py`） | 图形界面 |
+|---|---|---|
+| Windows 10 / 11 | 可用（**需从源码运行**） | 完整可用（安装版，推荐） |
+| Windows 7 / 8.1 | 可用（**需从源码运行**） | 桌面版起不来（缺 WebView2），tkinter 版可用 |
+| macOS / Linux | 可用（**需从源码运行**） | 需少量移植（当前界面代码含 Windows 专属调用） |
+
+> 安装版只提供 Windows 图形界面，且**不含命令行**——表中"命令行"一列都指从源码运行。
+> 安装版本身按 **Windows 10（1803 及以上）/ Windows 11 64 位**编译，老系统与其它平台请走源码。
+
+- **命令行与核心算法（测速、变速、节拍器、批量、CSV 报告）本身跨平台**：只依赖 librosa / soundfile / numpy / scipy，这些在各平台都有官方 wheel，装好即可跑。
+- **图形界面目前按 Windows 写**，搬到 macOS / Linux 需替换几处平台相关调用：桌面壳里"打开所在文件夹"用了 `explorer /select`（mac 换 `open -R`、Linux 换 `xdg-open`）、tkinter 版用了 `windll.shcore.SetProcessDpiAwareness` 与 `.ico` 图标。pywebview 框架本身跨平台（mac 走 Cocoa、Linux 走 GTK/Qt），所以只是替换几处判断，不是重写界面。**本仓库提供的是 Windows 源码，非 Windows 现成可用的入口是命令行。**
+
+- **推荐 Windows 10（1803 及以上）或 Windows 11**：桌面版需要 WebView2 运行时（新版系统通常自带或自动更新带上）与 .NET Framework 4.x（Win10/11 自带）。
+- **Windows 7 / 8.1**：从源码运行命令行或 tkinter 界面可用；pywebview 桌面版因 WebView2 不支持老系统，基本无法启动。
+
+---
+
+## 快速开始
+
+### 安装版（推荐，普通用户）
+
+下载 `BeatSyncSetup.exe`，一路下一步装完，桌面和开始菜单会自动生成快捷方式；
+默认装到 `C:\Users\<你>\AppData\Local\Programs\BeatSync`。
+安装时可勾选是否创建桌面快捷方式，程序目录里同时带中英文说明文档（`README.md` / `README.en.md`）与许可证（`LICENSE`）。
+
+**注意 `BeatSyncSetup.exe` 的存放路径不得含有中文**，只能含有英文、数字、符号——
+放在含中文的文件夹里双击会没有任何反应（静默退出），挪到纯英文路径即可。
+
+**安装版提供什么**：两个图形界面（桌面版 + 兼容界面），全部转换功能都在界面里操作，
+不需要装 Python、不需要联网、不需要命令行。
+
+### 从源码运行（开发者）
+
+需要 **Python 3.11+**：
+
+```bash
+pip install -r requirements.txt
+python tempo_converter_app.py
+```
+
+Windows 上也可以直接双击 `BeatSync.bat`（这是**源码仓库**里的启动脚本，随源码一起提供，安装版里没有）。
+
+界面语言默认中文，右上角"中 / EN"按钮可切到英文，详见[界面语言](#界面语言)。
+
+### 两个界面：桌面版与兼容界面
+
+**安装版内置两套界面，转换功能完全一样**（同一套核心代码，参数与控制项一一对应），只是外观不同：
+
+| 界面 | 依赖 | 说明 |
+| --- | --- | --- |
+| **桌面版**（默认） | 需要 WebView2 与 .NET | 界面更完整更好看 |
+| **兼容界面**（tkinter） | **都不需要** | 外观朴素，但在缺少 WebView2 / .NET 的机器上照样能跑 |
+
+### 桌面版打不开时，怎么进兼容界面
+
+桌面版依赖 WebView2 与 .NET（pythonnet），少数机器上会因为这两个组件缺失或加载被拒而启动失败
+（典型报错 `Win32Exception: 拒绝访问`，错误会写进程序目录的 `app_error.log`）。
+
+**桌面版一旦打不开，界面里的任何按钮都点不到**——所以要**从开始菜单直接进兼容界面**：
+
+1. 点开始菜单（或按 `Win` 键），在应用列表里找到 **BeatSync（兼容界面）** 并点击。
+2. **双击安装目录里的 `BeatSync-Compatibility.bat`**（最简单，推荐）。
+
+桌面版能正常打开时，主界面底部还有一个"改用兼容界面"的入口，想切过去点一下即可。
+
+**从源码运行时**（不装安装包）直接跑 tkinter 版：
+
+```bash
+python tempo_converter_gui.py        # 直接跑 tkinter 版
+python tempo_converter_app.py --tk   # 让主程序改走 tkinter
+```
+
+---
+
+## 命令行（仅源码运行）
+
+> **安装版没有命令行入口。** 安装出来的 `BeatSync.exe` 是图形界面程序，
+> 不接受命令行参数、也不会往控制台输出（双击和带参数启动都只会打开界面）。
+> 想用命令行，请按[从源码运行](#从源码运行开发者)装好 Python 与依赖后，在源码目录里执行下面的命令。
+
+图形界面之外也提供完整的命令行入口。
+
+```bash
+# 转到 180 BPM
+python tempo_converter.py song.mp3 -t 180
+
+# 加木鱼节拍器
+python tempo_converter.py song.mp3 -t 180 --metronome woodblock
+
+# 批量转换整个文件夹（含子目录）
+python tempo_converter.py ./music -t 180 --recursive
+
+# 统一输出目录（保留原文件夹层级）
+python tempo_converter.py ./music -t 180 --recursive -o D:\out
+
+# 同上但全部平铺
+python tempo_converter.py ./music -t 180 --recursive -o D:\out --no-mirror-dirs
+
+# 自定义变速上限
+python tempo_converter.py song.mp3 -t 180 --max-slowdown 15 --max-speedup 30
+
+# 只测速，不转换
+python tempo_converter.py song.mp3 --detect-only
+
+# 手动指定原速，跳过检测
+python tempo_converter.py song.flac -t 90 --bpm 88
+
+# 精确拉伸到目标速度
+python tempo_converter.py song.mp3 -t 180 --strict
+```
+
+默认中文输出；加 `--lang en` 可让命令行输出与报告全部改用英文。
+全部参数见 `python tempo_converter.py --help`（中文）或 `--lang en --help`（English）。
+
+### 参数速查
+
+| 参数 | 说明 |
+|---|---|
+| `-t, --target` | 目标 BPM（`--detect-only` 时可省略） |
+| `--bpm` | 手动指定原速，跳过自动检测 |
+| `--detect-only` | 只检测速度，不转换 |
+| `--strict` | 精确拉伸到目标 BPM（不做倍率关系，变速可能很大） |
+| `--metronome` | 添加节拍器并选择音色（默认不添加） |
+| `--click-rel-db` | 节拍器相对音量（dB），默认 −6 |
+| `--engine` | `phasevocoder` 保音高（默认）或 `resample` 磁带机式 |
+| `--format` | `source`（默认，与原文件相同）/ `wav` / `mp3` / `flac` / `ogg` |
+| `-o, --out-dir` | 输出目录（默认各文件所在目录的 `tempo_converted/`） |
+| `--no-mirror-dirs` | 指定输出目录时不镜像层级，全部平铺 |
+| `--recursive` | 递归搜索子文件夹 |
+| `--report` | CSV 报告路径（默认当前目录 `conversion_report.csv`） |
+| `--max-slowdown` | 最多放慢百分比，默认 20 |
+| `--max-speedup` | 最多加快百分比，默认 50 |
+
+---
+
+## 输出说明
+
+**命名**：`原名_目标bpm.扩展名`（例：`song_180bpm.wav`），重名时依次加 `_1`、`_2`、`_3`。
+
+**位置**：默认输出到各文件所在目录的 `tempo_converted/`；
+用 `-o` 指定统一目录后按输入层级镜像。
+
+**报告**：CSV 格式，默认写到当前目录 `conversion_report.csv`。
+
+---
+
+## 项目结构
+
+**这是源码仓库的结构**（从源码运行或二次开发时看到的文件）。
+安装版不会释放这些 `.py` 文件——它只有一个 `BeatSync.exe`、一个 `_internal\` 目录，
+外加 `README.md`、`README.en.md`、`LICENSE` 和 `assets\`。
+
+```
+tempo_converter.py        核心：测速 / 选方案 / 变速 / 节拍器 / 批量 / 报告；CLI 入口
+tempo_converter_app.py    桌面外壳：pywebview 窗口 + JS 桥 + 拖拽 + 冒烟测试
+tempo_converter_gui.py    tkinter 备选界面
+frontend/                 index.html + app.css + app.js（无外部依赖）
+BeatSync.bat              Windows 双击启动（源码专用，安装版没有）
+assets/                   图标源文件 icon.svg（界面与安装程序共用）
+requirements.txt          Python 依赖
+LICENSE                   MIT 许可证
+```
+
+依赖：librosa、soundfile、numpy、scipy、pywebview（**只有从源码运行才需要装**；安装版已把它们打包在内）。
+
+---
+
+## 界面语言
+
+图形界面**默认中文**，右上角"中 / EN"按钮（在日/夜间模式按钮左侧）可在中英文之间一键切换。
+
+- **切换范围**：界面上的全部文案——文件名列、参数标签、速度上限提示、音色名（Beep / Woodblock / Cowbell / Click / Sidestick / Clap）、按钮、进度与结果提示、弹窗提示。
+- **按钮自身提示**：中文界面下按钮显示"中 / EN"并把鼠标提示指向"切换到 English"，英文界面下反过来。
+- 桌面版切换语言后，**日志、结果备注、节拍关系、CSV 报告**都由后端按同一语言生成，英文界面不会露出中文。
+- **tkinter 备选界面**同样带右上角"中 / EN"按钮：切换即重建界面，已添加的文件与所有参数原样保留。转换参数与桌面版对齐：有"保持原来的文件夹层级"复选框（没填输出目录时自动置灰）、"最多放慢 / 最多加快"两个上限输入框（0–100，默认 20 / 50）、节拍器相对音量除滑块外还有可直接输入 dB 数值的输入框，均实时同步。
+- **命令行**（仅源码运行）默认中文；加 `--lang en`（或设环境变量 `BEATSYNC_LANG=en`）可让运行输出与 CSV 报告全部改用英文。`--lang` 只改显示语言，不影响任何算法行为。
+
+---
+
+## 许可证
+
+本项目基于 **MIT 许可证**发布，完整条款见 [LICENSE](LICENSE)。
+
+简单说：你可以自由使用、修改、分发本软件（包括商用），只需在副本或重要部分中保留版权声明与许可证原文；软件按"现状"提供，不含任何担保。
+
+第三方依赖（librosa、soundfile、numpy、scipy、pywebview 等）各自遵循其自身许可证，详见 `requirements.txt` 中列出的各个项目。
+

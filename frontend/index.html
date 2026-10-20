@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BeatSync</title>
+<link rel="icon" type="image/png" href="../assets/icon.png">
+<link rel="stylesheet" href="app.css">
+<script>
+/* 主题：只有日间/夜间两态，**默认日间**（2026-10-13 用户要求删掉"跟随系统"）。
+   这里必须内联执行，否则会先按默认色渲染一帧再切换（闪白/闪黑）。 */
+try {
+  var _t = localStorage.getItem("tmc-theme");
+  /* 兼容老用户：以前存过 "system"，一律当 light */
+  if (_t !== "dark") _t = "light";
+  document.documentElement.dataset.theme = _t;
+  document.documentElement.dataset.themeMode = _t;
+} catch (e) {
+  document.documentElement.dataset.theme = "light";
+  document.documentElement.dataset.themeMode = "light";
+}
+/* 语言：界面默认中文，可切英文。同样内联执行——必须在静态文案渲染前
+   盖好 data-lang，否则会先闪一帧中文。 */
+try {
+  var _l = localStorage.getItem("tmc-lang");
+  document.documentElement.dataset.lang = (_l === "en") ? "en" : "zh";
+} catch (e) {
+  document.documentElement.dataset.lang = "zh";
+}
+</script>
+</head>
+<body>
+
+<div id="dropOverlay" class="drop-overlay" aria-hidden="true">
+  <div class="drop-box">
+    <svg viewBox="0 0 24 24" width="42" height="42" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    <p data-t="drop">松开以添加文件 / 文件夹</p>
+  </div>
+</div>
+
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">
+        <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-linecap="round" aria-hidden="true">
+          <circle cx="9.5" cy="10" r="2.1" fill="currentColor" stroke="none"/>
+          <circle cx="9.5" cy="10" r="4.6" stroke-width="1.6" opacity=".9"/>
+          <circle cx="9.5" cy="10" r="7.4" stroke-width="1.3" opacity=".45"/>
+          <path d="M17.6 7.2 L21.4 10 L17.6 12.8 Z" fill="currentColor" stroke="none"/>
+          <circle cx="5.6" cy="19.6" r="1.5" fill="currentColor" stroke="none"/>
+          <circle cx="9.6" cy="19.6" r="1.1" fill="currentColor" stroke="none" opacity=".7"/>
+          <circle cx="13" cy="19.6" r=".8" fill="currentColor" stroke="none" opacity=".45"/>
+        </svg>
+      </span>
+      <h1>BeatSync</h1>
+    </div>
+    <div class="top-right">
+      <span id="modeBadge" class="badge warn hidden" data-t="badgeMock">浏览器预览模式</span>
+      <span id="bridgeStatus" class="conn"><i class="dot"></i><span>连接后端中…</span></span>
+      <button id="btnLang" class="icon-btn lang-btn" type="button" title="界面语言：中文" data-title-zh="界面语言：中文（点击切换到英文）" data-title-en="Language: English (click to switch to 中文)">中 / EN</button>
+      <button id="btnTheme" class="icon-btn" type="button" title="切换日间 / 夜间模式" data-title-zh="切换日间 / 夜间模式" data-title-en="Toggle light / dark mode">
+        <svg id="iconSun" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+        <svg id="iconMoon" class="hidden" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="main">
+    <!-- 左：文件 -->
+    <section class="card files-card">
+      <div class="card-head">
+        <h2><span data-t="cardFiles">文件</span> <span id="fileCount" class="count">0</span><span id="selCount" class="count sel hidden" data-t="selPrefix">已选 0</span></h2>
+        <div class="btn-row">
+          <button id="btnSelectAll" class="btn ghost sm" disabled data-t="selectAll">全选</button>
+          <button id="btnDelSel" class="btn ghost sm" disabled data-t="delSelected">删除选中</button>
+          <button id="btnClearDone" class="btn ghost sm" disabled data-t="clearDone">清除已处理</button>
+          <button id="btnAddFiles" class="btn ghost sm" disabled data-t="addFiles">＋ 添加文件</button>
+          <button id="btnAddFolder" class="btn ghost sm" disabled data-t="addFolder">＋ 添加文件夹</button>
+        </div>
+      </div>
+      <div id="dropZone" class="dropzone" tabindex="-1">
+        <div id="emptyState" class="empty">
+          <svg viewBox="0 0 24 24" width="44" height="44" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+          <p data-t="emptyTitle">拖入音频文件 / 文件夹</p>
+          <span data-t="emptyHint">或点击右上角按钮添加（wav · mp3 · flac · ogg · m4a 等）</span>
+        </div>
+        <ul id="fileList" class="file-list"></ul>
+      </div>
+    </section>
+
+    <!-- 右：设置 -->
+    <section class="card settings-card">
+      <div class="card-head"><h2 data-t="cardSettings">转换设置</h2></div>
+      <div class="settings-body">
+
+        <!-- 第 1 行：目标速度 + 原速 -->
+        <div class="grid2">
+          <div class="field">
+            <label><span data-t="labelTarget">目标速度</span> <em>BPM</em></label>
+            <div class="stepper">
+              <button id="bpmMinus" type="button" aria-label="减少" data-aria-zh="减少" data-aria-en="Decrease">−</button>
+              <input id="targetBpm" type="number" min="20" max="300" step="0.1" value="180">
+              <button id="bpmPlus" type="button" aria-label="增加" data-aria-zh="增加" data-aria-en="Increase">＋</button>
+            </div>
+          </div>
+          <div class="field">
+            <label><span data-t="labelSource">原速</span> <em>BPM</em> <span class="hint" data-t="hintAuto">留空 = 自动检测</span></label>
+            <input id="manualBpm" class="text-in" type="number" min="20" max="300" step="0.1"
+                   placeholder="自动检测" data-ph-zh="自动检测" data-ph-en="Auto-detect" autocomplete="off">
+          </div>
+        </div>
+
+        <!-- 第 2 行：变速上限两个输入框 -->
+        <div class="field">
+          <label><span data-t="labelLimit">变速上限</span> <em>%</em></label>
+          <div class="grid2">
+            <div class="inl">
+              <span class="inl-label" data-t="labelMaxSlow">最多放慢</span>
+              <input id="maxSlowdown" class="text-in num" type="number" min="0" max="100" step="1" value="20">
+              <span class="inl-unit">%</span>
+            </div>
+            <div class="inl">
+              <span class="inl-label" data-t="labelMaxFast">最多加快</span>
+              <input id="maxSpeedup" class="text-in num" type="number" min="0" max="100" step="1" value="50">
+              <span class="inl-unit">%</span>
+            </div>
+          </div>
+          <p id="limitHint" class="hint-line">最多放慢 20% · 最多加快 50%</p>
+        </div>
+
+        <!-- 第 3 行：变速方式 -->
+        <div class="field">
+          <div class="inl-head">
+            <label data-t="labelEngine">变速方式</label>
+            <label class="switch sm"><input id="detectOnly" type="checkbox"><i></i><span data-t="detectOnly">只测速</span></label>
+          </div>
+          <div class="segmented" id="engineSeg">
+            <button type="button" data-v="phasevocoder" class="on"><span data-t="enginePv">保音高</span><span data-t="enginePvSub">变速不变调</span></button>
+            <button type="button" data-v="resample"><span data-t="engineRs">磁带机式</span><span data-t="engineRsSub">变速变调</span></button>
+          </div>
+        </div>
+
+        <!-- 第 4 行：输出类型 -->
+        <div class="field">
+          <label data-t="labelFormat">输出类型</label>
+          <div class="segmented" id="formatSeg">
+            <button type="button" data-v="source" class="on"><span data-t="formatSource">原类型</span><span data-t="formatSourceSub">与输入相同</span></button>
+            <button type="button" data-v="wav">WAV</button>
+            <button type="button" data-v="mp3">MP3</button>
+            <button type="button" data-v="flac">FLAC</button>
+          </div>
+        </div>
+
+        <!-- 第 5 行：输出目录（与输出类型分开，避免挤在一起） -->
+        <div class="field">
+          <div class="inl-head">
+            <label data-t="labelOutDir">输出目录</label>
+            <button id="btnOutDir" class="btn ghost sm" type="button" data-t="choose">选择…</button>
+            <button id="btnOutDirReset" class="btn ghost sm hidden" type="button" data-t="restoreDefault">恢复默认</button>
+          </div>
+          <p id="outDirInfo" class="hint-line">默认输出到各文件所在目录的 tempo_converted /</p>
+          <label class="switch sm" id="mirrorWrap"><input id="mirrorDirs" type="checkbox" checked><i></i><span data-t="mirrorDirs">保持原来的文件夹层级</span></label>
+        </div>
+
+        <!-- 第 6 行：节拍器 -->
+        <div class="field metro">
+          <label class="switch lg"><input id="metronome" type="checkbox" checked><i></i><span data-t="metronome">添加节拍器</span></label>
+          <div id="metroPanel" class="metro-panel disabled">
+            <div class="timbres" id="timbres"></div>
+            <div class="inl">
+              <span class="inl-label" data-t="labelRelVol">相对音量</span>
+              <input id="clickRelDb" class="text-in num" type="number" min="-20" max="12" step="1" value="-6">
+              <span class="inl-unit">dB</span>
+              <span class="hint" data-t="hintEq">0 = 与音乐等响</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+  </main>
+
+  <!-- 操作栏 -->
+  <section class="actions card">
+    <button id="btnStart" class="btn primary big" disabled data-t="start">开始处理</button>
+    <button id="btnStop" class="btn danger big" disabled data-t="stop">停止</button>
+    <div class="progress-wrap">
+      <div class="progress-text"><span id="progressLabel" data-t="ready">就绪</span><span id="progressCount"></span></div>
+      <div class="progress"><div id="progressBar" class="bar"></div></div>
+    </div>
+    <button id="btnOpenReport" class="btn ghost sm hidden" data-t="openReport">打开报告</button>
+  </section>
+
+  <!-- 日志 -->
+  <section class="logcard collapsed" id="logCard">
+    <button id="logToggle" class="log-head" type="button">
+      <svg class="chev" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+      <span data-t="logTitle">处理日志</span>
+    </button>
+    <pre id="log" class="log-body"></pre>
+  </section>
+
+  <!-- 兼容界面入口：tkinter 版功能一致、不依赖 .NET / WebView2。
+       放在页面底部，避免用户只能从开始菜单里翻到它。 -->
+  <footer class="appfoot">
+    <span data-t="tkHint">界面显示异常？</span>
+    <button id="btnTk" class="linklike" type="button" data-t="tkOpen">改用兼容界面</button>
+  </footer>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>

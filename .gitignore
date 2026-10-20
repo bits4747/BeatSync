@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行过程产生的临时产物（输出目录、报告、日志、缓存）
+_out_*/
+_rep_*.csv
+_ck*/
+_ck*.out
+conversion_report.csv
+gui_trace.log
+app_error.log
+_smoke_result.json
+
+# numba JIT 缓存（首次运行自动重建）
+_ncache/
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

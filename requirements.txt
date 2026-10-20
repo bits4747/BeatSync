@@ -1,0 +1,5 @@
+librosa>=0.10
+soundfile>=0.12
+numpy
+scipy
+pywebview>=5.1
