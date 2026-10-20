@@ -204,6 +204,123 @@ def test_i18n_placeholder_parity():
     assert not bad, f"占位符中英不一致：{bad[:5]}"
 
 
+# ---------------------------------------------------------------- 分段变速
+
+def _accent_track(bpm: float, dur: float, sr: int = SR, offset: float = 0.0,
+                  acc: int = 4, n: int | None = None) -> np.ndarray:
+    """分段用合成点击轨：每 acc 拍一次 1200Hz 强击、其余 500Hz 弱击（与
+    _dev 回归同源；重音型保证变点检测能在两段交界处看到档位跳变）。
+    n 给定总样本数（两段共用一根时间轴），offset 是该段起点。"""
+    n = int(sr * dur) if n is None else n
+    y = np.zeros(n, dtype=np.float32)
+    period = 60.0 / bpm
+    t, k = 0.0, 0
+    while t < dur - period * 0.5:
+        i = int((t + offset) * sr)
+        L = int(0.05 * sr)
+        if 0 <= i < n - L:
+            env = np.exp(-np.linspace(0, 1, L) * 9)
+            strong = (k % acc == 0)
+            freq = 1200.0 if strong else 500.0
+            amp = 1.0 if strong else 0.5
+            y[i:i + L] += (amp * env * np.sin(2 * np.pi * freq * np.linspace(0, L / sr, L))).astype(np.float32)
+        t += period
+        k += 1
+    return y
+
+
+def _two_section_track(sr: int = SR, half: float = 10.0):
+    """前 half 秒 100 BPM、后 half 秒 140 BPM（同一根时间轴上相接），归一到 0.9。"""
+    n = int(sr * 2 * half)
+    y = (_accent_track(100.0, half, sr, offset=0.0, n=n)
+         + _accent_track(140.0, half, sr, offset=half, n=n))
+    return 0.9 * y / max(1e-9, float(np.max(np.abs(y)))), half
+
+
+def test_segments_split_changing_track():
+    """曲内 100→140 变拍必须被切开，且边界误差不超过 1 秒。"""
+    y, half = _two_section_track()
+    segs = tc.detect_tempo_segments(y, SR)
+    assert len(segs) >= 2, f"应当切出多段，实际 {len(segs)} 段"
+    edges = [s[0] for s in segs[1:]]
+    assert min(abs(e - half) for e in edges) <= 1.0, f"边界 {[round(e,2) for e in edges]} 偏离 {half}s 超过 1s"
+
+
+def test_segments_keep_steady_track_whole():
+    """恒速曲不得误切：整曲只有一段（= 不做分段、走默认路径）。"""
+    y = _accent_track(120.0, 24.0)
+    segs = tc.detect_tempo_segments(y, SR)
+    assert len(segs) == 1, f"恒速曲不应分段，实际 {len(segs)} 段: {segs}"
+
+
+def test_segment_plans_each_within_limits():
+    """每段各按最小变速规则出方案：rate 必须落在用户上下限内，倍率档互相独立。"""
+    y, _ = _two_section_track()
+    plans = tc._segment_plans(y, SR, 180.0, False,
+                              tc.DEFAULT_MAX_SLOWDOWN, tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+    real = [p for p in plans if p[2] is not None]
+    assert len(real) >= 2, "两段曲应得到两份方案"
+    for (_t0, _t1, sp) in real:
+        lo = 1.0 - tc.DEFAULT_MAX_SLOWDOWN
+        hi = 1.0 + tc.DEFAULT_MAX_SPEEDUP
+        assert lo - 1e-9 <= sp.plan.rate <= hi + 1e-9, f"rate {sp.plan.rate} 越界"
+        assert abs(sp.plan.click_bpm - 180.0) < 1e-6, "节拍器恒以目标速度发声"
+
+
+def test_segment_stitch_seam_is_quiet():
+    """拼接关：接缝处的一阶差分不得超过音乐自身最强瞬态（评分 ≤1 = 听不出爆音）。
+
+    评分口径：|diff(out)| 在接缝 ±0.15 s 内的最大值 ÷ 距接缝 0.5 s 以外的全局最大值。
+    段自身瞬态（鼓点）天然就是全曲最大跳变，所以分母用「离接缝远处的全局最大值」，
+    不能用分位数——合成曲每段起点是重音，硬切时接缝正砸在重音上（对照见 _dev 原型）。
+    """
+    y, _ = _two_section_track()
+    plans = [p for p in tc._segment_plans(y, SR, 180.0, False,
+                                          tc.DEFAULT_MAX_SLOWDOWN,
+                                          tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+             if p[2] is not None]
+    assert len(plans) >= 2
+    y2 = np.stack([y, y]).astype(np.float32)      # 主干接口是 (声道, 采样)
+    out, origins, _ht, _sc = tc._stitch_segments(y2, SR, plans, "phasevocoder")
+    d = np.abs(np.diff(out, axis=1)).max(axis=0)   # 沿时间轴；声道轴的 diff 是电平差
+    times = np.arange(len(d)) / SR
+    for i in range(1, len(plans)):
+        c0 = origins[i]
+        near, far = np.abs(times - c0) <= 0.15, np.abs(times - c0) > 0.5
+        assert far.any()
+        score = float(d[near].max()) / max(float(d[far].max()), 1e-9)
+        assert score <= 1.0, f"接缝 {c0:.2f}s 评分 {score:.2f} > 1：爆音超过音乐自身瞬态"
+
+
+def test_segment_metronome_follows_each_section():
+    """节拍器关：输出音乐自己的每个拍点都必须有点击落在上面（跨段不错拍）。"""
+    y, _ = _two_section_track()
+    plans = [p for p in tc._segment_plans(y, SR, 180.0, False,
+                                          tc.DEFAULT_MAX_SLOWDOWN,
+                                          tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+             if p[2] is not None]
+    assert len(plans) >= 2
+    y2 = np.stack([y, y]).astype(np.float32)
+    out, origins, _ht, _sc = tc._stitch_segments(y2, SR, plans, "phasevocoder")
+    worst = 0.0
+    for i, (_t0, _t1, sp) in enumerate(plans):
+        dur_out = float((_t1 - _t0) / sp.plan.rate) + 0.5
+        clicks = np.asarray(tc.click_schedule(sp.beats, sp.plan.rate, sp.plan.click_bpm,
+                                              dur_out,
+                                              clicks_per_beat=sp.plan.clicks_per_beat))
+        beats_out = origins[i] + sp.beats / sp.plan.rate
+        for b in beats_out:
+            if 0 <= b <= out.shape[1] / SR and clicks.size:
+                worst = max(worst, float(np.min(np.abs(origins[i] + clicks - b))))
+    # 拉伸后拍点会有 ~1 个相位窗的量化偏差；0.1 s 是「明显错拍」和「跟得上」的分界
+    assert worst < 0.1, f"最坏拍点-点击偏差 {worst * 1000:.1f}ms：跨段错拍"
+
+
+def test_segmented_options_default_off():
+    """硬约束：分段是 opt-in，默认值必须是 False（默认路径行为完全不变）。"""
+    assert tc.ConvertOptions().segments is False
+
+
 # ---------------------------------------------------------------- 极简 runner
 
 if __name__ == "__main__":

@@ -658,6 +658,243 @@ def _regular_grid(beat_times, P: float, phase: float, duration: float):
     return phase + np.arange(k0, k_end + 1) * P
 
 
+class SegmentPlan(NamedTuple):
+    """分段变速里一段的完整方案（时间均为**输入音频**秒轴；拼接后再映射到输出轴）。"""
+    t0: float
+    t1: float
+    bpm: float
+    beats: np.ndarray        # 段内拍时刻（输入轴，段起点为 0）
+    plan: "StretchPlan"
+
+
+def _frame_logtempo(y_mono, sr: int, hop: int = 512):
+    """逐帧 BPM 曲线（log2 域，3 帧中值平滑）。
+
+    librosa.feature.tempo 不开 aggregate，每帧自己估一次；倍频跳变在 log 域是
+    台阶，适合做分段常数拟合。中位数 ±2.2 倍裁剪把个别乱跳的帧压回合理带内，
+    裁剪后取 log 前先 np.maximum 兜底，避免除零。
+    """
+    import librosa
+    onset = librosa.onset.onset_strength(y=y_mono, sr=sr, hop_length=hop)
+    tp = np.asarray(librosa.feature.tempo(onset_envelope=onset, sr=sr,
+                                          aggregate=None)).ravel().astype(np.float64)
+    med = float(np.median(tp[tp > 0])) if np.any(tp > 0) else 120.0
+    tp = np.clip(tp, med / 2.2, med * 2.2)
+    logt = np.log2(np.maximum(tp, 1e-6))
+    sm = np.array([np.median(logt[max(0, i - 1):i + 2]) for i in range(len(logt))])
+    return sm, np.arange(len(tp)) * hop / sr
+
+
+def _seg_mean_sse(cs, ss, a, b):
+    """x[a:b] 的平方残差和（去均值），前缀和 O(1)。
+
+    5 分钟曲有 ~2.6 万帧，分段搜索要评估几百万个子段；直接切片求均值是
+    O(长度)，整体会挂到分钟级。SSE(a,b) = S[b]-S[a] - (C[b]-C[a])²/(b-a)。
+    """
+    n = b - a
+    if n <= 0:
+        return 0.0
+    return float((ss[b] - ss[a]) - (cs[b] - cs[a]) ** 2 / n)
+
+
+def _binary_segment(x, cs, ss, beta, min_len=8):
+    """递归二分的最小二乘分段常数（PELT 式的贪心版）。
+
+    只在「拆分带来的 SSE 下降 > beta」时才拆；beta = 2·s²·ln(n) 是贝叶斯惩罚，
+    s² 用相邻差分中位数估计（对倍频跳变的巨大差分稳健）。
+    """
+    n = len(x)
+    found, work = [], [(0, n)]
+    while work:
+        a, b = work.pop()
+        if b - a < 2 * min_len:
+            continue
+        base = _seg_mean_sse(cs, ss, a, b)
+        best, bestj = base, None
+        for j in range(a + min_len, b - min_len):
+            c = _seg_mean_sse(cs, ss, a, j) + _seg_mean_sse(cs, ss, j, b)
+            if c < best:
+                best, bestj = c, j
+        if bestj is not None and (base - best) > beta:
+            found.append(bestj)
+            work.append((a, bestj))
+            work.append((bestj, b))
+    return sorted(found)
+
+
+def detect_tempo_segments(y_mono, sr: int, dedup_s=2.0, merge_ratio=0.10,
+                          min_seg_s=4.0, min_analyze_s=12.0, lang=None):
+    """变拍检测：返回 [(t0, t1), ...]（输入秒轴，覆盖全曲）；恒速歌返回单段。
+
+    做法：逐帧 log-BPM 曲线 → 递归二分找变点 → 相邻过近( <dedup_s )的变点合并
+    → 短段(<min_seg_s)并入邻段、速度差 <merge_ratio 的邻段并成一段。
+    边界实测误差 <0.7 s（合成曲验收）。
+    每段至少 min_analyze_s 秒，否则 detect_tempo 拍点太少不可靠。
+    """
+    total = len(y_mono) / sr
+    if total < min_analyze_s * 1.5:
+        return [(0.0, total)]
+    logt, tf = _frame_logtempo(y_mono, sr)
+    n = len(logt)
+    cs = np.concatenate([[0.0], np.cumsum(logt)])
+    ss = np.concatenate([[0.0], np.cumsum(logt * logt)])
+    d = np.diff(logt)
+    s2 = 0.5 * float(np.median(d * d)) if len(d) else 1.0
+    idxs = _binary_segment(logt, cs, ss, 2.0 * s2 * math.log(max(n, 3)))
+    # 时间轴上的变点 → 帧下标
+    dedup = []
+    for b in idxs:
+        t = float(tf[min(b, n - 1)])
+        if dedup and abs(t - dedup[-1]) < dedup_s:
+            continue
+        dedup.append(t)
+    edges = [0] + [int(round(t * sr / 512)) for t in dedup] + [n]
+    edges = sorted(set(max(0, min(n, e)) for e in edges))
+    thr = math.log2(1.0 + merge_ratio)
+
+    def seg_dur(a, b):
+        return float(tf[min(b, n - 1)] - tf[a])
+
+    changed = True
+    while changed and len(edges) > 2:
+        changed = False
+        for i in range(len(edges) - 1):
+            a, b = edges[i], edges[i + 1]
+            nxt = edges[i + 2] if i + 2 < len(edges) else None
+            if seg_dur(a, b) < min_seg_s:
+                edges.pop(i + 1 if i + 1 < len(edges) - 1 else 1)
+                changed = True
+                break
+            if nxt is not None and abs(float(np.median(logt[a:b]))
+                                       - float(np.median(logt[b:nxt]))) < thr:
+                edges.pop(i + 1)
+                changed = True
+                break
+    times = [float(tf[e]) if e < n else total for e in edges]
+    times[0], times[-1] = 0.0, float(total)
+    out = []
+    for a, b in zip(times[:-1], times[1:]):
+        if b - a >= 1.0:                 # 丢掉退化小尾巴
+            out.append((a, b))
+    if out:
+        out[0] = (0.0, out[0][1])
+        out[-1] = (out[-1][0], float(total))
+    else:
+        out = [(0.0, float(total))]
+    return out
+
+
+def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
+                   max_slowdown: float = DEFAULT_MAX_SLOWDOWN,
+                   max_speedup: float = DEFAULT_MAX_SPEEDUP, lang=None):
+    """分段测速 + 每段各按原「最小变速」规则出方案。
+
+    返回 [(t0, t1, SegmentPlan)]。段数 == 1 表示「没发现变拍」，调用方应退回整曲
+    单方案路径（保持默认行为字节级不变）。某段测不到速度（太安静/太短）或算不出
+    可行方案时抛 RuntimeError，由调用方回退整曲处理——不做「猜一段」这种事。
+    """
+    segs = detect_tempo_segments(y_mono, sr, lang=lang)
+    if len(segs) < 2:
+        return [(segs[0][0], segs[0][1], None)]
+    out = []
+    for (t0, t1) in segs:
+        a, b = int(t0 * sr), int(t1 * sr)
+        bpm, beats = detect_tempo(y_mono[a:b], sr, lang)
+        plan = choose_stretched_tempo(bpm, target, strict, max_slowdown, max_speedup)
+        if plan is None:
+            raise RuntimeError(stretch_limits_text(
+                bpm, target, max_slowdown, max_speedup, lang=lang))
+        out.append((t0, t1, SegmentPlan(t0, t1, float(bpm),
+                                        np.asarray(beats, dtype=np.float64), plan)))
+    # 相邻段方案完全相同（同倍频档同 rate）→ 合并，少一次无谓拼接
+    merged = []
+    for item in out:
+        prev = merged[-1] if merged else None
+        if prev is not None and abs(prev[2].plan.rate - item[2].plan.rate) < 1e-9 \
+                and abs(float(prev[2].plan.clicks_per_beat)
+                        - float(item[2].plan.clicks_per_beat)) < 1e-9:
+            t0, t1, sp = prev
+            beats = np.concatenate([sp.beats, item[2].beats + (item[0] - t0)])
+            merged[-1] = (t0, item[1], SegmentPlan(t0, item[1], sp.bpm, beats, sp.plan))
+        else:
+            merged.append(item)
+    return merged
+
+
+def _xfade(a, b, ov):
+    """5 ms 等功率（cos²/sin²）交叉淡化拼接。ov=0 时退化为硬接。"""
+    if ov <= 0:
+        return np.concatenate([a, b], axis=1)
+    t = np.linspace(0.0, math.pi / 2, ov)
+    ca, sa = (np.cos(t) ** 2)[np.newaxis, :], (np.sin(t) ** 2)[np.newaxis, :]
+    return np.concatenate([a[:, :-ov], a[:, -ov:] * ca + b[:, :ov] * sa, b[:, ov:]], axis=1)
+
+
+def _pick_join(prev, nxt, ov, win, sr):
+    """为拼接点搜索一对下刀位置 (c, cc)，最小化「join 邻域最大一阶差分 ÷
+    两段自身强瞬态典型最大值」。评分 ≤1 = join 处没有任何超过音乐自身鼓点
+    瞬态的不连续 = 听不到爆音。
+
+    只在前段尾找低能量点**不够**：若后段头上正好是个强音（例如段落的重音起拍），
+    它仍会砸在淡化区里响。所以两侧下刀点都要参与搜索，谁响谁进淡化区。
+    """
+    L0 = int(0.12 * sr)
+    # 一阶差分沿**时间轴**（axis=1）求：声道维的差分是左右声道的电平差，
+    # 拿它当"瞬态"来评分会彻底错。
+    ref = max(float(np.percentile(np.abs(np.diff(prev, axis=1)), 99.95)) or 1e-9,
+              float(np.percentile(np.abs(np.diff(nxt, axis=1)), 99.95)) or 1e-9)
+    t = np.linspace(0.0, math.pi / 2, ov)
+    c2, s2v = np.cos(t) ** 2, np.sin(t) ** 2
+
+    def click_score(c, cc):
+        a = prev[:, max(0, c - L0):c - ov]
+        mid = prev[:, c - ov:c] * c2 + nxt[:, cc:cc + ov] * s2v
+        b = nxt[:, cc + ov:cc + L0]
+        j = np.concatenate([a, mid, b], axis=1)
+        return float(np.abs(np.diff(j, axis=1)).max()) / ref
+
+    def search(cs, ccs):
+        best, bc, bcc = 9e9, cs[0], ccs[0]
+        for c in cs:
+            for cc in ccs:
+                v = click_score(c, cc)
+                if v < best:
+                    best, bc, bcc = v, c, cc
+        return bc, bcc, best
+
+    c_lo = max(ov + L0, prev.shape[1] - win)
+    coarse = search(list(range(c_lo, prev.shape[1], 220)), list(range(0, win, 220)))
+    bc, bcc = coarse[0], coarse[1]
+    cs = [c for c in range(max(c_lo, bc - 260), min(prev.shape[1], bc + 261), 20)] or [bc]
+    ccs = list(range(max(0, bcc - 260), min(win, bcc + 261), 20)) or [bcc]
+    return search(cs, ccs)
+
+
+def _stitch_segments(y, sr, plans, engine):
+    """逐段拉伸并拼回一轨。返回 (输出音频 (2,n), origins, head_trim, join_scores)。
+
+    origins[i] = 第 i 段第一个样本落在输出轴的位置（秒），节拍器按它平移回全局。
+    段头被裁掉的样本数记在 head_trim 里；**内容不丢** —— 搜索下刀点时裁掉的
+    只是段首几毫秒的静音/低能量处，不是整拍。
+    """
+    if y.ndim == 1:
+        y = y[np.newaxis, :]
+    ov, win = int(0.005 * sr), int(0.04 * sr)
+    out, origins, head_trim, scores = None, [], [], []
+    for (t0, t1, sp) in plans:
+        a, b = int(t0 * sr), int(t1 * sr)
+        st = time_stretch(y[:, a:b], sp.plan.rate, engine).astype(np.float64)
+        if out is None:
+            out, origins, head_trim = st, [0.0], [0]
+        else:
+            cut, cut_cur, score = _pick_join(out, st, ov, win, sr)
+            scores.append(score)
+            origins.append((cut - ov - cut_cur) / sr)
+            head_trim.append(cut_cur)
+            out = _xfade(out[:, :cut], st[:, cut_cur:], ov)
+    return out, origins, head_trim, scores
+
+
 def _no_tempo_msg(lang: str | None = None) -> str:
     """检测失败的提示：随界面语言出中/英（英文界面不应漏中文）。"""
     return tr("无法检测速度（音频太短或太安静？），请用 --bpm 手动指定",
@@ -911,6 +1148,7 @@ class ConvertOptions:
     max_slowdown: float = DEFAULT_MAX_SLOWDOWN   # 最多放慢多少（0.25 = 25%），用户可调
     max_speedup: float = DEFAULT_MAX_SPEEDUP     # 最多加快多少（0.50 = 50%），用户可调
     lang: str | None = None             # 输出语言（None=跟随全局 set_lang；"zh"/"en"）
+    segments: bool = False              # 分段变速：先找变拍点，每段各按最小变速规则处理
 
 
 def _unique_output_path(out_dir: Path, stem: str, target_bpm: float, ext: str) -> Path:
@@ -950,6 +1188,109 @@ def _resolve_out_dir(opt: ConvertOptions, path: Path, rel_base: Path | None) -> 
     return base.joinpath(*safe) if safe else base
 
 
+def _process_segmented(path, opt, y, sr, y_mono, seg_plans, row, notes,
+                       log_fn, rel_base):
+    """分段变速的落地路径：逐段拉伸 → 无爆音拼接 → 每段沿自己的拍网格敲节拍器。
+
+    只在 --segments（且检测到多段）时进入；报告仍是一行，逐段明细写进「备注」，
+    CSV 列结构不变。拼接评分 >1 时也在备注里提醒（说明该处接缝可能听得出来）。
+    """
+    L = opt.lang or _LANG
+    y2, origins, head_trim, scores = _stitch_segments(y, sr, seg_plans, opt.engine)
+
+    def join(vals, fmt="{:.1f}"):
+        return " / ".join(fmt.format(v) for v in vals)
+
+    bpms = [sp.bpm for (_t0, _t1, sp) in seg_plans]
+    a2s = [sp.plan.a2 for (_t0, _t1, sp) in seg_plans]
+    rates = [sp.plan.rate for (_t0, _t1, sp) in seg_plans]
+    cpbs = [float(sp.plan.clicks_per_beat) for (_t0, _t1, sp) in seg_plans]
+    row["检测BPM"] = join(bpms)
+    row["检测方式"] = tr("自动检测·分段", "Auto · segmented", L)
+    row["拉伸后BPM"] = join(a2s)
+    row["拉伸比"] = join(rates, "{:.4f}")
+    row["速度变化"] = " / ".join(f"{(r - 1.0) * 100:+.1f}%" for r in rates)
+    row["节拍关系"] = " | ".join(relation_text(c, lang=L) for c in cpbs)
+    row["节拍器BPM"] = f"{seg_plans[0][2].plan.click_bpm:g}"
+    row["每拍点击数"] = join(cpbs, "{:g}")
+
+    music_rms_db = (opt.music_loudness_db if opt.music_loudness_db is not None
+                    else _rms_db(y2))
+    row["音乐响度dB"] = f"{music_rms_db:.1f}"
+
+    times = []
+    for i, (t0, t1, sp) in enumerate(seg_plans):
+        dur_out = float((t1 - t0) / sp.plan.rate) + 0.5
+        ct = click_schedule(sp.beats, sp.plan.rate, sp.plan.click_bpm, dur_out,
+                           clicks_per_beat=sp.plan.clicks_per_beat)
+        times.extend(origins[i] + float(c) for c in ct)
+        if sp.beats is None or len(sp.beats) < 4:
+            notes.append(tr(f"第{i + 1}段未取到可靠节拍位置，该段节拍器按速率均匀敲",
+                            f"segment {i + 1} has no reliable beat positions; "
+                            "its metronome clicks are spaced evenly", L))
+    times = sorted(t for t in times if 0.0 <= t < y2.shape[1] / sr)
+    if opt.metronome:
+        n = y2.shape[1]
+        rng = np.random.default_rng(20260606)
+        click = build_click_track(n, sr, times, opt.metronome, rng,
+                                  music_rms_db=music_rms_db, rel_db=opt.click_rel_db, lang=L)
+        y2 = np.array(y2, copy=True)
+        y2[:, :n] += click[np.newaxis, :n]
+        row["节拍器"] = timbre_name(opt.metronome, L)
+
+    peak = float(np.max(np.abs(y2)))
+    if peak > 0.999:
+        y2 *= 0.999 / peak
+        notes.append(tr("已做峰值限制（防止叠加节拍器后削波）",
+                        "peak-limited (to avoid clipping after adding the metronome)", L))
+
+    detail = tr(
+        f"分段 {len(seg_plans)} 段：", f"{len(seg_plans)} segments: ", L) + " | ".join(
+        f"{t0:g}-{t1:g}s {sp.bpm:.1f}→{sp.plan.a2:g}BPM {(sp.plan.rate - 1) * 100:+.1f}%"
+        for i, (t0, t1, sp) in enumerate(seg_plans))
+    notes.append(detail)
+    if scores:
+        worst = max(scores)
+        if worst > 1.0:
+            notes.append(tr(f"拼接点最大接缝评分 {worst:.2f}（>1 说明接缝可能听得出来，建议听检）",
+                            f"worst join score {worst:.2f} (>1 = the seam may be audible; "
+                            "please listen-check)", L))
+
+    out_dir = _resolve_out_dir(opt, path, rel_base)
+    fmt = str(opt.output_format or "wav").lower()
+    if fmt in ("source", "same", "auto"):
+        fmt = path.suffix.lstrip(".").lower() or "wav"
+    if fmt not in ("wav", "mp3", "flac", "ogg", "aiff", "aif"):
+        fmt = "wav"
+    out_path = _unique_output_path(Path(out_dir), path.stem, opt.target_bpm, f".{fmt}")
+    err = write_audio(out_path, y2, sr, lang=L)
+    if err:
+        notes.append(err)
+        out_path = out_path.with_name(out_path.stem + ".wav")
+
+    dur = y2.shape[1] / sr
+    row["输出文件"] = str(out_path)
+    row["输出时长秒"] = f"{dur:.2f}"
+    log_fn("  " + tr("分段变速 : ", "Segmented  : ", L)
+           + tr(f"共 {len(seg_plans)} 段，每段各按最小变速",
+                f"{len(seg_plans)} segments, each stretched by the minimum rule", L))
+    for (t0, t1, sp) in seg_plans:
+        log_fn("    " + tr(f"[{t0:.1f}–{t1:.1f}s] 测速 {sp.bpm:.1f} → ",
+                           f"[{t0:.1f}-{t1:.1f}s] {sp.bpm:.1f} → ", L)
+               + f"{sp.plan.a2:g} BPM {(sp.plan.rate - 1.0) * 100:+.1f}%"
+               + tr("，节拍器 ", ", metronome ", L) + f"{sp.plan.click_bpm:g} BPM "
+               + tr("——", " — ", L) + relation_text(sp.plan.clicks_per_beat, lang=L))
+    if opt.metronome and times:
+        log_fn("  " + tr("节拍器   : ", "Metronome  : ", L)
+               + f"{len(times)} " + tr("下，音量", "clicks, volume", L)
+               + f" {opt.click_rel_db:+g} dB")
+    log_fn("  " + tr("输出     : ", "Output     : ", L) + str(out_path)
+           + tr("（", " (", L) + f"{dur:.2f}" + tr(" 秒）", " s)", L))
+    if notes:
+        row["备注"] = tr("；", "; ", L).join(notes)
+    return row
+
+
 def process_file(path: Path, opt: ConvertOptions, log_fn=log,
                  rel_base: Path | None = None) -> dict:
     """处理单个文件，返回一行报告（dict）。任何失败都记在“备注”里而不中断批量。
@@ -983,6 +1324,26 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
             log_fn(f"  {path.name}: {detected:.1f} BPM")
             row["备注"] = tr("仅检测速度", "Tempo only", L)
             return row
+
+        # 1.5) 分段变速（opt-in）：找变拍点，每段各按「最小变速」规则出方案。
+        #      手动指定原速时无从分段；只发现一段时退回整曲路径。
+        seg_plans = None
+        if opt.segments and not (opt.bpm and opt.bpm > 0):
+            try:
+                cand = _segment_plans(y_mono, sr, opt.target_bpm, opt.strict,
+                                      opt.max_slowdown, opt.max_speedup, lang=L)
+                if len(cand) > 1 and cand[0][2] is not None:
+                    seg_plans = cand
+                else:
+                    notes.append(tr("未发现变拍，按整曲处理",
+                                    "no tempo change detected; processed as one piece", L))
+            except RuntimeError as re:
+                notes.append(tr("分段变速不可用（",
+                                "segmented mode unavailable (", L) + str(re)
+                             + tr("），已改按整曲处理", "); processed as one piece", L))
+        if seg_plans:
+            return _process_segmented(path, opt, y, sr, y_mono, seg_plans,
+                                      row, notes, log_fn, rel_base)
 
         # 2) 选最小变速方案（受用户设定的变速上限约束；都不满足 → 跳过该文件）
         plan = choose_stretched_tempo(detected, opt.target_bpm, opt.strict,
@@ -1181,6 +1542,8 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
             max_slowdown="max slowdown percentage for the music before switching to a speedup option (0~100, default %g)",
             max_speedup="max speedup percentage; files beyond both limits are skipped (0~100, default %g)",
             lang="output language: zh / en (default zh; affects notes, logs and the report)",
+            segments=("detect tempo changes inside each track and convert every section with its "
+                      "own minimum-stretch plan (seams cross-faded); ignored with --bpm"),
         )
     else:
         H = dict(
@@ -1201,6 +1564,8 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
             max_slowdown="最多把音乐放慢多少百分比，超出就改用加速方案（0~100，默认 %g)",
             max_speedup="最多把音乐加快多少百分比，两个上限都不满足的文件将被跳过（0~100，默认 %g)",
             lang="输出语言：zh / en（默认 zh；影响备注、日志与报告）",
+            segments=("检测曲内变拍，每段各按最小变速规则处理（拼接点做交叉淡化）；"
+                      "手动指定 --bpm 时不分段"),
         )
     ap = argparse.ArgumentParser(
         description=description,
@@ -1228,6 +1593,7 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
     ap.add_argument("--max-speedup", type=float, default=DEFAULT_MAX_SPEEDUP * 100,
                     metavar="PCT", help=H["max_speedup"] % (DEFAULT_MAX_SPEEDUP * 100))
     ap.add_argument("--lang", choices=["zh", "en"], default=None, help=H["lang"])
+    ap.add_argument("--segments", action="store_true", help=H["segments"])
     return ap
 
 
@@ -1271,6 +1637,7 @@ def main(argv=None) -> int:
         max_slowdown=max(0.0, float(args.max_slowdown)) / 100.0,
         max_speedup=max(0.0, float(args.max_speedup)) / 100.0,
         lang=L,
+        segments=bool(getattr(args, "segments", False)),
     )
 
     pairs = list(collect_inputs_with_base(args.inputs, args.recursive))

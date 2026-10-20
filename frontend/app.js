@@ -43,6 +43,7 @@ const ZH = {
   labelMaxFast: "最多加快",
   labelEngine: "变速方式",
   detectOnly: "只测速",
+  segments: "分段变速",
   enginePv: "保音高",
   enginePvSub: "变速不变调",
   engineRs: "磁带机式",
@@ -141,6 +142,7 @@ const EN = {
   labelMaxFast: "Max speed-up",
   labelEngine: "Stretch method",
   detectOnly: "Detect only",
+  segments: "Per-section",
   enginePv: "Keep pitch",
   enginePvSub: "changes tempo, keeps pitch",
   engineRs: "Tape style",
@@ -618,6 +620,7 @@ function readOptions() {
     target: $("#targetBpm").value,
     manualBpm: $("#manualBpm").value.trim(),
     detectOnly: $("#detectOnly").checked,
+    segments: $("#segments").checked,
     engine: document.querySelector("#engineSeg .on")?.dataset.v || "phasevocoder",
     outputFormat: document.querySelector("#formatSeg .on")?.dataset.v || "source",
     outDir: state.outDir || "",
@@ -640,6 +643,7 @@ function loadSettings() {
   if (s.target) $("#targetBpm").value = s.target;
   if (s.manualBpm) $("#manualBpm").value = s.manualBpm;
   if (s.detectOnly) $("#detectOnly").checked = true;
+  if (s.segments) $("#segments").checked = true;
   if (s.engine) segSelect("#engineSeg", s.engine);
   // 旧版本存的 wav/mp3/flac 仍照用；没存过则保持 HTML 默认的"原类型"
   if (s.outputFormat) segSelect("#formatSeg", s.outputFormat);
@@ -918,6 +922,7 @@ function bindUI() {
   $("#maxSpeedup").onchange = () => { $("#maxSpeedup").value = clampPct($("#maxSpeedup").value); limitHintUpdate(); saveSettings(); };
 
   $("#detectOnly").onchange = saveSettings;
+  $("#segments").onchange = saveSettings;
   $("#manualBpm").onchange = saveSettings;
 
   // 音色渲染与试听（抽成 renderTimbres，切换语言时整块重刷）

@@ -165,6 +165,9 @@ python tempo_converter.py song.flac -t 90 --bpm 88
 
 # stretch precisely to the target tempo
 python tempo_converter.py song.mp3 -t 180 --strict
+
+# per-section speed change: split at detected tempo changes, stretch each section on its own
+python tempo_converter.py song.mp3 -t 180 --segments
 ```
 
 The output is Chinese by default; add `--lang en` to make the console output and the report English.
@@ -188,8 +191,20 @@ For every option see `python tempo_converter.py --help` (Chinese) or `--lang en 
 | `--report` | CSV report path (default `conversion_report.csv` in the current directory) |
 | `--max-slowdown` | maximum slow-down percentage, default 20 |
 | `--max-speedup` | maximum speed-up percentage, default 50 |
+| `--segments` | per-section speed change: detect tempo changes inside the track and stretch each section with its own minimum-stretch plan (seams cross-faded); ignored with `--bpm` |
 
 ---
+
+## Per-section speed change
+
+By default the whole track is matched to a single detected BPM. If a song changes tempo halfway (say 100 BPM in the verse, 140 BPM in the chorus), one global rate leaves the metronome drifting off the beat through the changed part. With `--segments` (or the "Per-section" switch in either interface):
+
+1. the tempo curve is split at detected change points by least-squares segmentation; a steady track yields one section and falls back to the normal single-plan path;
+2. each section is measured and stretched on its own, using the original minimum-stretch rule;
+3. each seam searches a low-energy cut on **both** sides and applies a 5 ms equal-power cross-fade, so the join stays below the music's own transient level (a "seam score > 1" note in the report means "worth an ear check");
+4. the metronome follows each section's own beat grid, so clicks stay on the beat across seams.
+
+The report is still one row: the detected BPM / stretched BPM / speed change of the sections are joined with ` / `, and per-section details go into the remarks. **Without the switch, behaviour is byte-for-byte the same as before.**
 
 ## Output
 

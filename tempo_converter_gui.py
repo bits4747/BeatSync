@@ -330,6 +330,7 @@ class App:
             "mirror": bool(self.var_mirror.get()),
             "max_slow": self.var_max_slow.get(),
             "max_fast": self.var_max_fast.get(),
+            "segments": self.var_segments.get(),
             "status": self.var_status.get(),
         }
 
@@ -348,6 +349,7 @@ class App:
         self.var_mirror.set(s.get("mirror", True))
         self.var_max_slow.set(s.get("max_slow", self._fmt_pct(tc.DEFAULT_MAX_SLOWDOWN)))
         self.var_max_fast.set(s.get("max_fast", self._fmt_pct(tc.DEFAULT_MAX_SPEEDUP)))
+        self.var_segments.set(s.get("segments", False))
         self._sync_mirror_state()
         self._limit_hint_update()
         self._set_status_text(s["status"])
@@ -512,6 +514,15 @@ class App:
             .grid(row=8, column=1, columnspan=3, sticky="w", padx=8)
         self.var_max_slow.trace_add("write", self._on_limit_change)
         self.var_max_fast.trace_add("write", self._on_limit_change)
+
+        # 第 9 行：分段变速开关（opt-in；检测到曲内变拍时每段各按最小变速处理）
+        self.var_segments = tk.BooleanVar(value=False)
+        self.chk_segments = ttk.Checkbutton(
+            g, text=self.T("分段变速（检测到变拍时每段各按最小变速处理；手动指定原速时不生效）",
+                           "Per-section speed change (splits on detected tempo changes; "
+                           "ignored when source BPM is set)"),
+            variable=self.var_segments)
+        self.chk_segments.grid(row=9, column=0, columnspan=4, sticky="w", padx=4, pady=(6, 0))
 
     def _build_buttons(self):
         frame = ttk.Frame(self.body)
@@ -877,6 +888,7 @@ class App:
             mirror_dirs=bool(self.var_mirror.get()),
             max_slowdown=self._parse_pct(self.var_max_slow, tc.DEFAULT_MAX_SLOWDOWN),
             max_speedup=self._parse_pct(self.var_max_fast, tc.DEFAULT_MAX_SPEEDUP),
+            segments=bool(self.var_segments.get()),
             lang=tc.get_lang(),
         )
 
