@@ -25,3 +25,4 @@ _ncache/
 Thumbs.db
 .dsh-ops-*.lock
 pytest-cache-files-*/
+.pytest_cache/
