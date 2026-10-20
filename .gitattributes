@@ -1,0 +1,19 @@
+# 统一换行策略：仓库内存 LF，检出到 Windows 工作区时转 CRLF。
+# 不写这条会让每次 add 都刷 LF/CRLF 警告，且跨平台协作时整文件 diff。
+* text=auto eol=crlf
+
+# 明确按文本处理的源码
+*.py     text eol=crlf
+*.js     text eol=crlf
+*.css    text eol=crlf
+*.html   text eol=crlf
+*.md     text eol=crlf
+*.txt    text eol=crlf
+*.bat    text eol=crlf
+*.iss    text eol=crlf
+*.spec   text eol=crlf
+
+# 二进制资源不参与换行转换
+*.ico    binary
+*.png    binary
+*.exe    binary
