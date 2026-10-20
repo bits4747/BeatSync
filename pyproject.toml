@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beatsync"
+version = "1.1.0"
+description = "把音乐变速到目标 BPM，并叠加精确对齐的节拍器"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "BeatSync contributors" }]
+keywords = ["tempo", "bpm", "metronome", "audio", "librosa", "time-stretch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Intended Audience :: End Users/Desktop",
+]
+
+# 运行期依赖：只写下限，与 requirements.txt 保持同一口径（见该文件说明）
+dependencies = [
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "numpy",
+    "scipy",
+]
+
+[project.optional-dependencies]
+# 桌面版界面（WebView）。不装也能用命令行与兼容界面。
+gui = ["pywebview>=5.1"]
+# 开发/测试
+dev = [
+    "pytest>=7",
+]
+
+[project.urls]
+Homepage = "https://github.com/bits4747/BeatSync"
+Issues = "https://github.com/bits4747/BeatSync/issues"
+
+[project.scripts]
+beatsync = "tempo_converter:main"
+
+[tool.setuptools]
+py-modules = ["tempo_converter", "tempo_converter_app", "tempo_converter_gui"]
+
+[tool.setuptools.package-data]
+"*" = ["*.html", "*.js", "*.css"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    # librosa / numba 在部分版本上会刷无关警告，不应当让测试变红
+    "ignore::FutureWarning",
+]

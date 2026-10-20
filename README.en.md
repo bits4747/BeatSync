@@ -15,7 +15,7 @@ BeatSync avoids large tempo changes -- **the metronome always clicks at the targ
 
 Move the music to **n times or 1/n times** the target tempo (n is a whole number).
 
-1. **Detect**: measure the source tempo A (or specify it by hand).
+1. **Detect**: measure the source tempo A (or specify it by hand). The detected value is reported **as measured, without octave folding** — a 60 BPM track is reported as 60 BPM (since v1.1.0; older versions folded slow songs into the [70, 180) range).
 2. **Choose**: among all candidates, pick the one that changes the tempo least.
 3. **Respect the limits**: the change must stay inside the allowed range, otherwise the other direction is tried; if both directions exceed the limits, the file is skipped.
 
@@ -30,6 +30,8 @@ Target 180 BPM, default limits: slow down 20%, speed up 50% (both adjustable)
 | 100    | music at 90 (-10%); 2 clicks per beat                      |
 | 120    | music at 180 (+50%); 1 click per beat                      |
 | 360    | music stays at 360, **no change**; 1 click every 2 beats   |
+
+The table holds for both **automatic detection** and **manually specified tempo**. Known limitation: beat detection may land on an octave multiple/submultiple for non-4/4 material (3/4, 6/8, half-time) and sparse percussion; after the removal of folding, such misreads show up directly in the report. When in doubt, enter the tempo manually.
 
 ## Highlights
 

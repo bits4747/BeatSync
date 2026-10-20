@@ -24,3 +24,4 @@ _ncache/
 .DS_Store
 Thumbs.db
 .dsh-ops-*.lock
+pytest-cache-files-*/

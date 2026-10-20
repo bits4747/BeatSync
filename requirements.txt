@@ -1,5 +1,13 @@
+# 运行期依赖（只写下限，不锁死次版本——锁死会让 pip 在 Python 3.13 上
+# 找不到匹配的预编译轮子，得现场编译 numba/llvmlite，装一次十几分钟且常失败）。
+#
+# librosa>=0.10：0.10 起才默认走 soundfile 后端，不再依赖 audioread + ffmpeg。
+#   注意：librosa 1.0 已彻底移除 audioread 回退，因此 m4a/aac/wma **必须有
+#   ffmpeg 才能读**，未装 ffmpeg 时这些格式会直接失败——详见 README「支持格式」。
 librosa>=0.10
 soundfile>=0.12
 numpy
 scipy
+
+# 桌面版界面（WebView）。只跑命令行或兼容界面（--tk）时可以不装。
 pywebview>=5.1
