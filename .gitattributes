@@ -1,17 +1,18 @@
-# 统一换行策略：仓库内存 LF，检出到 Windows 工作区时转 CRLF。
-# 不写这条会让每次 add 都刷 LF/CRLF 警告，且跨平台协作时整文件 diff。
-* text=auto eol=crlf
+# 统一换行策略：入库归一化为 LF，检出时按各平台默认换行。
+# 不用 eol=crlf —— 那会在 checkout 时把工作区文件整体改写成 CRLF，
+# 与仓库现有 LF 内容产生整文件 diff，掩盖真实改动。
+* text=auto
 
 # 明确按文本处理的源码
-*.py     text eol=crlf
-*.js     text eol=crlf
-*.css    text eol=crlf
-*.html   text eol=crlf
-*.md     text eol=crlf
-*.txt    text eol=crlf
-*.bat    text eol=crlf
-*.iss    text eol=crlf
-*.spec   text eol=crlf
+*.py     text
+*.js     text
+*.css    text
+*.html   text
+*.md     text
+*.txt    text
+*.bat    text
+*.iss    text
+*.spec   text
 
 # 二进制资源不参与换行转换
 *.ico    binary
