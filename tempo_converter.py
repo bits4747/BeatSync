@@ -92,8 +92,8 @@ NUMBA_CACHE_DIR = _setup_numba_cache()
 # 支持的输入格式（m4a/aac/wma 需要系统安装 ffmpeg 才能读取）
 SUPPORTED_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".wma", ".aif", ".aiff"}
 
-# 测速结果归一化到人耳常用感知区间（只影响报告口径，不影响变速比例——
-# 对原速做 2 的整数次幂缩放，选出的拉伸后速度与拉伸比完全不变）
+# 测速结果**不再**归一化到 [70,180) —— 测到什么就报什么。
+# 这两个常量仅保留供历史代码/文档引用，不再参与检测结果的换算。
 TEMPO_LOW, TEMPO_HIGH = 70.0, 180.0
 
 # 变速上限（用户可无极调节）：把音乐放慢/加快太多听感很怪，所以只接受速度变化
@@ -306,7 +306,16 @@ def row_status(note) -> str:
 # ---------------------------------------------------------------- 速度方案
 
 def normalize_tempo(bpm: float) -> float:
-    """把测速结果归一化到 [70, 180)，即人耳通常感知的速度区间。"""
+    """**已停用**：历史上把测速结果折叠到 [70, 180)。
+
+    保留函数只为兼容外部调用；当前检测路径不再使用它（见 detect_tempo）。
+    直接返回原值，不做任何 2 的整数次幂换算。
+    """
+    return float(bpm)
+
+
+def _fold_tempo_legacy(bpm: float) -> float:
+    """历史实现（折叠到 [70, 180)），仅供对照/回溯测试使用。"""
     b = float(bpm)
     if b <= 0:
         return b
@@ -660,7 +669,7 @@ def _no_tempo_msg(lang: str | None = None) -> str:
 def detect_tempo(y_mono, sr: int, lang: str | None = None):
     """检测速度，返回 (bpm, beat_times)。
 
-    bpm 为精修后的值（已归一化到 [70, 180) 的报告口径），
+    bpm 为精修后的原值（**不再归一化**：测到 60 BPM 就报 60 BPM），
     beat_times 为拉伸前的时间轴节拍位置（稳定速度歌曲为精修规整网格）。
     lang 只影响检测失败时抛出的 RuntimeError 文案。
     """
@@ -674,7 +683,7 @@ def detect_tempo(y_mono, sr: int, lang: str | None = None):
     duration = len(onset) * 512 / sr
 
     if len(beat_times) < 4:
-        bpm = normalize_tempo(tracker) if tracker > 0 else 0.0
+        bpm = float(tracker) if tracker > 0 else 0.0
         if bpm <= 0:
             raise RuntimeError(_no_tempo_msg(lang))
         return bpm, beat_times
@@ -685,7 +694,7 @@ def detect_tempo(y_mono, sr: int, lang: str | None = None):
     if P is None:
         P = float(np.median(np.diff(beat_times)))
         phase = float(beat_times[0])
-    bpm = normalize_tempo(60.0 / P)
+    bpm = 60.0 / P
     if bpm <= 0:
         raise RuntimeError(_no_tempo_msg(lang))
     # 节拍序列：优先用"稳健平滑网格"（跟随真实变速、滤掉逐拍抖动），
@@ -1287,8 +1296,8 @@ def main(argv=None) -> int:
 
     print(flush=True)
     if opt.detect_only:
-        log(e(f"测速完成：共 {len(rows)} 个文件（速度已按 {TEMPO_LOW:g}~{TEMPO_HIGH:g} BPM 的习惯口径归一化）。",
-              f"Detection complete: {len(rows)} file(s) (tempos normalized to the conventional {TEMPO_LOW:g}~{TEMPO_HIGH:g} BPM range)."))
+        log(e(f"测速完成：共 {len(rows)} 个文件（报告的是检测器实测值，未做倍频折叠）。",
+              f"Detection complete: {len(rows)} file(s) (reported tempos are raw detector values, no octave folding)."))
     else:
         if L == "en":
             tail = f", skipped {skipped} (beyond stretch limits)" if skipped else ""
