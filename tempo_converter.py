@@ -1098,6 +1098,464 @@ def _stitch_segments(y, sr, plans, engine):
     return out, origins, head_trim, scores
 
 
+# ---------------------------------------------------------------- 渐变速度
+#
+# 「渐变」（渐快/渐慢）与「变拍」（阶跃）是两种不同的东西，解法也不同：
+#   · 变拍：速度在某处跳变、之后维持新的恒定值 → 分段（_segment_plans）。
+#   · 渐变：速度连续变化，全程没有一个恒定值 → 分段救不回来（每段内部仍在变），
+#     必须「分块变速率」：把连续变化切成若干块，每块用一个恒定拉伸比，
+#     块内拍位偏差控制在几十毫秒内，块边界落在拍点上再做 5ms 交叉淡化。
+#
+# 判定用逐窗自相关测速曲线上的四个量（窗口 3~10s、步进 0.5s）：
+#   V    总变差 Σ|Δ|            —— 低于 RAMP_FLAT_VAR 就是恒速
+#   Peak 单窗最大变化 ÷ V       —— ≥ RAMP_STEP_PEAK 是阶跃（变化集中在某一处）
+#   D    首尾净漂移（八度）      —— ≥ RAMP_MIN_DRIFT 才可能是渐变
+#   rho  速度曲线与时间的秩相关  —— ≥ RAMP_MIN_RHO 才是单调渐变
+# 用秩相关而不是 |D|/V，是因为真实音色上后者会被倍频跳变带偏（实测一条纯渐慢
+# 的 |D|/V 只有 0.38 会被误判成"混合"，而同一例的 rho=-0.99）。
+
+SHAPE_MIN_DUR = 6.0      # 短于此不做形状判定（窗口测速不可靠）
+RAMP_MIN_DUR = 8.0       # 短于此不做渐变拉平
+RAMP_BUDGET_S = 0.025    # 每块内允许的最大累积拍位偏差（秒）
+RAMP_MAX_CHUNKS = 60     # 分块数上限（再多说明素材不像渐变，放弃）
+RAMP_FLAT_VAR = 0.10     # 总变差低于此值 = 恒速（八度单位）
+RAMP_STEP_PEAK = 0.22    # 单窗变化占总变差比例 ≥ 此值 = 阶跃
+RAMP_MIN_DRIFT = 0.12    # 净漂移 ≥ 此值才可能是渐变
+RAMP_MIN_RHO = 0.70      # 且秩相关 ≥ 此值（单调）
+
+
+def _median_filter(x, k: int):
+    """一维中值滤波（edge 补齐），用于压掉测速曲线的逐窗抖动。"""
+    x = np.asarray(x, dtype=np.float64)
+    k = max(1, int(k))
+    if k <= 1 or len(x) < k:
+        return x.copy()
+    h = k // 2
+    xp = np.pad(x, h, mode="edge")
+    return np.array([np.median(xp[i:i + k]) for i in range(len(x))])
+
+
+def _rank(x):
+    """平均秩（并列取均值），Spearman 用。"""
+    x = np.asarray(x, dtype=np.float64)
+    order = np.argsort(x, kind="mergesort")
+    r = np.empty(len(x), dtype=np.float64)
+    r[order] = np.arange(len(x), dtype=np.float64)
+    xs = x[order]
+    i = 0
+    while i < len(xs):
+        j = i
+        while j + 1 < len(xs) and xs[j + 1] == xs[i]:
+            j += 1
+        if j > i:
+            r[order[i:j + 1]] = (i + j) / 2.0
+        i = j + 1
+    return r
+
+
+def _spearman(a, b) -> float:
+    ra, rb = _rank(a), _rank(b)
+    ra = ra - ra.mean()
+    rb = rb - rb.mean()
+    den = math.sqrt(float(np.sum(ra * ra)) * float(np.sum(rb * rb)))
+    return float(np.sum(ra * rb) / den) if den > 1e-12 else 0.0
+
+
+def _tempo_curve(y_mono, sr: int, win_s: float | None = None, step: float = 0.5,
+                 lo: float = 50.0, hi: float = 260.0):
+    """逐窗自相关测速曲线 → (窗口中心时刻, BPM)。
+
+    不用 librosa.feature.tempo（tempogram 分辨率太粗，曲线是台阶状），改为在
+    起音包络上做自相关取峰 + 抛物线细化。**挑峰带连续性约束**：候选峰里选与
+    上一窗最接近（log2 距离 ≤0.30 八度）的最强峰，否则退回全局最强峰——
+    这是为了不让曲线在倍频档之间来回跳（实测不做约束时 120 BPM 的曲子会在
+    60/120/240 之间乱跳）。
+    """
+    import librosa
+
+    hop = 256
+    onset = np.asarray(librosa.onset.onset_strength(y=y_mono, sr=sr, hop_length=hop),
+                       dtype=np.float64)
+    fps = sr / float(hop)
+    dur = len(onset) / fps
+    if dur < 2.0 or len(onset) < 8:
+        return np.asarray([]), np.asarray([])
+    if win_s is None:
+        win_s = float(np.clip(dur / 8.0, 3.0, 10.0))
+    n = int(round(win_s * fps))
+    n = max(8, min(n, len(onset)))
+    lag_lo = max(2, int(math.floor(fps * 60.0 / hi)))
+    lag_hi = min(n - 2, int(math.ceil(fps * 60.0 / lo)))
+    if lag_hi <= lag_lo + 1:
+        return np.asarray([]), np.asarray([])
+    step_n = max(1, int(round(step * fps)))
+    try:
+        prior = float(np.atleast_1d(
+            librosa.feature.tempo(onset_envelope=onset, sr=sr))[0])
+    except Exception:
+        prior = 0.0
+
+    times, bpms = [], []
+    prev = prior if prior > 0 else 120.0
+    for s in range(0, max(1, len(onset) - n + 1), step_n):
+        seg = onset[s:s + n]
+        seg = seg - seg.mean()
+        e = float(np.dot(seg, seg))
+        if e <= 1e-12:
+            continue
+        ac = np.correlate(seg, seg, mode="full")[n - 1:] / e
+        cand = [l for l in range(lag_lo, lag_hi + 1)
+                if ac[l] > ac[l - 1] and ac[l] >= ac[l + 1] and ac[l] > 0.05]
+        if not cand:
+            continue
+        near = [l for l in cand if abs(math.log2((fps * 60.0 / l) / prev)) <= 0.30]
+        l = max(near, key=lambda q: ac[q]) if near else max(cand, key=lambda q: ac[q])
+        y0, y1, y2 = ac[l - 1], ac[l], ac[l + 1]
+        den = y0 - 2.0 * y1 + y2
+        d = 0.5 * (y0 - y2) / den if abs(den) > 1e-12 else 0.0
+        P = (l + d) / fps
+        if P <= 0:
+            continue
+        bpm = 60.0 / P
+        times.append((s + n * 0.5) / fps)
+        bpms.append(bpm)
+        prev = bpm
+    bpms = np.asarray(bpms, dtype=np.float64)
+    # 整条曲线做一次八度对齐：窗口自相关本身分不清 60 和 120，而连续性约束一旦
+    # 从错误的一档起步就会整条锁死（实测 120 BPM 素材被锁成 60）。用全局先验
+    # 把曲线的中位拉到同一档——形状指标（变差/漂移/秩相关）对八度不敏感，这里
+    # 只是让绝对值和后面的积分网格不落在错的一档上。
+    if len(bpms) and prior > 0:
+        med = float(np.median(bpms))
+        if med > 0:
+            shift = int(round(math.log2(prior / med)))
+            if shift:
+                bpms = bpms * (2.0 ** shift)
+    return np.asarray(times, dtype=np.float64), bpms
+
+
+def detect_tempo_shape(y_mono, sr: int, lang: str | None = None,
+                       ref_bpm: float | None = None) -> dict:
+    """判定整曲速度形状：constant / step / ramp_up / ramp_down / wave / mixed。
+
+    只用于决定走哪条处理路径，不参与报告数值（报告仍用 detect_tempo 的实测值）。
+    ref_bpm 给了就用它把速度曲线整体对齐到同一八度（窗口自相关分不清 60/120）。
+    """
+    dur = len(y_mono) / sr
+    info = {"shape": "constant", "drift": 0.0, "var": 0.0, "rho": 0.0,
+            "peak": 0.0, "bpm_start": 0.0, "bpm_end": 0.0,
+            "curve": (np.asarray([]), np.asarray([]))}
+    if dur < SHAPE_MIN_DUR:
+        return info
+    times, bpms = _tempo_curve(y_mono, sr)
+    if ref_bpm and ref_bpm > 0 and len(bpms):
+        med = float(np.median(bpms))
+        if med > 0:
+            shift = int(round(math.log2(float(ref_bpm) / med)))
+            if shift:
+                bpms = np.asarray(bpms, dtype=np.float64) * (2.0 ** shift)
+    info["curve"] = (times, bpms)
+    if len(bpms) < 6:
+        return info
+    sm = _median_filter(np.log2(np.asarray(bpms, dtype=np.float64)), 9)
+    d = np.diff(sm)
+    edge = max(1, int(round(0.12 * len(sm))))
+    drift = float(np.median(sm[-edge:]) - np.median(sm[:edge]))
+    var = float(np.sum(np.abs(d)))
+    peak = float(np.max(np.abs(d)) / var) if var > 1e-9 else 0.0
+    rho = _spearman(sm, np.arange(len(sm)))
+    bpm_start = float(2.0 ** np.median(sm[:edge]))
+    bpm_end = float(2.0 ** np.median(sm[-edge:]))
+    if var < RAMP_FLAT_VAR:
+        shape = "constant"
+    elif peak >= RAMP_STEP_PEAK:
+        shape = "step"
+    elif abs(drift) >= RAMP_MIN_DRIFT and abs(rho) >= RAMP_MIN_RHO:
+        shape = "ramp_up" if drift > 0 else "ramp_down"
+    elif abs(drift) < RAMP_MIN_DRIFT:
+        shape = "wave"
+    else:
+        shape = "mixed"
+    info.update({"shape": shape, "drift": drift, "var": var, "rho": rho,
+                 "peak": peak, "bpm_start": bpm_start, "bpm_end": bpm_end})
+    return info
+
+
+def _snap_refine(onset, fps: float, grid):
+    """把网格点小幅吸附到附近的起音峰上，再对残差做中值平滑。
+
+    只做「小幅修正」：搜索半径 0.2 拍。若整体中位修正量超过 0.35 拍，说明
+    吸附锁到了另一条拍线上（例如反拍），整轮修正作废、保留原网格。
+    """
+    g = np.asarray(grid, dtype=np.float64)
+    if len(g) < 4 or fps <= 0:
+        return g
+    ibi = np.diff(g)
+    med = float(np.median(ibi))
+    if med <= 0:
+        return g
+    half = max(1, int(round(0.20 * med * fps)))
+    snapped = g.copy()
+    for k in range(len(g)):
+        c = int(round(g[k] * fps))
+        a, b = max(0, c - half), min(len(onset), c + half + 1)
+        if b <= a:
+            continue
+        snapped[k] = (a + int(np.argmax(onset[a:b]))) / fps
+    resid = snapped - g
+    if abs(float(np.median(resid))) > 0.35 * med:
+        return g
+    out = g + _median_filter(resid, 5)
+    if np.any(np.diff(out) <= 0.0):
+        return g
+    return out
+
+
+def _phase_align(onset, fps: float, grid):
+    """给整条网格找一个全局相位偏移，使网格点上的起音能量最大。
+
+    曲线积分出来的网格相位是任意的（只有拍距可信），吸附只能修 ±0.2 拍，
+    所以先在 ±0.5 拍内扫一遍整体平移。beat_track 出来的网格本来就对拍，
+    扫出来的最优偏移会接近 0，不会把它带偏。
+    """
+    g = np.asarray(grid, dtype=np.float64)
+    if len(g) < 4 or len(onset) == 0:
+        return g
+    T = float(np.median(np.diff(g)))
+    if T <= 0:
+        return g
+    best_off, best_s = 0.0, -1.0
+    for k in range(-25, 26):
+        off = k * 0.02 * T
+        idx = np.clip(np.round((g + off) * fps).astype(int), 0, len(onset) - 1)
+        sc = float(np.mean(onset[idx]))
+        if sc > best_s:
+            best_s, best_off = sc, off
+    return g + best_off
+
+
+def _smooth_ramp_beats(raw, dur: float):
+    """实测拍点 → 平滑拍网格（对 log 拍间隔做中值滤波后重新累积）。
+
+    渐变曲目上 librosa 的逐拍检测本身是对的（对真值偏差中位 ~11ms），坏在
+    下游把整曲拟合到**单一周期**。这里只去掉逐拍抖动，保留局部拍距，所以
+    网格能跟着渐变走。返回 None 表示跟踪器丢拍/并拍，改用速度曲线积分。
+    """
+    ibi = np.diff(np.asarray(raw, dtype=np.float64))
+    if len(ibi) < 4 or np.any(ibi <= 1e-3):
+        return None
+    med = float(np.median(ibi))
+    if med <= 0 or np.any(ibi > 2.2 * med) or np.any(ibi < 0.45 * med):
+        return None
+    sm = np.exp(_median_filter(np.log(ibi), 7))
+    g = np.concatenate([[raw[0]], raw[0] + np.cumsum(sm)])
+    last = float(sm[-1])
+    while g[-1] + last < dur and len(g) < 5000:
+        g = np.append(g, g[-1] + last)
+    return g
+
+
+def _curve_grid(curve, dur: float, ref_bpm: float | None = None):
+    """用速度曲线积分出拍网格（beat_track 跟不住陡渐变时的退路）。
+
+    t_{n+1} = t_n + 60/bpm(t_n)：不假设任何参数模型，曲线是什么就积什么。
+    曲线先按渐变方向做单调化（渐快取累积最大、渐慢取累积最小）压掉抖动。
+
+    窗口自相关分不清 60/120，整条曲线可能落在错的一档上；给了 ref_bpm 就按
+    它把曲线整体平移整数个八度——形状不变，绝对档位对齐到全曲检测值。
+    """
+    times, bpms = curve
+    if times is None or len(bpms) < 3:
+        return None
+    t = np.asarray(times, dtype=np.float64)
+    b = np.asarray(bpms, dtype=np.float64)
+    ok = np.isfinite(b) & (b > 0) & np.isfinite(t)
+    if int(ok.sum()) < 3:
+        return None
+    t, b = t[ok], b[ok]
+    if ref_bpm and ref_bpm > 0:
+        med = float(np.median(b))
+        if med > 0:
+            shift = int(round(math.log2(float(ref_bpm) / med)))
+            if shift:
+                b = b * (2.0 ** shift)
+    b = np.maximum.accumulate(b) if b[-1] >= b[0] else np.minimum.accumulate(b)
+    g = [0.0]
+    while g[-1] < dur and len(g) < 5000:
+        bpm = float(np.interp(g[-1], t, b))
+        if bpm <= 0:
+            break
+        g.append(g[-1] + 60.0 / bpm)
+    if g and g[-1] >= dur:
+        g = g[:-1]
+    return np.asarray(g, dtype=np.float64) if len(g) >= 4 else None
+
+
+def _ramp_grid(y_mono, sr: int, curve, lang: str | None = None,
+               ref_bpm: float | None = None):
+    """为渐变曲目生成一条「跟着速度曲线走」的拍点网格（输入轴秒）。"""
+    import librosa
+
+    dur = len(y_mono) / sr
+    hop = 256
+    onset = np.asarray(librosa.onset.onset_strength(y=y_mono, sr=sr, hop_length=hop),
+                       dtype=np.float64)
+    fps = sr / float(hop)
+    cands = []
+    try:
+        onset512 = librosa.onset.onset_strength(y=y_mono, sr=sr)
+        _tp, raw = librosa.beat.beat_track(onset_envelope=onset512, sr=sr,
+                                           units="time", trim=False)
+        raw = np.asarray(raw, dtype=np.float64)
+    except Exception:
+        raw = np.asarray([])
+    if len(raw) >= 8:
+        g = _smooth_ramp_beats(raw, dur)
+        if g is not None:
+            cands.append(g)
+    g = _curve_grid(curve, dur, ref_bpm)
+    if g is not None:
+        cands.append(g)
+    # 两条候选各有胜场：beat_track 在缓渐变上更准，但它跟不住陡渐变（会把两拍
+    # 并一拍，网格点数量明显偏多）；曲线积分反之（相位靠吸附补）。都吸附到起音
+    # 峰后按「网格点上的起音能量均值」择优——错网格的余点会落在峰间，分数自然低。
+    best = None
+    for g in cands:
+        g = g[(g >= 0.0) & (g < dur)]
+        if len(g) < 4:
+            continue
+        gs = _snap_refine(onset, fps, _phase_align(onset, fps, g))
+        idx = np.clip(np.round(gs * fps).astype(int), 0, len(onset) - 1)
+        sc = float(np.mean(onset[idx])) if len(idx) else 0.0
+        if best is None or sc > best[0]:
+            best = (sc, gs)
+    if best is None:
+        return None
+    grid = best[1]
+    grid = grid[(grid >= 0.0) & (grid < dur)]
+    return grid if len(grid) >= 4 else None
+
+
+def _greedy_chunks(beats, a2: float, budget_s: float = RAMP_BUDGET_S):
+    """贪心把拍点并成块：每块一个恒定拉伸比，块内拍位偏差 ≤ budget_s。"""
+    T = 60.0 / a2
+    tol = max(1e-3, budget_s / T)          # 允许偏差（拍）
+    n = len(beats)
+    out = []
+    i = 0
+    while i < n - 1:
+        best = i + 1
+        j = i + 2
+        while j < n:
+            r = (beats[j] - beats[i]) / ((j - i) * T)
+            if r <= 0:
+                break
+            dev = float(np.max(np.abs((beats[i:j + 1] - beats[i]) / (r * T)
+                                      - np.arange(j - i + 1))))
+            if dev > tol:
+                break
+            best = j
+            j += 1
+        out.append((i, best))
+        i = best
+    return out
+
+
+def _ramp_plans(beats, dur: float, target: float,
+                max_slowdown: float = DEFAULT_MAX_SLOWDOWN,
+                max_speedup: float = DEFAULT_MAX_SPEEDUP,
+                budget_s: float = RAMP_BUDGET_S):
+    """给渐变曲目出分块方案。返回 (info, None) 或 (None, 原因)。
+
+    info = {chunks, a2, cpb, bpm_start, bpm_end}。
+
+    **拉平到多少 BPM**：先在所有合法 cpb（整数 / 分子为 1 的分数）里挑一个
+    全局 a2 = target/cpb，使各块拉伸比都尽量接近 1（minimax |log2 rate|）。
+    这样既满足「输出音乐恒速」，又沿用「音乐只做最小变速、节拍器恒定以目标
+    速度发声」这条既有规则：cpb=1 时音乐被拉到 target，cpb=2 时拉到 target/2
+    而节拍器每拍敲 2 下——听感仍是目标速度，音乐却几乎不用变速。
+    所有候选都越限 → 返回 None，由调用方按原方式处理（不丢歌）。
+    """
+    beats = np.asarray(beats, dtype=np.float64)
+    if len(beats) < 6:
+        return None, "beats"
+    ibi = np.diff(beats)
+    loc = np.array([60.0 / np.median(ibi[max(0, k - 1):k + 2])
+                    for k in range(len(ibi))])
+    lo_b = float(np.percentile(loc, 2.0))
+    hi_b = float(np.percentile(loc, 98.0))
+    if lo_b <= 0 or hi_b <= 0:
+        return None, "beats"
+    lo_r = 1.0 - max(0.0, float(max_slowdown))
+    hi_r = 1.0 + max(0.0, float(max_speedup))
+    eps = 1e-9
+    best = None
+    for cpb in CPB_CANDIDATES:
+        a2 = float(target) / float(cpb)
+        rmin, rmax = a2 / hi_b, a2 / lo_b
+        if rmin < lo_r - eps or rmax > hi_r + eps:
+            continue
+        key = (max(abs(math.log2(max(rmin, 1e-9))), abs(math.log2(max(rmax, 1e-9)))),
+               0 if float(cpb).is_integer() else 1, float(cpb))
+        if best is None or key < best[0]:
+            best = (key, a2, float(cpb))
+    if best is None:
+        return None, "limits"
+    _key, a2, cpb = best
+    T = 60.0 / a2
+    chunks = _greedy_chunks(beats, a2, budget_s)
+    for _round in range(10):
+        if len(chunks) > RAMP_MAX_CHUNKS:
+            return None, "many"
+        rates = [(beats[j] - beats[i]) / ((j - i) * T) for (i, j) in chunks]
+        bad = [k for k, r in enumerate(rates) if r < lo_r - eps or r > hi_r + eps]
+        if not bad:
+            break
+        if len(chunks) < 2:
+            return None, "limits"
+        # 把最越限的一块并入邻块（合并后速率向平均值靠拢，通常就回到范围内）
+        k = min(bad, key=lambda q: -abs(math.log2(max(rates[q], 1e-9))))
+        if k > 0:
+            chunks[k - 1] = (chunks[k - 1][0], chunks[k][1])
+            chunks.pop(k)
+        else:
+            chunks[0] = (chunks[0][0], chunks[1][1])
+            chunks.pop(1)
+    else:
+        return None, "limits"
+    edge = max(1, int(round(0.12 * len(ibi))))
+    bpm_start = float(60.0 / np.median(ibi[:edge]))
+    bpm_end = float(60.0 / np.median(ibi[-edge:]))
+    return ({"chunks": chunks, "a2": a2, "cpb": cpb,
+             "bpm_start": bpm_start, "bpm_end": bpm_end}, None)
+
+
+def _ramp_segment_plans(beats, dur: float, target: float, info) -> list:
+    """把分块方案转成 _stitch_segments 能吃的 SegmentPlan 列表。"""
+    a2 = float(info["a2"])
+    cpb = float(info["cpb"])
+    T = 60.0 / a2
+    chunks = info["chunks"]
+    plans = []
+    for k, (i, j) in enumerate(chunks):
+        t0 = 0.0 if k == 0 else float(beats[i])
+        t1 = float(dur) if k == len(chunks) - 1 else float(beats[j])
+        if t1 <= t0:
+            continue
+        nb = int(j - i)
+        span = float(beats[j] - beats[i])
+        if nb <= 0 or span <= 0:
+            continue
+        detected = 60.0 * nb / span
+        rate = span / (nb * T)
+        sel = beats[i:j + 1]
+        sel = sel[(sel >= t0 - 1e-6) & (sel < t1 - 1e-6)]
+        plan = StretchPlan(a2, rate, float(target), cpb, 0)
+        plans.append((t0, t1, SegmentPlan(t0, t1, detected,
+                                          (sel - t0).astype(np.float64), plan)))
+    return plans
+
+
 def _no_tempo_msg(lang: str | None = None) -> str:
     """检测失败的提示：随界面语言出中/英（英文界面不应漏中文）。"""
     return tr("无法检测速度（音频太短或太安静？），请用 --bpm 手动指定",
@@ -1509,6 +1967,157 @@ def _process_segmented(path, opt, y, sr, y_mono, seg_plans, row, notes,
     return row
 
 
+def _ramp_why_text(why: str, lang) -> str:
+    """渐变拉平失败的原因（写进备注，让用户知道为什么没拉平）。"""
+    if why == "limits":
+        return tr("需要的变速超出加减速上限（可用 --max-slowdown / --max-speedup 放宽）",
+                  "the required stretch exceeds the limits "
+                  "(raise them with --max-slowdown / --max-speedup)", lang)
+    if why == "many":
+        return tr("分块过多，素材不像渐变", "too many chunks; the material does not look like a ramp", lang)
+    return tr("拍点不足", "not enough beats", lang)
+
+
+def _ramp_try(path, opt, y, sr, y_mono, shape, row, notes, log_fn, rel_base,
+              detected: float | None = None):
+    """尝试「渐变 → 目标恒定速度」。成功返回报告行，失败返回 None（调用方继续原流程）。
+
+    失败只写一条备注，绝不因此丢歌：渐变拉平是本项目的增强路径，原有
+    「整曲单速 / 分段」路径必须保持可用。
+    """
+    L = opt.lang or _LANG
+    dur = len(y_mono) / sr
+    if dur < RAMP_MIN_DUR:
+        return None
+    grid = _ramp_grid(y_mono, sr, shape.get("curve"), L, ref_bpm=detected)
+    if grid is None or len(grid) < 6:
+        notes.append(tr("渐变速度：拍点网格没建起来，按原方式处理",
+                        "ramp: could not build a beat grid; processed the usual way", L))
+        return None
+    info, why = _ramp_plans(grid, dur, opt.target_bpm,
+                            opt.max_slowdown, opt.max_speedup)
+    if info is None:
+        notes.append(tr("渐变速度：", "ramp: ", L) + _ramp_why_text(why, L)
+                     + tr("，按原方式处理", "; processed the usual way", L))
+        return None
+    plans = _ramp_segment_plans(grid, dur, opt.target_bpm, info)
+    if len(plans) < 2:
+        return None
+    info["shape"] = shape["shape"]
+    return _process_ramp(path, opt, y, sr, y_mono, plans, info,
+                         row, notes, log_fn, rel_base)
+
+
+def _process_ramp(path, opt, y, sr, y_mono, plans, ramp, row, notes,
+                  log_fn, rel_base):
+    """渐变变速的落地路径：分块变速率 → 无爆音拼接 → 沿拍网格敲节拍器。
+
+    与 _process_segmented 的区别只在报告措辞：分段是「每段各有自己的速度」，
+    渐变是「一整段连续变化被拉平到一个恒定速度」，所以检测值写成区间、
+    拉伸比写成范围，并额外透出 `_渐变` 结构化键给前端渲染。
+    """
+    L = opt.lang or _LANG
+    y2, origins, head_trim, scores = _stitch_segments(y, sr, plans, opt.engine)
+
+    rates = [sp.plan.rate for (_t0, _t1, sp) in plans]
+    a2 = float(ramp["a2"])
+    cpb = float(ramp["cpb"])
+    target = float(opt.target_bpm)
+    b0 = float(ramp.get("bpm_start") or 0.0)
+    b1 = float(ramp.get("bpm_end") or 0.0)
+    rmin, rmax = float(min(rates)), float(max(rates))
+
+    row["检测BPM"] = f"{b0:.1f}→{b1:.1f}"
+    row["检测方式"] = tr("自动检测·渐变", "Auto · ramp", L)
+    row["拉伸后BPM"] = f"{a2:g}"
+    row["拉伸比"] = f"{rmin:.4f}~{rmax:.4f}"
+    row["速度变化"] = f"{(rmin - 1.0) * 100:+.1f}%~{(rmax - 1.0) * 100:+.1f}%"
+    row["节拍关系"] = relation_text(cpb, lang=L)
+    row["节拍器BPM"] = f"{target:g}"
+    row["每拍点击数"] = f"{cpb:g}"
+    # 内部结构化键（不进 CSV：write_report 只写 REPORT_FIELDS 的 15 个键）
+    row["_渐变"] = {
+        "shape": ramp.get("shape") or "ramp",
+        "from": f"{b0:.1f}", "to": f"{b1:.1f}",
+        "a2": f"{a2:g}", "chunks": len(plans), "cpb": f"{cpb:g}",
+        "rateMin": f"{rmin:.4f}", "rateMax": f"{rmax:.4f}",
+        "relation": relation_text(cpb, lang=L),
+    }
+
+    music_rms_db = (opt.music_loudness_db if opt.music_loudness_db is not None
+                    else _rms_db(y2))
+    row["音乐响度dB"] = f"{music_rms_db:.1f}"
+
+    times = []
+    for i, (t0, t1, sp) in enumerate(plans):
+        dur_out = float((t1 - t0) / sp.plan.rate) + 0.5
+        ct = click_schedule(sp.beats, sp.plan.rate, sp.plan.click_bpm, dur_out,
+                            clicks_per_beat=sp.plan.clicks_per_beat)
+        times.extend(origins[i] + float(c) for c in ct)
+    times = sorted(t for t in times if 0.0 <= t < y2.shape[1] / sr)
+    if opt.metronome:
+        n = y2.shape[1]
+        rng = np.random.default_rng(20260606)
+        click = build_click_track(n, sr, times, opt.metronome, rng,
+                                  music_rms_db=music_rms_db,
+                                  rel_db=opt.click_rel_db, lang=L)
+        y2 = np.array(y2, copy=True)
+        y2[:, :n] += click[np.newaxis, :n]
+        row["节拍器"] = timbre_name(opt.metronome, L)
+
+    peak = float(np.max(np.abs(y2)))
+    if peak > 0.999:
+        y2 *= 0.999 / peak
+        notes.append(tr("已做峰值限制（防止叠加节拍器后削波）",
+                        "peak-limited (to avoid clipping after adding the metronome)", L))
+
+    notes.append(tr(
+        f"渐变速度 {b0:.1f}→{b1:.1f} BPM，分 {len(plans)} 块拉平到 {a2:g} BPM"
+        f"（块速率 {rmin:.4f}~{rmax:.4f}）",
+        f"ramp {b0:.1f}->{b1:.1f} BPM flattened to {a2:g} BPM in {len(plans)} chunks"
+        f" (chunk rates {rmin:.4f}~{rmax:.4f})", L))
+    if scores:
+        worst = max(scores)
+        if worst > 1.0:
+            notes.append(tr(f"拼接点最大接缝评分 {worst:.2f}（>1 说明接缝可能听得出来，建议听检）",
+                            f"worst join score {worst:.2f} (>1 = the seam may be audible; "
+                            "please listen-check)", L))
+
+    out_dir = _resolve_out_dir(opt, path, rel_base)
+    fmt = str(opt.output_format or "wav").lower()
+    if fmt in ("source", "same", "auto"):
+        fmt = path.suffix.lstrip(".").lower() or "wav"
+    if fmt not in ("wav", "mp3", "flac", "ogg", "aiff", "aif"):
+        fmt = "wav"
+    out_path = _unique_output_path(Path(out_dir), path.stem, opt.target_bpm, f".{fmt}")
+    br = resolve_mp3_bitrate(opt.mp3_bitrate, path) if fmt == "mp3" else None
+    err = write_audio(out_path, y2, sr, lang=L, mp3_bitrate=br)
+    if err:
+        notes.append(err)
+        out_path = out_path.with_name(out_path.stem + ".wav")
+
+    dur = y2.shape[1] / sr
+    row["输出文件"] = str(out_path)
+    row["输出时长秒"] = f"{dur:.2f}"
+    log_fn("  " + tr("渐变拉平 : ", "Ramp       : ", L)
+           + f"{b0:.1f}→{b1:.1f} BPM"
+           + tr(f"，分 {len(plans)} 块拉平到 ", f", flattened to ", L)
+           + f"{a2:g} BPM" + tr("，节拍器 ", ", metronome ", L)
+           + f"{target:g} BPM " + tr("——", " — ", L) + relation_text(cpb, lang=L))
+    log_fn("  " + tr("块速率   : ", "Chunk rates: ", L) + f"{rmin:.4f}~{rmax:.4f}"
+           + tr(f"（{len(plans)} 块，块内拍位偏差 ≤ {RAMP_BUDGET_S * 1000:.0f} ms）",
+                f" ({len(plans)} chunks, in-chunk beat error <= {RAMP_BUDGET_S * 1000:.0f} ms)", L))
+    if opt.metronome and times:
+        log_fn("  " + tr("节拍器   : ", "Metronome  : ", L)
+               + f"{len(times)} " + tr("下，音量", "clicks, volume", L)
+               + f" {opt.click_rel_db:+g} dB")
+    log_fn("  " + tr("输出     : ", "Output     : ", L) + str(out_path)
+           + tr("（", " (", L) + f"{dur:.2f}" + tr(" 秒）", " s)", L))
+    if notes:
+        row["备注"] = tr("；", "; ", L).join(notes)
+    return row
+
+
 def process_file(path: Path, opt: ConvertOptions, log_fn=log,
                  rel_base: Path | None = None) -> dict:
     """处理单个文件，返回一行报告（dict）。任何失败都记在“备注”里而不中断批量。
@@ -1553,21 +2162,40 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
         seg_plans = None
         seg_infeasible = None
         if seg_mode != "off" and not (opt.bpm and opt.bpm > 0):
+            # 先分「渐变」还是「阶跃」：渐变要分块变速率拉平，阶跃才是分段。
+            # 渐变失败只记一条备注并继续走原路径，绝不因此丢歌。
+            is_ramp = False
             try:
-                cand, seg_infeasible = _segment_plans(
-                    y_mono, sr, opt.target_bpm, opt.strict,
-                    opt.max_slowdown, opt.max_speedup, lang=L,
-                    merge_infeasible=(seg_mode == "auto"))
-                if seg_infeasible is None:
-                    if len(cand) > 1 and (seg_mode == "on" or _segments_worthwhile(cand)):
-                        seg_plans = cand
-                    else:
-                        notes.append(tr("未发现明显变拍，按整曲处理",
-                                        "no significant tempo change; processed as one piece", L))
+                shape = detect_tempo_shape(y_mono, sr, L, ref_bpm=detected)
+                if shape["shape"] in ("ramp_up", "ramp_down"):
+                    is_ramp = True
+                    ramp_row = _ramp_try(path, opt, y, sr, y_mono, shape,
+                                         row, notes, log_fn, rel_base,
+                                         detected=detected)
+                    if ramp_row is not None:
+                        return ramp_row
             except RuntimeError as re:
-                notes.append(tr("分段变速不可用（",
-                                "segmented mode unavailable (", L) + str(re)
-                             + tr("），已改按整曲处理", "); processed as one piece", L))
+                notes.append(tr("渐变变速不可用（", "ramp mode unavailable (", L)
+                             + str(re) + tr("），已改按原方式处理",
+                                            "); processed the usual way", L))
+            # 渐变曲不走分段：分段是给「阶跃」用的，把渐变硬切成几段会得到一堆
+            # 越限的窄段，只会在备注里多一句误导用户的话。
+            if not is_ramp:
+                try:
+                    cand, seg_infeasible = _segment_plans(
+                        y_mono, sr, opt.target_bpm, opt.strict,
+                        opt.max_slowdown, opt.max_speedup, lang=L,
+                        merge_infeasible=(seg_mode == "auto"))
+                    if seg_infeasible is None:
+                        if len(cand) > 1 and (seg_mode == "on" or _segments_worthwhile(cand)):
+                            seg_plans = cand
+                        else:
+                            notes.append(tr("未发现明显变拍，按整曲处理",
+                                            "no significant tempo change; processed as one piece", L))
+                except RuntimeError as re:
+                    notes.append(tr("分段变速不可用（",
+                                    "segmented mode unavailable (", L) + str(re)
+                                 + tr("），已改按整曲处理", "); processed as one piece", L))
         if seg_plans:
             return _process_segmented(path, opt, y, sr, y_mono, seg_plans,
                                       row, notes, log_fn, rel_base)

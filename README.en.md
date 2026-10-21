@@ -226,6 +226,37 @@ Measured on "YYZ", target 180 — hit-ratio for the single-rate path vs automati
 
 The two sections chosen automatically are `0–42.6s @102.8 → 90 BPM (−12.5%, 2 clicks per beat)` and `42.6–267s @140.7 → 180 BPM (+27.9%, 1 click per beat)`, both clicking at 180.
 
+## Gradual tempo change (accelerando / ritardando)
+
+Some tracks do not change speed at one point — they **speed up or slow down continuously** (common in rock/jazz outros and electronic build-ups). A single global rate is wrong there: the track is stretched at the average tempo, so the first half ends up too fast and the second half too slow, and the metronome is off from start to finish. Hard segmentation is wrong too — the sections are only two or three seconds long, no feasible plan exists, and the seams become dense enough to hear.
+
+**The program detects a ramp automatically and switches to chunked flattening**, with no extra switch (it follows the "Auto per-section" master switch):
+
+1. tempo is measured window by window on the onset envelope (window length adapts to the track, 3–10 s), producing a tempo curve;
+2. the curve is classified into `constant` / `step` (an abrupt change) / `ramp_up` / `ramp_down` (gradual) / `wave` (elastic). The features are, after smoothing: **net drift, total variation, rank correlation and the largest single-window jump as a share of total variation** — a ramp spreads its change evenly in one direction, a step jumps once, and the single-window share separates them;
+3. for a ramp, a beat grid is built that follows it (`beat_track` and "integrate the tempo curve" are both tried; each is phase-snapped and the winner is the one with the higher **mean onset energy on its grid points** — a wrong grid puts its off-points between peaks and scores lower);
+4. beats are merged greedily into chunks under an error budget (25 ms by default), each chunk using **one constant stretch ratio**, with boundaries on beats;
+5. chunks are stretched and joined with a 5 ms equal-power cross-fade, so no clicks at the seams;
+6. the metronome follows each chunk's grid, so clicks stay on the beat for the whole track.
+
+In the report a ramp is written in interval form: `Detected BPM = 140.0→110.0`, `Detection = Auto · ramp`, `Stretch ratio = 0.8599~1.0797`; the UI shows `Flattened ramp 140.0→110.0 ⇒ 180.0 · 9 chunks`.
+
+Measured on synthetic material (30 s, one transient per beat, target 120 BPM):
+
+| Material | Shape | Chunks | Output |
+| --- | --- | --- | --- |
+| Slowdown 140→110 | `ramp_down` (drift −0.276, peak 0.037) | 7, ratios 0.858–1.086 | 120.2 BPM, local-speed spread ≈0 |
+| Speedup 100→140 | `ramp_up` (drift +0.376, peak 0.049) | 8, ratios 0.859–1.143 | 120.2 BPM, local-speed spread ≈0 |
+| Steep 90→150 | `ramp_up` (drift +0.565) | 9, ratios 0.819–1.272 | 120.2 BPM, seam score 0.059 |
+| Steady 120 | `constant` (var 0.003) | — | not triggered, normal path |
+
+Limits and known constraints:
+
+- **Each chunk still obeys the slowdown/speedup limits** (20% slower and 50% faster by default; raise them with `--max-slowdown` / `--max-speedup`). If a ramp is too wide to chunk feasibly, the program **falls back to a single global rate** and says so in the remarks ("Gradual tempo: the required stretch exceeds the limits … handled the usual way") — it never drops the file.
+- Ramp detection needs at least 6 s of audio and chunked flattening at least 8 s; shorter tracks take the normal path.
+- The phase vocoder smears transients slightly (dense percussion can sound a little softer), an inherent cost of stretching that does not affect beat alignment.
+- Passing `--bpm` manually bypasses ramp detection (your value wins).
+
 ## Output
 
 **Naming**: `original_<target>bpm.ext` (for example `song_180bpm.wav`); on a name clash `_1`, `_2`, `_3` are appended.
