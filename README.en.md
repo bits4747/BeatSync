@@ -40,7 +40,7 @@ The table holds for both **automatic detection** and **manually specified tempo*
 - **Accurate detection, metronome that never drifts**: detection uses autocorrelation refined on a comb grid, so steady-tempo tracks are pinned down to roughly 0.1 BPM. The metronome does not stack fixed intervals; it is placed directly on the music's own beat time line, so it never drifts or misses a beat.
 - **Six percussion sounds, adjustable relative level**: audition and pick a sound; its level follows the track's own loudness and the relative amount is adjustable.
 - **Batch processing**: process a whole library in one go.
-- **Several output formats**: WAV / MP3 / FLAC.
+- **Several output formats**: WAV / MP3 / FLAC. MP3 output **matches the input file's bitrate by default** (no quality downgrade); you can also pick 320/256/192/160/128 explicitly.
 - **Keep the folder structure**: when converting a whole library, the output directory mirrors the input tree instead of piling every track into one level; this can be turned off in the interface (output then lands flat in the output directory).
 - **Bilingual interface**: switch between Chinese and English with the "中 / EN" button in the top-right corner.
 
@@ -185,6 +185,7 @@ For every option see `python tempo_converter.py --help` (Chinese) or `--lang en 
 | `--click-rel-db` | metronome level relative to the music (dB), default -6 |
 | `--engine` | `phasevocoder` keeps the pitch (default) or `resample` for a tape-style shift |
 | `--format` | `source` (default, same as the input) / `wav` / `mp3` / `flac` / `ogg` |
+| `--mp3-bitrate` | mp3 output bitrate: `auto` (default, match the input file) / `320` / `256` / `224` / `192` / `160` / `128` / `112` / `96` |
 | `-o, --out-dir` | output directory (default: `tempo_converted/` beside each source file) |
 | `--no-mirror-dirs` | with an output directory, do not mirror the tree -- write everything flat |
 | `--recursive` | search subfolders recursively |

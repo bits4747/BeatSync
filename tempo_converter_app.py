@@ -557,6 +557,7 @@ class Api:
             metronome=opts.get("metronome") or None,
             click_rel_db=_num(opts.get("clickRelDb"), -6.0),
             output_format=opts.get("outputFormat") or "source",
+            mp3_bitrate=opts.get("mp3Bitrate") or "auto",
             out_dir=Path(opts["outDir"]) if opts.get("outDir") else None,
             mirror_dirs=bool(opts.get("mirrorDirs", True)),
             max_slowdown=_pct(opts.get("maxSlowdown"), tc.DEFAULT_MAX_SLOWDOWN),

@@ -150,6 +150,14 @@ try {
             <button type="button" data-v="mp3">MP3</button>
             <button type="button" data-v="flac">FLAC</button>
           </div>
+          <div class="segmented sm bitrate-seg" id="bitrateSeg">
+            <button type="button" data-v="auto" class="on"><span data-t="brAuto">跟随原文件</span></button>
+            <button type="button" data-v="320">320k</button>
+            <button type="button" data-v="256">256k</button>
+            <button type="button" data-v="192">192k</button>
+            <button type="button" data-v="128">128k</button>
+          </div>
+          <p class="hint-line" data-t="bitrateHint">仅 MP3 输出有效；默认跟随原文件码率</p>
         </div>
 
         <!-- 第 5 行：输出目录（与输出类型分开，避免挤在一起） -->

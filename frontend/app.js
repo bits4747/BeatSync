@@ -52,6 +52,8 @@ const ZH = {
   labelFormat: "输出类型",
   formatSource: "原类型",
   formatSourceSub: "与输入相同",
+  brAuto: "跟随原文件",
+  bitrateHint: "仅 MP3 输出有效；默认跟随原文件码率",
   labelOutDir: "输出目录",
   choose: "选择…",
   restoreDefault: "恢复默认",
@@ -152,6 +154,8 @@ const EN = {
   labelFormat: "Output format",
   formatSource: "Same as input",
   formatSourceSub: "unchanged",
+  brAuto: "Match source",
+  bitrateHint: "MP3 output only; defaults to the source bitrate",
   labelOutDir: "Output folder",
   choose: "Choose…",
   restoreDefault: "Restore default",
@@ -639,6 +643,7 @@ function readOptions() {
     segments: $("#segments").checked,
     engine: document.querySelector("#engineSeg .on")?.dataset.v || "phasevocoder",
     outputFormat: document.querySelector("#formatSeg .on")?.dataset.v || "source",
+    mp3Bitrate: document.querySelector("#bitrateSeg .on")?.dataset.v || "auto",
     outDir: state.outDir || "",
     mirrorDirs: $("#mirrorDirs").checked,
     metronome: metroOn ? timbre : "",
@@ -663,6 +668,7 @@ function loadSettings() {
   if (s.engine) segSelect("#engineSeg", s.engine);
   // 旧版本存的 wav/mp3/flac 仍照用；没存过则保持 HTML 默认的"原类型"
   if (s.outputFormat) segSelect("#formatSeg", s.outputFormat);
+  if (s.mp3Bitrate) segSelect("#bitrateSeg", s.mp3Bitrate);
   if (s.outDir) { state.outDir = s.outDir; }
   // 默认勾选；只有用户显式存过 false 才取消
   if (s.mirrorDirs === false) $("#mirrorDirs").checked = false;
@@ -926,6 +932,7 @@ function bindUI() {
   // 分段选择
   document.querySelectorAll("#engineSeg button").forEach(b => b.onclick = () => { segSelect("#engineSeg", b.dataset.v); saveSettings(); });
   document.querySelectorAll("#formatSeg button").forEach(b => b.onclick = () => { segSelect("#formatSeg", b.dataset.v); saveSettings(); });
+  document.querySelectorAll("#bitrateSeg button").forEach(b => b.onclick = () => { segSelect("#bitrateSeg", b.dataset.v); saveSettings(); });
 
   // 节拍器
   $("#metronome").onchange = () => { metroPanelUpdate(); saveSettings(); };

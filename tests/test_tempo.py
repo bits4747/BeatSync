@@ -336,6 +336,87 @@ def test_segmented_options_default_off():
     assert tc.ConvertOptions().segments is False
 
 
+# ---------------------------------------------------------------- mp3 码率
+
+def test_mp3_bitrate_default_is_auto():
+    """默认必须是「跟随原文件」，否则又回到库默认的低码率。"""
+    assert tc.ConvertOptions().mp3_bitrate == "auto"
+
+
+def test_snap_mp3_bitrate():
+    """任意码率吸附到最接近的可选档位；等距取高的一档。"""
+    assert tc._snap_mp3_bitrate(320) == 320
+    assert tc._snap_mp3_bitrate(321.6) == 320      # 容器开销让实测值略高
+    assert tc._snap_mp3_bitrate(245) == 256        # 典型 VBR 平均码率
+    assert tc._snap_mp3_bitrate(128.4) == 128
+    assert tc._snap_mp3_bitrate(142) == 128        # 库默认的 142k 也要落到档位上
+    assert tc._snap_mp3_bitrate("abc") == tc.DEFAULT_MP3_BITRATE
+    assert tc._snap_mp3_bitrate(10) == 96          # 低于最低档时取最低档
+
+
+def _work_dir():
+    """测试写文件用的目录（仓库内 tests/_tmp/，已 gitignore）。
+
+    不用 pytest 的 tmp_path / tempfile.mkdtemp：某些受限环境里那类目录会被
+    打上受限 ACL，libsndfile 打不开、pytest 之后也收不进去。os.makedirs 继承
+    父目录 ACL，没这个问题。
+    """
+    d = REPO / "tests" / "_tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def test_resolve_mp3_bitrate_auto_reads_source():
+    """auto 要真的去读输入文件码率；读不出来（非 mp3/损坏）时退回 320。"""
+    import uuid
+
+    import soundfile as sf
+
+    d = _work_dir()
+    src = d / f"a_{uuid.uuid4().hex}.mp3"
+    wav = d / f"a_{uuid.uuid4().hex}.wav"
+    try:
+        sr, n = 44100, 44100 * 3
+        y = (0.2 * np.sin(2 * np.pi * 440 * np.arange(n) / sr)).astype(np.float32)
+        sf.write(str(src), y, sr, subtype="MPEG_LAYER_III",
+                 bitrate_mode="CONSTANT", compression_level=0.65)   # 128 kbps
+        got = tc.resolve_mp3_bitrate("auto", src)
+        assert got == 128, f"auto 应跟随输入 128k，实际 {got}"
+
+        sf.write(str(wav), y, sr, subtype="PCM_16")
+        assert tc.resolve_mp3_bitrate("auto", wav) == tc.DEFAULT_MP3_BITRATE
+    finally:
+        for p in (src, wav):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
+def test_write_mp3_honours_bitrate():
+    """写出的 mp3 实际码率必须贴近请求值（这是本次修复的核心）。"""
+    import os
+    import uuid
+
+    import soundfile as sf
+
+    d = _work_dir()
+    sr, n = 44100, 44100 * 5
+    y = np.stack([0.2 * np.sin(2 * np.pi * 440 * np.arange(n) / sr)] * 2).astype(np.float32)
+    for want in (320, 128):
+        p = d / f"out_{want}_{uuid.uuid4().hex}.mp3"
+        try:
+            assert tc.write_audio(p, y, sr, mp3_bitrate=want) is None
+            info = sf.info(str(p))
+            kbps = os.path.getsize(p) * 8 / info.duration / 1000
+            assert abs(kbps - want) < 12, f"请求 {want}k，实际 {kbps:.1f}k"
+        finally:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+
 # ---------------------------------------------------------------- 极简 runner
 
 if __name__ == "__main__":

@@ -493,25 +493,95 @@ def load_audio(path: Path):
     return y.astype(np.float32), int(sr)
 
 
-def write_audio(path: Path, y, sr: int, lang=None):
-    """写出音频；返回出错时的备注（None 表示成功）。备注按 lang/全局语言出中英。"""
+# MP3 输出码率控制。
+# libsndfile 没有「码率」参数，而是用 compression_level(0~1) 配合
+# bitrate_mode="CONSTANT" 映射到一组标准 CBR 码率。下面这张表是在
+# libsndfile 1.2.2 / soundfile 0.14.0 上逐档实测出来的（60 秒素材量体积）：
+#   0.00~0.10 -> 320   0.15~0.25 -> 256   0.30~0.35 -> 224   0.40~0.45 -> 192
+#   0.50~0.60 -> 160   0.65      -> 128   0.70      -> 112   0.75~0.80 -> 96
+# 注意：不指定这两个参数时，libsndfile 默认给的是约 142 kbps 的变码率——
+# 那就是「输入 320k、输出掉到 40% 体积、听感发沙」的根源，所以这里必须显式指定。
+MP3_BITRATES = (320, 256, 224, 192, 160, 128, 112, 96)
+_MP3_COMPRESSION = {320: 0.00, 256: 0.15, 224: 0.30, 192: 0.40,
+                    160: 0.50, 128: 0.65, 112: 0.70, 96: 0.75}
+DEFAULT_MP3_BITRATE = 320
+
+
+def source_bitrate_kbps(path: Path):
+    """估算输入文件的实际码率（kbps）；拿不到返回 None。
+
+    用「文件字节数 × 8 ÷ 时长」算，对 CBR 和 VBR 都成立（VBR 得到的是平均值）。
+    """
+    try:
+        import soundfile as sf
+
+        info = sf.info(str(path))
+        if not info.duration or info.duration <= 0:
+            return None
+        return int(round(os.path.getsize(path) * 8 / info.duration / 1000.0))
+    except Exception:
+        return None
+
+
+def _snap_mp3_bitrate(kbps) -> int:
+    """把任意码率吸附到最接近的可选档位（等距时取较高的一档）。"""
+    try:
+        v = float(kbps)
+    except (TypeError, ValueError):
+        return DEFAULT_MP3_BITRATE
+    return min(MP3_BITRATES, key=lambda b: (abs(b - v), -b))
+
+
+def resolve_mp3_bitrate(requested, path: Path) -> int:
+    """把用户选择解析成实际 CBR 码率（kbps）。
+
+    requested 可以是 "auto"/"source"/None（跟随原文件）、数字或数字字符串。
+    跟随原文件时：读不出输入码率（如 wav 输入）就用 320。
+    """
+    if requested is None or (isinstance(requested, str)
+                             and requested.strip().lower() in ("", "auto", "source")):
+        src = source_bitrate_kbps(path)
+        return DEFAULT_MP3_BITRATE if src is None else _snap_mp3_bitrate(src)
+    if isinstance(requested, str):
+        try:
+            requested = int(float(requested.strip()))
+        except ValueError:
+            return DEFAULT_MP3_BITRATE
+    return _snap_mp3_bitrate(requested)
+
+
+def write_audio(path: Path, y, sr: int, lang=None, mp3_bitrate=None):
+    """写出音频；返回出错时的备注（None 表示成功）。备注按 lang/全局语言出中英。
+
+    mp3_bitrate：仅对 .mp3 生效，单位 kbps（None = DEFAULT_MP3_BITRATE）。
+    """
     import soundfile as sf
 
     L = lang or _LANG
     data = y.T if y.ndim == 2 else y  # soundfile 要求 (帧, 声道)
+    suffix = path.suffix.lower()
     # OGG/Vorbis 的已知缺陷：某些 libsndfile 版本（实测 1.2.2 / soundfile 0.14.0）
     # 在写入超过约 50 万采样点时会让进程**原生崩溃**（0xC0000409），不是 Python
     # 异常，下面的 except 拦不住，批处理会连同已完成的报告一起丢失。因此对
     # Vorbis 超出阈值的情况直接改存 wav，绝不把进程交给 libsndfile。
-    if path.suffix.lower() in (".ogg", ".oga") and len(data) > _OGG_SAFE_FRAMES:
+    if suffix in (".ogg", ".oga") and len(data) > _OGG_SAFE_FRAMES:
         alt = path.with_suffix(".wav")
         sf.write(str(alt), np.ascontiguousarray(data), sr, subtype="PCM_16")
         return tr(f"{path.name} 过长，OGG 编码不可靠，已改存 {alt.name}",
                   f"{path.name} is too long for reliable OGG encoding; "
                   f"saved as {alt.name} instead", L)
     try:
-        if path.suffix.lower() in (".wav", ".flac"):
+        if suffix in (".wav", ".flac"):
             sf.write(str(path), np.ascontiguousarray(data), sr, subtype="PCM_16")
+        elif suffix == ".mp3":
+            br = int(mp3_bitrate or DEFAULT_MP3_BITRATE)
+            try:
+                sf.write(str(path), np.ascontiguousarray(data), sr,
+                         subtype="MPEG_LAYER_III", bitrate_mode="CONSTANT",
+                         compression_level=_MP3_COMPRESSION.get(br, 0.0))
+            except Exception:
+                # 旧版 libsndfile 不认这两个参数 → 退回库默认写法，总比写不出好
+                sf.write(str(path), np.ascontiguousarray(data), sr)
         else:
             sf.write(str(path), np.ascontiguousarray(data), sr)
         return None
@@ -1152,6 +1222,7 @@ class ConvertOptions:
     click_rel_db: float = -6.0            # 节拍器相对音乐响度的 dB（0=等响，负值更轻）
     music_loudness_db: float | None = None  # 手动指定音乐响度（默认自动测量，测试用）
     output_format: str = "source"       # source=与原文件同格式（默认）；或 wav/mp3/flac/ogg
+    mp3_bitrate: object = "auto"        # mp3 输出码率 kbps；"auto"=跟随原文件
     out_dir: Path | None = None         # None = 输入文件所在目录/tempo_converted
     mirror_dirs: bool = True            # 指定输出目录时，按输入目录层级镜像子文件夹
     max_slowdown: float = DEFAULT_MAX_SLOWDOWN   # 最多放慢多少（0.25 = 25%），用户可调
@@ -1282,7 +1353,8 @@ def _process_segmented(path, opt, y, sr, y_mono, seg_plans, row, notes,
     if fmt not in ("wav", "mp3", "flac", "ogg", "aiff", "aif"):
         fmt = "wav"
     out_path = _unique_output_path(Path(out_dir), path.stem, opt.target_bpm, f".{fmt}")
-    err = write_audio(out_path, y2, sr, lang=L)
+    br = resolve_mp3_bitrate(opt.mp3_bitrate, path) if fmt == "mp3" else None
+    err = write_audio(out_path, y2, sr, lang=L, mp3_bitrate=br)
     if err:
         notes.append(err)
         out_path = out_path.with_name(out_path.stem + ".wav")
@@ -1318,6 +1390,7 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
     用于在指定输出目录时镜像原目录层级；不传则退化为文件自身所在目录。
     """
     L = opt.lang or _LANG
+    path = Path(path)                     # 容错：调用方传 str 时不至于在 path.parent 上炸
     row = {"输入文件": str(path), "检测BPM": "", "检测方式": "", "目标BPM": opt.target_bpm,
            "拉伸后BPM": "", "拉伸比": "", "速度变化": "", "节拍关系": "",
            "节拍器BPM": "", "每拍点击数": "", "音乐响度dB": "",
@@ -1433,7 +1506,8 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
         if fmt not in ("wav", "mp3", "flac", "ogg", "aiff", "aif"):
             fmt = "wav"                      # 不支持的格式（如 m4a/aac 写不出）退回 wav
         out_path = _unique_output_path(Path(out_dir), path.stem, opt.target_bpm, f".{fmt}")
-        err = write_audio(out_path, y2, sr, lang=L)
+        br = resolve_mp3_bitrate(opt.mp3_bitrate, path) if fmt == "mp3" else None
+        err = write_audio(out_path, y2, sr, lang=L, mp3_bitrate=br)
         if err:
             notes.append(err)
             out_path = out_path.with_name(out_path.stem + ".wav")
@@ -1457,8 +1531,10 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
                    + tr(f"（音乐每拍敲 {plan.clicks_per_beat:g} 下），",
                         f", {plan.clicks_per_beat:g} click(s) per music beat, ", L)
                    + tr("音量为音乐响度 ", "volume ", L) + f"{opt.click_rel_db:+g} dB")
+        _brnote = tr(f"，mp3 {br} kbps", f", mp3 {br} kbps", L) if br else ""
         log_fn("  " + tr("输出     : ", "Output     : ", L) + str(out_path)
-               + tr("（", " (", L) + f"{dur:.2f}" + tr(" 秒）", " s)", L))
+               + tr("（", " (", L) + f"{dur:.2f}" + tr(" 秒", " s", L)
+               + _brnote + tr("）", ")", L))
     except Exception as e:
         em = localize_error(str(e), L)
         row["备注"] = tr("失败: ", "Failed: ", L) + em
@@ -1570,6 +1646,8 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
             click_rel_db="metronome relative volume (dB): matched to the music's own loudness, 0 = equal, negative = quieter (default -6)",
             engine="stretch engine: phasevocoder=pitch preserved (default); resample=tape-style (pitch follows speed)",
             output_format="output format (default source = same as input; unsupported formats like m4a fall back to wav)",
+            mp3_bitrate=("mp3 output bitrate in kbps: auto = match the input file's bitrate (default); "
+                         "or one of 320/256/224/192/160/128/112/96"),
             out_dir="output directory (default tempo_converted next to each input; when set, subfolders mirror the input layout by default, see --no-mirror-dirs)",
             no_mirror_dirs="do not mirror the folder layout (all files flat in the output dir)",
             recursive="search subfolders recursively",
@@ -1592,6 +1670,8 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
             click_rel_db="节拍器相对音量（dB）：以音乐自身响度为基准自动匹配，0=等响，负值更轻（默认 -6）",
             engine="变速引擎：phasevocoder=保音高（默认）；resample=磁带机式（音高随速度变化）",
             output_format="输出格式（默认 source=与原文件同格式；写不出的格式如 m4a 自动退回 wav）",
+            mp3_bitrate=("mp3 输出码率 kbps：auto=跟随输入文件的码率（默认）；"
+                         "或 320/256/224/192/160/128/112/96 之一"),
             out_dir=("输出目录（默认各输入文件所在目录下的 tempo_converted；"
                      "指定后默认按输入层级镜像子文件夹，见 --no-mirror-dirs）"),
             no_mirror_dirs="指定输出目录时不做层级镜像（所有文件平铺在输出目录下）",
@@ -1619,6 +1699,9 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
     ap.add_argument("--format", dest="output_format",
                     choices=["source", "wav", "mp3", "flac", "ogg"], default="source",
                     help=H["output_format"])
+    ap.add_argument("--mp3-bitrate", dest="mp3_bitrate", default="auto",
+                    choices=["auto"] + [str(b) for b in MP3_BITRATES],
+                    help=H["mp3_bitrate"])
     ap.add_argument("-o", "--out-dir", default=None, help=H["out_dir"])
     ap.add_argument("--no-mirror-dirs", dest="mirror_dirs", action="store_false", default=True,
                     help=H["no_mirror_dirs"])
@@ -1668,6 +1751,7 @@ def main(argv=None) -> int:
         metronome=args.metronome,
         click_rel_db=args.click_rel_db,
         output_format=args.output_format,
+        mp3_bitrate=args.mp3_bitrate,
         out_dir=Path(args.out_dir) if args.out_dir else None,
         mirror_dirs=bool(args.mirror_dirs),
         max_slowdown=max(0.0, float(args.max_slowdown)) / 100.0,
