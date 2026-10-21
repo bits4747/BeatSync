@@ -403,6 +403,8 @@ label.switch { display: flex; align-items: center; gap: 9px; cursor: pointer; pa
 .bitrate-seg { margin-top: 8px; }
 .bitrate-seg button { padding: 4px 4px; font-size: 13px; }
 .bitrate-seg button span { font-size: 13px; color: inherit; }
+/* 码率只对 MP3 输出有意义：其它输出类型整排置灰、不可点 */
+.bitrate-seg.disabled { opacity: .38; pointer-events: none; filter: saturate(.4); }
 
 .hint-line { font-size: 13.5px; color: var(--faint); margin-top: 6px; display: flex; align-items: center; gap: 4px; }
 .hint-line.strong { color: var(--accent-2); }

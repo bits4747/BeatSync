@@ -43,7 +43,7 @@ const ZH = {
   labelMaxFast: "最多加快",
   labelEngine: "变速方式",
   detectOnly: "只测速",
-  segments: "分段变速",
+  segments: "自动分段变速",
   segSpeeds: "每段速度",
   enginePv: "保音高",
   enginePvSub: "变速不变调",
@@ -53,7 +53,8 @@ const ZH = {
   formatSource: "原类型",
   formatSourceSub: "与输入相同",
   brAuto: "跟随原文件",
-  bitrateHint: "仅 MP3 输出有效；默认跟随原文件码率",
+  bitrateHint: "默认跟随原文件码率",
+  bitrateHintOff: "码率只对 MP3 输出有效",
   labelOutDir: "输出目录",
   choose: "选择…",
   restoreDefault: "恢复默认",
@@ -145,7 +146,7 @@ const EN = {
   labelMaxFast: "Max speed-up",
   labelEngine: "Stretch method",
   detectOnly: "Detect only",
-  segments: "Per-section",
+  segments: "Auto per-section",
   segSpeeds: "Section BPM",
   enginePv: "Keep pitch",
   enginePvSub: "changes tempo, keeps pitch",
@@ -155,7 +156,8 @@ const EN = {
   formatSource: "Same as input",
   formatSourceSub: "unchanged",
   brAuto: "Match source",
-  bitrateHint: "MP3 output only; defaults to the source bitrate",
+  bitrateHint: "Defaults to the source bitrate",
+  bitrateHintOff: "Bitrate applies to MP3 output only",
   labelOutDir: "Output folder",
   choose: "Choose…",
   restoreDefault: "Restore default",
@@ -640,7 +642,7 @@ function readOptions() {
     target: $("#targetBpm").value,
     manualBpm: $("#manualBpm").value.trim(),
     detectOnly: $("#detectOnly").checked,
-    segments: $("#segments").checked,
+    segments: $("#segments").checked ? "auto" : "off",
     engine: document.querySelector("#engineSeg .on")?.dataset.v || "phasevocoder",
     outputFormat: document.querySelector("#formatSeg .on")?.dataset.v || "source",
     mp3Bitrate: document.querySelector("#bitrateSeg .on")?.dataset.v || "auto",
@@ -664,7 +666,9 @@ function loadSettings() {
   if (s.target) $("#targetBpm").value = s.target;
   if (s.manualBpm) $("#manualBpm").value = s.manualBpm;
   if (s.detectOnly) $("#detectOnly").checked = true;
-  if (s.segments) $("#segments").checked = true;
+  // 默认开启（自动分段）。旧版本存的是布尔 false（那时默认就是关），不能当成
+  // 「用户主动关掉」——只有新版存下的字符串 "off"/"0" 才算显式关闭。
+  if (s.segments === "off" || s.segments === "0") $("#segments").checked = false;
   if (s.engine) segSelect("#engineSeg", s.engine);
   // 旧版本存的 wav/mp3/flac 仍照用；没存过则保持 HTML 默认的"原类型"
   if (s.outputFormat) segSelect("#formatSeg", s.outputFormat);
@@ -682,6 +686,7 @@ function loadSettings() {
   if (s.maxSpeedup !== undefined) $("#maxSpeedup").value = s.maxSpeedup;
   limitHintUpdate();
   metroPanelUpdate();
+  bitrateGateUpdate();
 }
 
 /* 变速上限：输入框数值与说明文字实时联动（一行短文案，避免换行占高） */
@@ -713,6 +718,21 @@ function timbreSelect(k) {
 
 function metroPanelUpdate() {
   $("#metroPanel").classList.toggle("disabled", !$("#metronome").checked);
+}
+
+/* 码率只对 MP3 输出有意义：输出类型选 WAV/FLAC 时整排置灰、不可点。
+   「原类型与输入相同」保留可点——输入可能就是 mp3，具体在 Python 侧按实际格式生效。 */
+function bitrateGateUpdate() {
+  const fmt = document.querySelector("#formatSeg .on")?.dataset.v || "source";
+  const off = fmt === "wav" || fmt === "flac";
+  const seg = $("#bitrateSeg");
+  if (!seg) return;
+  seg.classList.toggle("disabled", off);
+  seg.setAttribute("aria-disabled", off ? "true" : "false");
+  seg.querySelectorAll("button").forEach(b => { b.disabled = off; });
+  const onHint = $("#bitrateHintOn"), offHint = $("#bitrateHintOff");
+  if (onHint) onHint.classList.toggle("hidden", off);
+  if (offHint) offHint.classList.toggle("hidden", !off);
 }
 
 /* 音色卡片：中英两种名字都写进 DOM，由 CSS 按当前语言显示其中一个。
@@ -931,7 +951,7 @@ function bindUI() {
 
   // 分段选择
   document.querySelectorAll("#engineSeg button").forEach(b => b.onclick = () => { segSelect("#engineSeg", b.dataset.v); saveSettings(); });
-  document.querySelectorAll("#formatSeg button").forEach(b => b.onclick = () => { segSelect("#formatSeg", b.dataset.v); saveSettings(); });
+  document.querySelectorAll("#formatSeg button").forEach(b => b.onclick = () => { segSelect("#formatSeg", b.dataset.v); bitrateGateUpdate(); saveSettings(); });
   document.querySelectorAll("#bitrateSeg button").forEach(b => b.onclick = () => { segSelect("#bitrateSeg", b.dataset.v); saveSettings(); });
 
   // 节拍器

@@ -133,7 +133,7 @@ try {
           <div class="inl-head">
             <label data-t="labelEngine">变速方式</label>
             <label class="switch sm"><input id="detectOnly" type="checkbox"><i></i><span data-t="detectOnly">只测速</span></label>
-            <label class="switch sm"><input id="segments" type="checkbox"><i></i><span data-t="segments">分段变速</span></label>
+            <label class="switch sm"><input id="segments" type="checkbox" checked><i></i><span data-t="segments">自动分段变速</span></label>
           </div>
           <div class="segmented" id="engineSeg">
             <button type="button" data-v="phasevocoder" class="on"><span data-t="enginePv">保音高</span><span data-t="enginePvSub">变速不变调</span></button>
@@ -157,7 +157,8 @@ try {
             <button type="button" data-v="192">192k</button>
             <button type="button" data-v="128">128k</button>
           </div>
-          <p class="hint-line" data-t="bitrateHint">仅 MP3 输出有效；默认跟随原文件码率</p>
+          <p class="hint-line" id="bitrateHintOn" data-t="bitrateHint">默认跟随原文件码率</p>
+          <p class="hint-line hidden" id="bitrateHintOff" data-t="bitrateHintOff">码率只对 MP3 输出有效</p>
         </div>
 
         <!-- 第 5 行：输出目录（与输出类型分开，避免挤在一起） -->

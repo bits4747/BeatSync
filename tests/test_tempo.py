@@ -318,22 +318,68 @@ def test_segment_metronome_follows_each_section():
 
 
 def test_segment_infeasible_skips_whole_track():
-    """任一段超出加减速上限 → 整首不做变速（返回 infeasible，调用方跳过整首）。
+    """on 模式：任一段超出加减速上限 → 整首不做变速（返回 infeasible，调用方跳过整首）。
 
     需求 m02195：不允许「只变可行段、跳过越限段」——那会让交接点两侧速度对不上。
+    这里显式关掉自动合并（merge_infeasible=False），模拟界面勾选「强制分段」。
     """
     y, _half = _two_section_track()
     plans, infeasible = tc._segment_plans(y, SR, 180.0, False,
-                                          max_slowdown=0.01, max_speedup=0.01, lang="zh")
+                                          max_slowdown=0.01, max_speedup=0.01, lang="zh",
+                                          merge_infeasible=False)
     assert infeasible is not None, "1% 的紧上限下必然有段落越限"
     _t0, _t1, _bpm, _why = infeasible
     assert _bpm > 0 and _why, "越限信息应包含该段速度与原因"
     assert all(p[2] is None for p in plans), "越限时不得返回任何可行段方案"
 
 
-def test_segmented_options_default_off():
-    """硬约束：分段是 opt-in，默认值必须是 False（默认路径行为完全不变）。"""
-    assert tc.ConvertOptions().segments is False
+def test_segment_auto_merges_infeasible_section():
+    """auto 模式：越限段并入速度相近的邻段，而不是把整首歌丢掉。
+
+    现实案例：一首歌中间有 6~10 秒的过渡/加花段，它自己「加速差一点、减速也
+    差一点」，但并进速度相近的大段后整段可行——此时应当照常出文件。
+    """
+    y, _half = _two_section_track()
+    plans, infeasible = tc._segment_plans(y, SR, 180.0, False,
+                                          max_slowdown=0.01, max_speedup=0.01, lang="zh",
+                                          merge_infeasible=True)
+    # 1% 上限下所有段都不可行 → 一路并到整曲 → 交回「没发现变拍」的单段形式，
+    # 由整曲单速路径决定跳不跳，而不是在分段这一层把歌判死。
+    assert infeasible is None
+    assert len(plans) == 1 and plans[0][2] is None
+
+
+def test_segments_worthwhile_guard():
+    """auto 模式：段间速度差不够大时不值得分段。"""
+    class _P:
+        def __init__(self, bpm):
+            self.bpm = bpm
+
+    def mk(*bpms):
+        return [(0.0, 1.0, _P(b)) for b in bpms]
+
+    assert tc._segments_worthwhile(mk(100.0, 140.0)) is True
+    assert tc._segments_worthwhile(mk(100.0, 106.0)) is False
+    assert tc._segments_worthwhile(mk(100.0)) is False
+
+
+def test_segments_mode_normalisation():
+    """opt.segments 接受 bool 与 "auto"/"on"/"off" 三态字符串。"""
+    class _O:
+        def __init__(self, v):
+            self.segments = v
+
+    assert tc._segments_mode(_O("auto")) == "auto"
+    assert tc._segments_mode(_O("on")) == "on"
+    assert tc._segments_mode(_O("off")) == "off"
+    assert tc._segments_mode(_O(True)) == "on"
+    assert tc._segments_mode(_O(False)) == "off"
+    assert tc._segments_mode(_O(None)) == "auto"
+
+
+def test_segmented_options_default_auto():
+    """默认是 auto：检测到明显变拍就自动分段（变拍歌默认也能对上节拍器）。"""
+    assert tc.ConvertOptions().segments == "auto"
 
 
 # ---------------------------------------------------------------- mp3 码率

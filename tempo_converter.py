@@ -854,37 +854,161 @@ def detect_tempo_segments(y_mono, sr: int, dedup_s=2.0, merge_ratio=0.10,
     return out
 
 
+SEG_GRID_MIN_SCORE = 1.10   # 段内拍网格「命中比」低于此值 → 认为该段拍子没跟上
+SEG_MIN_SPREAD = 1.15       # auto 模式：最快/最慢段速度比低于此值不值得分段
+SEG_MIN_SEG_S = 8.0         # 分段最短时长（太短的段测速不可靠，并入邻段）
+
+
+def _seg_align_score(onset, rms, sr: int, beats, t0: float, t1: float,
+                     hop: int = 256) -> float:
+    """段内拍网格的「命中比」：拍点处 onset 均值 ÷ 该段有效帧 onset 均值。
+
+    >1 表示拍点确实落在起音上；≈1 表示网格和音乐基本无关（拍子没跟上）。
+    只统计非静音帧，避免淡出尾巴把基准拉低。
+    """
+    n = min(len(onset), len(rms))
+    f0 = max(0, min(int(t0 * sr / hop), n))
+    f1 = max(0, min(int(t1 * sr / hop), n))
+    if f1 - f0 < 8 or not len(rms):
+        return 0.0
+    env, r = onset[f0:f1], rms[f0:f1]
+    v = r > float(np.max(rms)) * 0.03
+    if not bool(np.any(v)):
+        return 0.0
+    base = float(np.mean(env[v]))
+    if base <= 0:
+        return 0.0
+    idx = [int(round(float(t) * sr / hop)) - f0 for t in beats if t0 <= float(t) < t1]
+    idx = [i for i in idx if 0 <= i < len(env) and bool(v[i])]
+    if len(idx) < 4:
+        return 0.0
+    return float(np.mean(env[idx])) / base
+
+
+def _segments_mode(opt) -> str:
+    """把 opt.segments（bool 或 "auto"/"on"/"off"）规整成三态字符串。
+
+    auto = 只在检测到**明显**变拍时自动分段（默认）；on = 强制分段（严格：
+    任一段越限则整首跳过）；off = 一律整曲单速。
+    """
+    v = getattr(opt, "segments", "auto")
+    if isinstance(v, str):
+        v = v.strip().lower()
+        if v in ("auto", "on", "off"):
+            return v
+        if v in ("1", "true", "yes", "force"):
+            return "on"
+        if v in ("0", "false", "no", "none", ""):
+            return "off"
+        return "auto"
+    if v is None:
+        return "auto"
+    return "on" if v else "off"
+
+
+def _segments_worthwhile(plans) -> bool:
+    """auto 模式：段间速度差是否大到值得分段（最快/最慢 ≥ SEG_MIN_SPREAD）。
+
+    分段会对每段各做一次变速与拼接，本身有代价（接缝、音质）；只差百分之几的
+    「速度漂移」不值得切，宁可整曲单速。
+    """
+    bpms = [sp.bpm for (_t0, _t1, sp) in plans if sp is not None]
+    if len(bpms) < 2:
+        return False
+    lo, hi = min(bpms), max(bpms)
+    return lo > 0 and (hi / lo) >= SEG_MIN_SPREAD
+
+
 def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
                    max_slowdown: float = DEFAULT_MAX_SLOWDOWN,
-                   max_speedup: float = DEFAULT_MAX_SPEEDUP, lang=None):
+                   max_speedup: float = DEFAULT_MAX_SPEEDUP, lang=None,
+                   min_seg_s: float = SEG_MIN_SEG_S,
+                   merge_infeasible: bool = True):
     """分段测速 + 每段各按原「最小变速」规则出方案。
 
     返回 (plans, infeasible)。
 
     - plans：[(t0, t1, SegmentPlan)]；段数 == 1（infeasible 为 None）表示「没发现
-      变拍」，调用方应退回整曲单方案路径（保持默认行为字节级不变）。
-    - infeasible：None，或 (t0, t1, bpm, reason) —— 表示检测到多段、但**其中某段**
-      按上下限算不出可行方案。此时调用方必须把**整首歌**跳过（不生成文件、
-      也不退回整曲处理）：只要有一段超出加减速上限，整首就不变（用户要求，
-      2026-10 需求 m02195）。不做「只变可行段、跳过越限段」这种事——那会让
-      一首歌里有的段变了、有的段没变，交接点两侧速度对不上。
+      明显变拍」，调用方应退回整曲单方案路径。
+    - infeasible：None，或 (t0, t1, bpm, reason) —— 表示多段且**某段**按上下限
+      算不出可行方案。auto 模式由调用方退回整曲处理（不丢歌）；on 模式按
+      m02195 的规则把整首跳过。
 
-    某段测不到速度（太安静/太短）时 detect_tempo 仍抛 RuntimeError，由调用方
-    退回整曲处理（那是「读不出」而非「越限」，与默认行为一致地保守回退）。
+    两道「合并」闸门（都不改变「每段各按最小变速」这条主规则）：
+      1. 拍网格跟不上（命中比 < SEG_GRID_MIN_SCORE）的段 → 并入拍网格更可信
+         的邻段。典型是淡出尾奏、噪声段：单独给它一个网格反而更糟。
+      2. 算不出可行方案的段 → 并入速度更接近（log2 域距离最小）的邻段。
+         典型是两三秒的过渡/加花段，它自己「加速差一点、减速也差一点」，
+         但并进速度相近的大段后整段是可行的。
+    每轮只处理最该处理的一段，然后对合并后的段重新测速，直到没有需要处理的段。
     """
-    segs = detect_tempo_segments(y_mono, sr, lang=lang)
+    segs = detect_tempo_segments(y_mono, sr, min_seg_s=min_seg_s, lang=lang)
+    total = len(y_mono) / sr
     if len(segs) < 2:
         return [(segs[0][0], segs[0][1], None)], None
-    out = []
-    for (t0, t1) in segs:
-        a, b = int(t0 * sr), int(t1 * sr)
-        bpm, beats = detect_tempo(y_mono[a:b], sr, lang)
-        plan = choose_stretched_tempo(bpm, target, strict, max_slowdown, max_speedup)
-        if plan is None:
-            reason = stretch_limits_text(bpm, target, max_slowdown, max_speedup, lang=lang)
-            return [(t0, t1, None)], (t0, t1, float(bpm), reason)
-        out.append((t0, t1, SegmentPlan(t0, t1, float(bpm),
-                                        np.asarray(beats, dtype=np.float64), plan)))
+
+    import librosa
+    onset = librosa.onset.onset_strength(y=y_mono, sr=sr, hop_length=256)
+    rms = librosa.feature.rms(y=y_mono, frame_length=2048, hop_length=256)[0]
+
+    infos = []
+    for _round in range(8):
+        infos = []
+        for (t0, t1) in segs:
+            a, b = int(t0 * sr), int(t1 * sr)
+            try:
+                bpm, beats = detect_tempo(y_mono[a:b], sr, lang)
+            except RuntimeError:
+                bpm, beats = 0.0, np.asarray([], dtype=np.float64)   # 该段读不出 → 并入邻段
+            rel = np.asarray(beats, dtype=np.float64)
+            plan = (choose_stretched_tempo(bpm, target, strict, max_slowdown, max_speedup)
+                    if bpm > 0 else None)
+            infos.append({"t0": t0, "t1": t1, "bpm": float(bpm), "beats": rel,
+                          "plan": plan,
+                          "score": _seg_align_score(onset, rms, sr, rel + t0, t0, t1)})
+        if len(infos) < 2:
+            break
+        bad_plan = [i for i, s in enumerate(infos) if s["plan"] is None]
+        if bad_plan and not merge_infeasible:
+            break                     # on 模式：越限即整首跳过，不做合并
+        weak = [i for i, s in enumerate(infos) if s["score"] < SEG_GRID_MIN_SCORE]
+        if bad_plan:
+            i = bad_plan[0]
+        elif weak:
+            i = min(weak, key=lambda k: infos[k]["score"])
+        else:
+            break
+        # 选并入方向：越限段看速度是否更接近；弱网格段看邻段网格是否更可信
+        cand = []
+        if i > 0:
+            if infos[i]["plan"] is None:
+                d = abs(math.log2(infos[i]["bpm"] / infos[i - 1]["bpm"])) \
+                    if infos[i]["bpm"] > 0 and infos[i - 1]["bpm"] > 0 else 0.0
+            else:
+                d = -infos[i - 1]["score"]
+            cand.append((d, i - 1))
+        if i < len(infos) - 1:
+            if infos[i]["plan"] is None:
+                d = abs(math.log2(infos[i]["bpm"] / infos[i + 1]["bpm"])) \
+                    if infos[i]["bpm"] > 0 and infos[i + 1]["bpm"] > 0 else 0.0
+            else:
+                d = -infos[i + 1]["score"]
+            cand.append((d, i + 1))
+        if not cand:
+            break
+        j = min(cand)[1]
+        lo, hi = min(i, j), max(i, j)
+        segs = sorted([(s["t0"], s["t1"]) for k, s in enumerate(infos) if k not in (lo, hi)]
+                      + [(infos[lo]["t0"], infos[hi]["t1"])])
+
+    if len(infos) < 2:
+        return [(0.0, total, None)], None
+    for s in infos:
+        if s["plan"] is None:
+            reason = stretch_limits_text(s["bpm"], target, max_slowdown, max_speedup, lang=lang)
+            return [(s["t0"], s["t1"], None)], (s["t0"], s["t1"], float(s["bpm"]), reason)
+    out = [(s["t0"], s["t1"], SegmentPlan(s["t0"], s["t1"], s["bpm"], s["beats"], s["plan"]))
+           for s in infos]
     # 相邻段方案完全相同（同倍频档同 rate）→ 合并，少一次无谓拼接
     merged = []
     for item in out:
@@ -1228,7 +1352,10 @@ class ConvertOptions:
     max_slowdown: float = DEFAULT_MAX_SLOWDOWN   # 最多放慢多少（0.25 = 25%），用户可调
     max_speedup: float = DEFAULT_MAX_SPEEDUP     # 最多加快多少（0.50 = 50%），用户可调
     lang: str | None = None             # 输出语言（None=跟随全局 set_lang；"zh"/"en"）
-    segments: bool = False              # 分段变速：先找变拍点，每段各按最小变速规则处理
+    # 分段变速："auto"（默认，检测到明显变拍才分段，分段不适用则退回整曲）/
+    # "on"（强制分段，任一段越限则整首跳过）/ "off"（一律整曲单速）。
+    # 也接受 True/False（True→on，False→off），兼容旧调用方。
+    segments: object = "auto"
 
 
 def _unique_output_path(out_dir: Path, stem: str, target_bpm: float, ext: str) -> Path:
@@ -1422,19 +1549,21 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
         #      关键语义（需求 m02195）：检测到多段但**任一段**超出加减速上限时，
         #      整首跳过、不生成文件、也不退回整曲处理——避免出现「一首歌里有的段
         #      变了、有的段没变」导致交接点两侧速度对不上。
+        seg_mode = _segments_mode(opt)
         seg_plans = None
         seg_infeasible = None
-        if opt.segments and not (opt.bpm and opt.bpm > 0):
+        if seg_mode != "off" and not (opt.bpm and opt.bpm > 0):
             try:
                 cand, seg_infeasible = _segment_plans(
                     y_mono, sr, opt.target_bpm, opt.strict,
-                    opt.max_slowdown, opt.max_speedup, lang=L)
+                    opt.max_slowdown, opt.max_speedup, lang=L,
+                    merge_infeasible=(seg_mode == "auto"))
                 if seg_infeasible is None:
-                    if len(cand) > 1:
+                    if len(cand) > 1 and (seg_mode == "on" or _segments_worthwhile(cand)):
                         seg_plans = cand
                     else:
-                        notes.append(tr("未发现变拍，按整曲处理",
-                                        "no tempo change detected; processed as one piece", L))
+                        notes.append(tr("未发现明显变拍，按整曲处理",
+                                        "no significant tempo change; processed as one piece", L))
             except RuntimeError as re:
                 notes.append(tr("分段变速不可用（",
                                 "segmented mode unavailable (", L) + str(re)
@@ -1444,14 +1573,20 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
                                       row, notes, log_fn, rel_base)
         if seg_infeasible is not None:
             _t0, _t1, _bpm, _why = seg_infeasible
-            row["检测方式"] = tr("自动检测·分段", "Auto · segmented", L)
-            row["备注"] = (tr("跳过：", "Skipped: ", L)
-                           + tr("分段变速中有段落超出加减速上限",
-                               "a section exceeds the stretch limits in segmented mode", L)
-                           + tr("：", ": ", L) + _why
-                           + tr("，整首不做变速", "; the whole track is left unchanged", L))
-            log_fn("  " + row["备注"])
-            return row
+            if seg_mode == "auto":
+                # 自动模式：分段不可行就退回整曲单速，绝不因为「分段失败」把歌丢掉。
+                notes.append(tr("分段变速不适用（",
+                                "segmented mode not applicable (", L) + _why
+                             + tr("），已按整曲处理", "); processed as one piece", L))
+            else:
+                row["检测方式"] = tr("自动检测·分段", "Auto · segmented", L)
+                row["备注"] = (tr("跳过：", "Skipped: ", L)
+                               + tr("分段变速中有段落超出加减速上限",
+                                   "a section exceeds the stretch limits in segmented mode", L)
+                               + tr("：", ": ", L) + _why
+                               + tr("，整首不做变速", "; the whole track is left unchanged", L))
+                log_fn("  " + row["备注"])
+                return row
 
         # 2) 选最小变速方案（受用户设定的变速上限约束；都不满足 → 跳过该文件）
         plan = choose_stretched_tempo(detected, opt.target_bpm, opt.strict,
@@ -1655,9 +1790,10 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
             max_slowdown="max slowdown percentage for the music before switching to a speedup option (0~100, default %g)",
             max_speedup="max speedup percentage; files beyond both limits are skipped (0~100, default %g)",
             lang="output language: zh / en (default zh; affects notes, logs and the report)",
-            segments=("detect tempo changes inside each track and convert every section with its "
-                      "own minimum-stretch plan (seams cross-faded); if any section is beyond the "
-                      "limits the whole track is left unchanged; ignored with --bpm"),
+            segments=("tempo-change handling: auto = detect clear tempo changes inside each track and "
+                      "convert every section with its own minimum-stretch plan (seams cross-faded; "
+                      "default), on = always split (the whole track is left unchanged if any section "
+                      "exceeds the limits), off = one speed for the whole track; ignored with --bpm"),
         )
     else:
         H = dict(
@@ -1680,8 +1816,9 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
             max_slowdown="最多把音乐放慢多少百分比，超出就改用加速方案（0~100，默认 %g)",
             max_speedup="最多把音乐加快多少百分比，两个上限都不满足的文件将被跳过（0~100，默认 %g)",
             lang="输出语言：zh / en（默认 zh；影响备注、日志与报告）",
-            segments=("检测曲内变拍，每段各按最小变速规则处理（拼接点做交叉淡化）；"
-                      "任一段超出加减速上限时整首不变速；手动指定 --bpm 时不分段"),
+            segments=("变拍处理：auto=检测到明显变拍时自动分段，每段各按最小变速规则处理"
+                      "（拼接点做交叉淡化；默认）；on=总是分段（任一段超出加减速上限时整首不变速）；"
+                      "off=整曲单速；手动指定 --bpm 时不分段"),
         )
     ap = argparse.ArgumentParser(
         description=description,
@@ -1712,7 +1849,8 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
     ap.add_argument("--max-speedup", type=float, default=DEFAULT_MAX_SPEEDUP * 100,
                     metavar="PCT", help=H["max_speedup"] % (DEFAULT_MAX_SPEEDUP * 100))
     ap.add_argument("--lang", choices=["zh", "en"], default=None, help=H["lang"])
-    ap.add_argument("--segments", action="store_true", help=H["segments"])
+    ap.add_argument("--segments", nargs="?", const="on", default="auto",
+                    choices=["auto", "on", "off"], help=H["segments"])
     return ap
 
 
@@ -1757,7 +1895,7 @@ def main(argv=None) -> int:
         max_slowdown=max(0.0, float(args.max_slowdown)) / 100.0,
         max_speedup=max(0.0, float(args.max_speedup)) / 100.0,
         lang=L,
-        segments=bool(getattr(args, "segments", False)),
+        segments=getattr(args, "segments", "auto"),
     )
 
     pairs = list(collect_inputs_with_base(args.inputs, args.recursive))

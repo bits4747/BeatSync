@@ -562,7 +562,7 @@ class Api:
             mirror_dirs=bool(opts.get("mirrorDirs", True)),
             max_slowdown=_pct(opts.get("maxSlowdown"), tc.DEFAULT_MAX_SLOWDOWN),
             max_speedup=_pct(opts.get("maxSpeedup"), tc.DEFAULT_MAX_SPEEDUP),
-            segments=bool(opts.get("segments")),
+            segments=(opts.get("segments") if opts.get("segments") not in (None, "") else "auto"),
             lang=lang,
         )
         self.stop_event.clear()

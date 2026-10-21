@@ -167,7 +167,9 @@ python tempo_converter.py song.flac -t 90 --bpm 88
 python tempo_converter.py song.mp3 -t 180 --strict
 
 # per-section speed change: split at detected tempo changes, stretch each section on its own
-python tempo_converter.py song.mp3 -t 180 --segments
+# (auto segmentation is the default, so this flag is usually unnecessary;
+#  --segments off disables it, --segments on forces it)
+python tempo_converter.py song.mp3 -t 180 --segments on
 ```
 
 The output is Chinese by default; add `--lang en` to make the console output and the report English.
@@ -192,21 +194,37 @@ For every option see `python tempo_converter.py --help` (Chinese) or `--lang en 
 | `--report` | CSV report path (default `conversion_report.csv` in the current directory) |
 | `--max-slowdown` | maximum slow-down percentage, default 20 |
 | `--max-speedup` | maximum speed-up percentage, default 50 |
-| `--segments` | per-section speed change: detect tempo changes inside the track and stretch each section with its own minimum-stretch plan (seams cross-faded); ignored with `--bpm` |
+| `--segments` | three-state per-section mode: `auto` (default — segment automatically when a clear tempo change is detected), `on` (force segmentation; any infeasible section skips the whole track), `off` (always one rate for the whole track); a bare flag means `on`; ignored with `--bpm` |
 
 ---
 
 ## Per-section speed change
 
-By default the whole track is matched to a single detected BPM. If a song changes tempo halfway (say 100 BPM in the verse, 140 BPM in the chorus), one global rate leaves the metronome drifting off the beat through the changed part. With `--segments` (or the "Per-section" switch in either interface):
+**`auto` is the default**: the whole track is matched to a single detected BPM, but if a clear tempo change is detected (sections differ by ≥15%) it is split into speed sections, each stretched with its own minimum-stretch plan. Use `--segments on` to force segmentation, `--segments off` to disable it (or the "Auto per-section" switch in either interface).
 
-1. the tempo curve is split at detected change points by least-squares segmentation; a steady track yields one section and falls back to the normal single-plan path;
+Why it matters: on tracks like Rush's "YYZ", the intro runs at a different tempo from the body. One global rate (140→180, ×1.28) leaves the intro's metronome completely off — the intro's own pulse is around 208 BPM, so after stretching it sits near 266, nowhere near the 180 clicks. With segmentation the intro is handled at its own tempo and the clicks land.
+
+The pipeline:
+
+1. the tempo curve is split at detected change points by least-squares segmentation; a steady track yields one section and falls back to the normal single-plan path, and sections closer than 15% are not split (no seam for a few percent);
 2. each section is measured and stretched on its own, using the original minimum-stretch rule;
-3. each seam searches a low-energy cut on **both** sides and applies a 5 ms equal-power cross-fade, so the join stays below the music's own transient level (a "seam score > 1" note in the report means "worth an ear check");
-4. the metronome follows each section's own beat grid, so clicks stay on the beat across seams;
-5. if **any** section has no feasible plan within the current limits, the **whole track is left unchanged** (no file is produced; the remark starts with "Skipped:"). We never stretch only the feasible sections — that would leave the two sides of a seam at different speeds.
+3. **grid-quality gate**: every section's beat grid is scored by "mean onset strength at the beats ÷ mean onset strength over the section" (>1 means the beats land on attacks, ≈1 means the grid is unrelated to the music). A section scoring below 1.10 is merged into the more trustworthy neighbour and re-measured rather than clicked blindly;
+4. each seam searches a low-energy cut on **both** sides and applies a 5 ms equal-power cross-fade, so the join stays below the music's own transient level (a "seam score > 1" note in the report means "worth an ear check");
+5. the metronome follows each section's own beat grid, so clicks stay on the beat across seams;
+6. **if a section has no feasible plan within the current limits** (say a 6-second transition that is "a bit too fast to slow down and a bit too slow to speed up"), `auto` merges it into the nearer-in-tempo neighbour and re-measures — as long as the merged section is feasible the file is produced, and **a short section never throws the whole track away**. `on` (forced) keeps the strict contract: if **any** section is infeasible the **whole track is left unchanged** (no file is produced; the remark starts with "Skipped:"). We never stretch only the feasible sections — that would leave the two sides of a seam at different speeds.
 
-The report is still one row: the detected BPM / stretched BPM / speed change of the sections are joined with ` / `, and per-section details go into the remarks; the UI also lists each section's speed side by side (e.g. `100→90｜154→180`). **Without the switch, behaviour is byte-for-byte the same as before.**
+The report is still one row: the detected BPM / stretched BPM / speed change of the sections are joined with ` / `, and per-section details go into the remarks; the UI also lists each section's speed side by side (e.g. `100→90｜154→180`). A steady track under `auto` behaves exactly like the single-plan path (one section detected → normal path).
+
+Measured on "YYZ", target 180 — hit-ratio for the single-rate path vs automatic segmentation, all four regions improve:
+
+| Region | Single rate | Auto segmented |
+| --- | --- | --- |
+| Intro 0–32.9s | 0.946 (worse than random) | **1.531** |
+| Transition 32.9–42.6s | 0.858 | 0.922 |
+| Body 42.6–253.2s | 1.220 | **2.021** |
+| Outro 253.2–267s | 0.980 | 1.118 |
+
+The two sections chosen automatically are `0–42.6s @102.8 → 90 BPM (−12.5%, 2 clicks per beat)` and `42.6–267s @140.7 → 180 BPM (+27.9%, 1 click per beat)`, both clicking at 180.
 
 ## Output
 
