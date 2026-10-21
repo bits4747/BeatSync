@@ -256,8 +256,9 @@ def test_segments_keep_steady_track_whole():
 def test_segment_plans_each_within_limits():
     """每段各按最小变速规则出方案：rate 必须落在用户上下限内，倍率档互相独立。"""
     y, _ = _two_section_track()
-    plans = tc._segment_plans(y, SR, 180.0, False,
-                              tc.DEFAULT_MAX_SLOWDOWN, tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+    plans, infeasible = tc._segment_plans(y, SR, 180.0, False,
+                                          tc.DEFAULT_MAX_SLOWDOWN, tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+    assert infeasible is None, f"两段曲都应在限内，实际越限: {infeasible}"
     real = [p for p in plans if p[2] is not None]
     assert len(real) >= 2, "两段曲应得到两份方案"
     for (_t0, _t1, sp) in real:
@@ -275,10 +276,10 @@ def test_segment_stitch_seam_is_quiet():
     不能用分位数——合成曲每段起点是重音，硬切时接缝正砸在重音上（对照见 _dev 原型）。
     """
     y, _ = _two_section_track()
-    plans = [p for p in tc._segment_plans(y, SR, 180.0, False,
-                                          tc.DEFAULT_MAX_SLOWDOWN,
-                                          tc.DEFAULT_MAX_SPEEDUP, lang="zh")
-             if p[2] is not None]
+    plans, _inf = tc._segment_plans(y, SR, 180.0, False,
+                                    tc.DEFAULT_MAX_SLOWDOWN,
+                                    tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+    plans = [p for p in plans if p[2] is not None]
     assert len(plans) >= 2
     y2 = np.stack([y, y]).astype(np.float32)      # 主干接口是 (声道, 采样)
     out, origins, _ht, _sc = tc._stitch_segments(y2, SR, plans, "phasevocoder")
@@ -295,10 +296,10 @@ def test_segment_stitch_seam_is_quiet():
 def test_segment_metronome_follows_each_section():
     """节拍器关：输出音乐自己的每个拍点都必须有点击落在上面（跨段不错拍）。"""
     y, _ = _two_section_track()
-    plans = [p for p in tc._segment_plans(y, SR, 180.0, False,
-                                          tc.DEFAULT_MAX_SLOWDOWN,
-                                          tc.DEFAULT_MAX_SPEEDUP, lang="zh")
-             if p[2] is not None]
+    plans, _inf = tc._segment_plans(y, SR, 180.0, False,
+                                    tc.DEFAULT_MAX_SLOWDOWN,
+                                    tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+    plans = [p for p in plans if p[2] is not None]
     assert len(plans) >= 2
     y2 = np.stack([y, y]).astype(np.float32)
     out, origins, _ht, _sc = tc._stitch_segments(y2, SR, plans, "phasevocoder")
@@ -314,6 +315,20 @@ def test_segment_metronome_follows_each_section():
                 worst = max(worst, float(np.min(np.abs(origins[i] + clicks - b))))
     # 拉伸后拍点会有 ~1 个相位窗的量化偏差；0.1 s 是「明显错拍」和「跟得上」的分界
     assert worst < 0.1, f"最坏拍点-点击偏差 {worst * 1000:.1f}ms：跨段错拍"
+
+
+def test_segment_infeasible_skips_whole_track():
+    """任一段超出加减速上限 → 整首不做变速（返回 infeasible，调用方跳过整首）。
+
+    需求 m02195：不允许「只变可行段、跳过越限段」——那会让交接点两侧速度对不上。
+    """
+    y, _half = _two_section_track()
+    plans, infeasible = tc._segment_plans(y, SR, 180.0, False,
+                                          max_slowdown=0.01, max_speedup=0.01, lang="zh")
+    assert infeasible is not None, "1% 的紧上限下必然有段落越限"
+    _t0, _t1, _bpm, _why = infeasible
+    assert _bpm > 0 and _why, "越限信息应包含该段速度与原因"
+    assert all(p[2] is None for p in plans), "越限时不得返回任何可行段方案"
 
 
 def test_segmented_options_default_off():

@@ -44,6 +44,7 @@ const ZH = {
   labelEngine: "变速方式",
   detectOnly: "只测速",
   segments: "分段变速",
+  segSpeeds: "每段速度",
   enginePv: "保音高",
   enginePvSub: "变速不变调",
   engineRs: "磁带机式",
@@ -143,6 +144,7 @@ const EN = {
   labelEngine: "Stretch method",
   detectOnly: "Detect only",
   segments: "Per-section",
+  segSpeeds: "Section BPM",
   enginePv: "Keep pitch",
   enginePvSub: "changes tempo, keeps pitch",
   engineRs: "Tape style",
@@ -350,7 +352,12 @@ function mockBridge() {
       const mock = [
         { status: "done", detected: "95.1", a2: "90.0", rate: "0.9464", relation: "每拍敲 2 下", clickBpm: "180" },
         { status: "done", detected: "108.9", a2: "90.0", rate: "0.8264", relation: "每拍敲 2 下", clickBpm: "180" },
-        { status: "done", detected: "122.5", a2: "180.0", rate: "1.4694", relation: "每拍敲 1 下", clickBpm: "180" },
+        { status: "done", detected: "100.0", a2: "90.0", rate: "0.9000", relation: "每拍敲 2 下", clickBpm: "180",
+          segments: [
+            { detected: "100.0", a2: "90.0", rate: "0.9000" },
+            { detected: "154.0", a2: "180.0", rate: "1.1688" },
+            { detected: "130.0", a2: "180.0", rate: "1.3846" },
+          ] },
         { status: "done", detected: "140.2", a2: "180.0", rate: "1.2839", relation: "每拍敲 1 下", clickBpm: "180" },
         { status: "done", detected: "163.9", a2: "180.0", rate: "1.0982", relation: "每拍敲 1 下", clickBpm: "180" },
       ];
@@ -363,6 +370,7 @@ function mockBridge() {
           type: "file-status", path: p, status: m.status, index: i + 1,
           detected: m.detected, a2: m.a2, rate: m.rate,
           relation: m.relation, clickBpm: m.clickBpm, note: m.note || "",
+          segments: m.segments || null,
           out: m.status === "done" ? p.replace(/\.(\w+)$/, "_180bpm.wav") : "",
         });
         __appEvent({ type: "progress", done: i + 1, total: files.length });
@@ -576,7 +584,15 @@ function fileRow(item) {
   // 失败/跳过原因例外——那是必须让用户看到的信息。其余备注（峰值限制等）不再显示，
   // 完整细节在 CSV 报告的「备注」列里。
   const parts = [];
-  if (item.info && item.info.detected) {
+  const segs = item.info && Array.isArray(item.info.segments) ? item.info.segments : null;
+  if (segs && segs.length >= 2) {
+    // 分段变速：把每一段自己的速度标出来，如「每段速度 100→90（-10.0%）｜140→180（+28.4%）」
+    const list = segs.map((s) => {
+      const pct = fmtPercent(s.rate);
+      return `${s.detected}→${s.a2}${pct ? `（${pct}）` : ""}`;
+    }).join("｜");
+    parts.push(`<span class="accent">${t("segSpeeds")}</span> ${escapeHtml(list)}`);
+  } else if (item.info && item.info.detected) {
     parts.push(`<span class="accent">${item.info.detected} BPM</span>`);
     if (item.info.a2) parts.push(`${item.info.a2}（${fmtPercent(item.info.rate)}）`);
     if (item.info.relation) parts.push(item.info.relation);

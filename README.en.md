@@ -202,9 +202,10 @@ By default the whole track is matched to a single detected BPM. If a song change
 1. the tempo curve is split at detected change points by least-squares segmentation; a steady track yields one section and falls back to the normal single-plan path;
 2. each section is measured and stretched on its own, using the original minimum-stretch rule;
 3. each seam searches a low-energy cut on **both** sides and applies a 5 ms equal-power cross-fade, so the join stays below the music's own transient level (a "seam score > 1" note in the report means "worth an ear check");
-4. the metronome follows each section's own beat grid, so clicks stay on the beat across seams.
+4. the metronome follows each section's own beat grid, so clicks stay on the beat across seams;
+5. if **any** section has no feasible plan within the current limits, the **whole track is left unchanged** (no file is produced; the remark starts with "Skipped:"). We never stretch only the feasible sections — that would leave the two sides of a seam at different speeds.
 
-The report is still one row: the detected BPM / stretched BPM / speed change of the sections are joined with ` / `, and per-section details go into the remarks. **Without the switch, behaviour is byte-for-byte the same as before.**
+The report is still one row: the detected BPM / stretched BPM / speed change of the sections are joined with ` / `, and per-section details go into the remarks; the UI also lists each section's speed side by side (e.g. `100→90｜154→180`). **Without the switch, behaviour is byte-for-byte the same as before.**
 
 ## Output
 

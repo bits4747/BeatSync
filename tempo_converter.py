@@ -789,21 +789,30 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
                    max_speedup: float = DEFAULT_MAX_SPEEDUP, lang=None):
     """分段测速 + 每段各按原「最小变速」规则出方案。
 
-    返回 [(t0, t1, SegmentPlan)]。段数 == 1 表示「没发现变拍」，调用方应退回整曲
-    单方案路径（保持默认行为字节级不变）。某段测不到速度（太安静/太短）或算不出
-    可行方案时抛 RuntimeError，由调用方回退整曲处理——不做「猜一段」这种事。
+    返回 (plans, infeasible)。
+
+    - plans：[(t0, t1, SegmentPlan)]；段数 == 1（infeasible 为 None）表示「没发现
+      变拍」，调用方应退回整曲单方案路径（保持默认行为字节级不变）。
+    - infeasible：None，或 (t0, t1, bpm, reason) —— 表示检测到多段、但**其中某段**
+      按上下限算不出可行方案。此时调用方必须把**整首歌**跳过（不生成文件、
+      也不退回整曲处理）：只要有一段超出加减速上限，整首就不变（用户要求，
+      2026-10 需求 m02195）。不做「只变可行段、跳过越限段」这种事——那会让
+      一首歌里有的段变了、有的段没变，交接点两侧速度对不上。
+
+    某段测不到速度（太安静/太短）时 detect_tempo 仍抛 RuntimeError，由调用方
+    退回整曲处理（那是「读不出」而非「越限」，与默认行为一致地保守回退）。
     """
     segs = detect_tempo_segments(y_mono, sr, lang=lang)
     if len(segs) < 2:
-        return [(segs[0][0], segs[0][1], None)]
+        return [(segs[0][0], segs[0][1], None)], None
     out = []
     for (t0, t1) in segs:
         a, b = int(t0 * sr), int(t1 * sr)
         bpm, beats = detect_tempo(y_mono[a:b], sr, lang)
         plan = choose_stretched_tempo(bpm, target, strict, max_slowdown, max_speedup)
         if plan is None:
-            raise RuntimeError(stretch_limits_text(
-                bpm, target, max_slowdown, max_speedup, lang=lang))
+            reason = stretch_limits_text(bpm, target, max_slowdown, max_speedup, lang=lang)
+            return [(t0, t1, None)], (t0, t1, float(bpm), reason)
         out.append((t0, t1, SegmentPlan(t0, t1, float(bpm),
                                         np.asarray(beats, dtype=np.float64), plan)))
     # 相邻段方案完全相同（同倍频档同 rate）→ 合并，少一次无谓拼接
@@ -818,7 +827,7 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
             merged[-1] = (t0, item[1], SegmentPlan(t0, item[1], sp.bpm, beats, sp.plan))
         else:
             merged.append(item)
-    return merged
+    return merged, None
 
 
 def _xfade(a, b, ov):
@@ -1214,6 +1223,16 @@ def _process_segmented(path, opt, y, sr, y_mono, seg_plans, row, notes,
     row["节拍器BPM"] = f"{seg_plans[0][2].plan.click_bpm:g}"
     row["每拍点击数"] = join(cpbs, "{:g}")
 
+    # 内部结构化键（不进 CSV：write_report 只写 REPORT_FIELDS 的 15 个键）——
+    # 供桌面/pywebview 桥接透出给前端逐段渲染「120｜154｜130」样式。
+    row["_分段"] = [
+        {"t0": round(float(t0), 3), "t1": round(float(t1), 3),
+         "detected": f"{sp.bpm:.1f}", "a2": f"{sp.plan.a2:g}",
+         "rate": f"{sp.plan.rate:.4f}",
+         "relation": relation_text(sp.plan.clicks_per_beat, lang=L)}
+        for (t0, t1, sp) in seg_plans
+    ]
+
     music_rms_db = (opt.music_loudness_db if opt.music_loudness_db is not None
                     else _rms_db(y2))
     row["音乐响度dB"] = f"{music_rms_db:.1f}"
@@ -1327,16 +1346,22 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
 
         # 1.5) 分段变速（opt-in）：找变拍点，每段各按「最小变速」规则出方案。
         #      手动指定原速时无从分段；只发现一段时退回整曲路径。
+        #      关键语义（需求 m02195）：检测到多段但**任一段**超出加减速上限时，
+        #      整首跳过、不生成文件、也不退回整曲处理——避免出现「一首歌里有的段
+        #      变了、有的段没变」导致交接点两侧速度对不上。
         seg_plans = None
+        seg_infeasible = None
         if opt.segments and not (opt.bpm and opt.bpm > 0):
             try:
-                cand = _segment_plans(y_mono, sr, opt.target_bpm, opt.strict,
-                                      opt.max_slowdown, opt.max_speedup, lang=L)
-                if len(cand) > 1 and cand[0][2] is not None:
-                    seg_plans = cand
-                else:
-                    notes.append(tr("未发现变拍，按整曲处理",
-                                    "no tempo change detected; processed as one piece", L))
+                cand, seg_infeasible = _segment_plans(
+                    y_mono, sr, opt.target_bpm, opt.strict,
+                    opt.max_slowdown, opt.max_speedup, lang=L)
+                if seg_infeasible is None:
+                    if len(cand) > 1:
+                        seg_plans = cand
+                    else:
+                        notes.append(tr("未发现变拍，按整曲处理",
+                                        "no tempo change detected; processed as one piece", L))
             except RuntimeError as re:
                 notes.append(tr("分段变速不可用（",
                                 "segmented mode unavailable (", L) + str(re)
@@ -1344,6 +1369,16 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
         if seg_plans:
             return _process_segmented(path, opt, y, sr, y_mono, seg_plans,
                                       row, notes, log_fn, rel_base)
+        if seg_infeasible is not None:
+            _t0, _t1, _bpm, _why = seg_infeasible
+            row["检测方式"] = tr("自动检测·分段", "Auto · segmented", L)
+            row["备注"] = (tr("跳过：", "Skipped: ", L)
+                           + tr("分段变速中有段落超出加减速上限",
+                               "a section exceeds the stretch limits in segmented mode", L)
+                           + tr("：", ": ", L) + _why
+                           + tr("，整首不做变速", "; the whole track is left unchanged", L))
+            log_fn("  " + row["备注"])
+            return row
 
         # 2) 选最小变速方案（受用户设定的变速上限约束；都不满足 → 跳过该文件）
         plan = choose_stretched_tempo(detected, opt.target_bpm, opt.strict,
@@ -1543,7 +1578,8 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
             max_speedup="max speedup percentage; files beyond both limits are skipped (0~100, default %g)",
             lang="output language: zh / en (default zh; affects notes, logs and the report)",
             segments=("detect tempo changes inside each track and convert every section with its "
-                      "own minimum-stretch plan (seams cross-faded); ignored with --bpm"),
+                      "own minimum-stretch plan (seams cross-faded); if any section is beyond the "
+                      "limits the whole track is left unchanged; ignored with --bpm"),
         )
     else:
         H = dict(
@@ -1565,7 +1601,7 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
             max_speedup="最多把音乐加快多少百分比，两个上限都不满足的文件将被跳过（0~100，默认 %g)",
             lang="输出语言：zh / en（默认 zh；影响备注、日志与报告）",
             segments=("检测曲内变拍，每段各按最小变速规则处理（拼接点做交叉淡化）；"
-                      "手动指定 --bpm 时不分段"),
+                      "任一段超出加减速上限时整首不变速；手动指定 --bpm 时不分段"),
         )
     ap = argparse.ArgumentParser(
         description=description,

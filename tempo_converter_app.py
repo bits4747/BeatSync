@@ -602,6 +602,7 @@ class Api:
                 "rate": row.get("拉伸比"), "relation": row.get("节拍关系"),
                 "clickBpm": row.get("节拍器BPM"), "note": row.get("备注"),
                 "out": row.get("输出文件"),
+                "segments": row.get("_分段"),
             })
             self._emit({"type": "progress", "done": i + 1, "total": total})
 
