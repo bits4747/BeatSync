@@ -234,8 +234,8 @@ Some tracks do not change speed at one point — they **speed up or slow down co
 
 1. tempo is measured window by window on the onset envelope (window length adapts to the track, 3–10 s), producing a tempo curve;
 2. the curve is classified into `constant` / `step` (an abrupt change) / `ramp_up` / `ramp_down` (gradual) / `wave` (elastic). The features are, after smoothing: **net drift, total variation, rank correlation and the largest single-window jump as a share of total variation** — a ramp spreads its change evenly in one direction, a step jumps once, and the single-window share separates them;
-3. for a ramp, a beat grid is built that follows it (`beat_track` and "integrate the tempo curve" are both tried; each is phase-snapped and the winner is the one with the higher **mean onset energy on its grid points** — a wrong grid puts its off-points between peaks and scores lower);
-4. beats are merged greedily into chunks under an error budget (25 ms by default), each chunk using **one constant stretch ratio**, with boundaries on beats;
+3. for a ramp, a beat grid is built that follows it. Two candidates are always built — `beat_track` and "integrate the tempo curve" — and each is phase-snapped and cleaned of over-detected beats before being ranked by the **mean onset energy on its grid points** (a wrong grid puts its off-points between peaks and scores lower). If the best-scoring grid cannot yield a feasible chunking, the next one is tried: on real recordings the two grids trade wins (the same track has produced "grid A feasible, grid B over the limits");
+4. beats are merged greedily into chunks under an error budget, each chunk using **one constant stretch ratio**, with boundaries on beats. The budget is 25 ms by default; if that yields more than 30 chunks it is relaxed to 40 ms and then 60 ms and retried — real-world beat grids jitter much more than synthetic ones, and 25 ms produces dozens of chunks whose seams become audible;
 5. chunks are stretched and joined with a 5 ms equal-power cross-fade, so no clicks at the seams;
 6. the metronome follows each chunk's grid, so clicks stay on the beat for the whole track.
 
@@ -250,9 +250,18 @@ Measured on synthetic material (30 s, one transient per beat, target 120 BPM):
 | Steep 90→150 | `ramp_up` (drift +0.565) | 9, ratios 0.819–1.272 | 120.2 BPM, seam score 0.059 |
 | Steady 120 | `constant` (var 0.003) | — | not triggered, normal path |
 
+Measured on real audio (a 140.7 BPM rock multitrack resampled into a ramp, 67 s, target 120 BPM):
+
+| Material | Shape | Chunks | Reported source range | Output |
+| --- | --- | --- | --- | --- |
+| Slowdown 140→110 | `ramp_down` (drift −0.250, rho −1.000) | 20 | 136.6→114.9 | tempo curve 120.0/119.8/121.5/122.9/119.5 |
+| Speedup 110→140 | `ramp_up` (drift +0.309, rho +0.996) | 19 | 112.2→138.9 | tempo curve 120.5/120.7/120.8/128.5/121.4 |
+
+Real audio needs noticeably more chunks than synthetic material (20 vs 7); that is dictated by the jitter of the beat grid itself and is expected.
+
 Limits and known constraints:
 
-- **Each chunk still obeys the slowdown/speedup limits** (20% slower and 50% faster by default; raise them with `--max-slowdown` / `--max-speedup`). If a ramp is too wide to chunk feasibly, the program **falls back to a single global rate** and says so in the remarks ("Gradual tempo: the required stretch exceeds the limits … handled the usual way") — it never drops the file.
+- **Each chunk still obeys the slowdown/speedup limits** (20% slower and 50% faster by default; raise them with `--max-slowdown` / `--max-speedup`). A smooth ramp can usually be brought inside the limits by chunking more finely; only when the target is far from the source (e.g. a 120 BPM track pushed past 400 BPM) does no feasible chunking exist, in which case the program **falls back to a single global rate** and says so in the remarks ("Gradual tempo: the required stretch exceeds the limits … handled the usual way") — it never drops the file.
 - Ramp detection needs at least 6 s of audio and chunked flattening at least 8 s; shorter tracks take the normal path.
 - The phase vocoder smears transients slightly (dense percussion can sound a little softer), an inherent cost of stretching that does not affect beat alignment.
 - Passing `--bpm` manually bypasses ramp detection (your value wins).

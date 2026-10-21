@@ -1117,6 +1117,9 @@ def _stitch_segments(y, sr, plans, engine):
 SHAPE_MIN_DUR = 6.0      # 短于此不做形状判定（窗口测速不可靠）
 RAMP_MIN_DUR = 8.0       # 短于此不做渐变拉平
 RAMP_BUDGET_S = 0.025    # 每块内允许的最大累积拍位偏差（秒）
+RAMP_BUDGETS = (0.025, 0.040, 0.060)   # 预算逐级放宽：真实录音的网格抖动比合成
+                                       # 素材大得多，25 ms 会切出几十块甚至判不可行
+RAMP_PREF_CHUNKS = 30    # 块数在此以内算"接缝可接受"，超过就换更大预算重试
 RAMP_MAX_CHUNKS = 60     # 分块数上限（再多说明素材不像渐变，放弃）
 RAMP_FLAT_VAR = 0.10     # 总变差低于此值 = 恒速（八度单位）
 RAMP_STEP_PEAK = 0.22    # 单窗变化占总变差比例 ≥ 此值 = 阶跃
@@ -1391,9 +1394,13 @@ def _curve_grid(curve, dur: float, ref_bpm: float | None = None):
     return np.asarray(g, dtype=np.float64) if len(g) >= 4 else None
 
 
-def _ramp_grid(y_mono, sr: int, curve, lang: str | None = None,
-               ref_bpm: float | None = None):
-    """为渐变曲目生成一条「跟着速度曲线走」的拍点网格（输入轴秒）。"""
+def _ramp_grid_candidates(y_mono, sr: int, curve, lang: str | None = None,
+                          ref_bpm: float | None = None):
+    """为渐变曲目生成若干条「跟着速度曲线走」的拍点网格（输入轴秒），按起音得分降序。
+
+    返回 [(score, grid), ...]。调用方先用第一条；若它出不了可行分块方案，
+    再退到下一条——不同网格在真实录音上各有胜负，选错一条不代表素材不可行。
+    """
     import librosa
 
     dur = len(y_mono) / sr
@@ -1418,22 +1425,60 @@ def _ramp_grid(y_mono, sr: int, curve, lang: str | None = None,
         cands.append(g)
     # 两条候选各有胜场：beat_track 在缓渐变上更准，但它跟不住陡渐变（会把两拍
     # 并一拍，网格点数量明显偏多）；曲线积分反之（相位靠吸附补）。都吸附到起音
-    # 峰后按「网格点上的起音能量均值」择优——错网格的余点会落在峰间，分数自然低。
-    best = None
+    # 峰后按「网格点上的起音能量均值」打分排序——错网格的余点会落在峰间，分数自然低。
+    scored = []
     for g in cands:
         g = g[(g >= 0.0) & (g < dur)]
         if len(g) < 4:
             continue
         gs = _snap_refine(onset, fps, _phase_align(onset, fps, g))
+        gs = gs[(gs >= 0.0) & (gs < dur)]
+        if len(gs) < 4:
+            continue
+        gs = _drop_spurious_beats(gs)
+        if len(gs) < 4:
+            continue
         idx = np.clip(np.round(gs * fps).astype(int), 0, len(onset) - 1)
         sc = float(np.mean(onset[idx])) if len(idx) else 0.0
-        if best is None or sc > best[0]:
-            best = (sc, gs)
-    if best is None:
-        return None
-    grid = best[1]
-    grid = grid[(grid >= 0.0) & (grid < dur)]
-    return grid if len(grid) >= 4 else None
+        scored.append((sc, gs))
+    if not scored:
+        return []
+    scored.sort(key=lambda t: -t[0])
+    return scored
+
+
+def _ramp_grid(y_mono, sr, curve, lang=None, ref_bpm=None):
+    """得分最高的那条网格（单条版本，供测试与简单调用）。"""
+    cands = _ramp_grid_candidates(y_mono, sr, curve, ref_bpm=ref_bpm)
+    return cands[0][1] if cands else None
+
+
+def _drop_spurious_beats(beats, lo_ratio: float = 0.62, win: int = 5,
+                         passes: int = 3):
+    """剔除网格里的伪拍（多检出）。
+
+    真实录音里瞬态密集处（鼓 fill、失真吉他重音）常被多检出一拍，局部拍距只有
+    邻居的一半——按它算出来的局部速度会翻倍，进而让分块速率越限、把整首渐变
+    误判成「不可行」。判据用**局部**拍距中位数（渐变曲的拍距本身在变，不能用
+    全局中位数）：拍距短于局部中位数的 `lo_ratio` 倍就丢掉后一个拍。
+    """
+    b = np.asarray(beats, dtype=np.float64)
+    if len(b) < 8:
+        return b
+    keep = np.ones(len(b), dtype=bool)
+    for _ in range(max(1, int(passes))):
+        idx = np.where(keep)[0]
+        if len(idx) < 8:
+            break
+        cur = b[idx]
+        ibi = np.diff(cur)
+        med = np.array([np.median(ibi[max(0, k - win):k + win + 1])
+                        for k in range(len(ibi))])
+        bad = np.where(ibi < lo_ratio * med)[0]
+        if not len(bad):
+            break
+        keep[idx[bad + 1]] = False
+    return b[keep]
 
 
 def _greedy_chunks(beats, a2: float, budget_s: float = RAMP_BUDGET_S):
@@ -2007,17 +2052,36 @@ def _ramp_try(path, opt, y, sr, y_mono, shape, row, notes, log_fn, rel_base,
     dur = len(y_mono) / sr
     if dur < RAMP_MIN_DUR:
         return None
-    grid = _ramp_grid(y_mono, sr, shape.get("curve"), L, ref_bpm=detected)
-    if grid is None or len(grid) < 6:
+    cands = _ramp_grid_candidates(y_mono, sr, shape.get("curve"), L, ref_bpm=detected)
+    cands = [(sc, g) for (sc, g) in cands if len(g) >= 6]
+    if not cands:
         notes.append(tr("渐变速度：拍点网格没建起来，按原方式处理",
                         "ramp: could not build a beat grid; processed the usual way", L))
         return None
-    info, why = _ramp_plans(grid, dur, opt.target_bpm,
-                            opt.max_slowdown, opt.max_speedup)
-    if info is None:
-        notes.append(tr("渐变速度：", "ramp: ", L) + _ramp_why_text(why, L)
+    # 网格候选 × 分块预算：先用得分最高的网格、最紧的预算；出不了可行方案就换
+    # 下一条网格，块数过多就放宽预算。真实录音上两条网格各有胜负（同一条素材
+    # 可能 A 网格可行、B 网格越限），只按起音得分单选会在这种素材上整首放弃。
+    best = None
+    last_why = None
+    for rank, (_sc, grid) in enumerate(cands):
+        for budget in RAMP_BUDGETS:
+            info, why = _ramp_plans(grid, dur, opt.target_bpm,
+                                    opt.max_slowdown, opt.max_speedup,
+                                    budget_s=budget)
+            if info is None:
+                last_why = why
+                continue
+            n = len(info["chunks"])
+            key = (0 if n <= RAMP_PREF_CHUNKS else 1, n, rank, budget)
+            if best is None or key < best[0]:
+                best = (key, grid, info, budget)
+            break          # 该网格在最小可行预算下已出方案，不再放宽
+    if best is None:
+        notes.append(tr("渐变速度：", "ramp: ", L) + _ramp_why_text(last_why, L)
                      + tr("，按原方式处理", "; processed the usual way", L))
         return None
+    _key, grid, info, budget = best
+    info["budget_s"] = budget
     plans = _ramp_segment_plans(grid, dur, opt.target_bpm, info)
     if len(plans) < 2:
         return None
@@ -2128,9 +2192,10 @@ def _process_ramp(path, opt, y, sr, y_mono, plans, ramp, row, notes,
            + tr(f"，分 {len(plans)} 块拉平到 ", f", flattened to ", L)
            + f"{a2:g} BPM" + tr("，节拍器 ", ", metronome ", L)
            + f"{target:g} BPM " + tr("——", " — ", L) + relation_text(cpb, lang=L))
+    _bud = float(ramp.get("budget_s") or RAMP_BUDGET_S)
     log_fn("  " + tr("块速率   : ", "Chunk rates: ", L) + f"{rmin:.4f}~{rmax:.4f}"
-           + tr(f"（{len(plans)} 块，块内拍位偏差 ≤ {RAMP_BUDGET_S * 1000:.0f} ms）",
-                f" ({len(plans)} chunks, in-chunk beat error <= {RAMP_BUDGET_S * 1000:.0f} ms)", L))
+           + tr(f"（{len(plans)} 块，块内拍位偏差 ≤ {_bud * 1000:.0f} ms）",
+                f" ({len(plans)} chunks, in-chunk beat error <= {_bud * 1000:.0f} ms)", L))
     if opt.metronome and times:
         log_fn("  " + tr("节拍器   : ", "Metronome  : ", L)
                + f"{len(times)} " + tr("下，音量", "clicks, volume", L)
