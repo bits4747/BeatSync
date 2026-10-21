@@ -594,6 +594,28 @@ def test_ramp_plans_infeasible_returns_reason():
     assert why in ("limits", "many"), f"原因应当是 limits/many，实际 {why}"
 
 
+def test_ramp_plans_tolerates_outlier_beats():
+    """真实录音的拍网格边缘常有零星错拍，不能因此把整首渐变判死。
+
+    可行性必须看**块级速率**（多拍平均，渲染时真正用的值），而不是逐拍局部
+    速度的极值：把少数几个拍挪成明显偏快，块内平均后仍然可行。
+    """
+    y, true_beats = _ramp_track(140.0, 110.0, 20.0)
+    clean, why0 = tc._ramp_plans(true_beats, 20.0, 120.0, 0.20, 0.50)
+    assert clean is not None, f"干净网格应当可行，实际 {why0}"
+    # 人为制造离群拍：把第 3、第 4 个拍之间的间隔压掉 35%（局部速度被抬高约 1.5 倍）
+    noisy = np.array(true_beats, dtype=np.float64)
+    for k in (3, 4):
+        noisy[k + 1] = noisy[k] + (noisy[k + 1] - noisy[k]) * 0.65
+    noisy[5:] = noisy[5:] - (noisy[5] - np.array(true_beats)[5])
+    info, why = tc._ramp_plans(noisy, 20.0, 120.0, 0.20, 0.50)
+    assert info is not None, f"有离群拍时不应直接判越限（实际 {why}）"
+    T = 60.0 / float(info["a2"])
+    for (i, j) in info["chunks"]:
+        r = (noisy[j] - noisy[i]) / ((j - i) * T)
+        assert 0.80 - 1e-9 <= r <= 1.50 + 1e-9, f"块速率 {r:.4f} 越限"
+
+
 def test_ramp_end_to_end_flattens_to_target():
     """端到端：渐变素材转完，输出速度必须恒定在目标附近。"""
     import librosa

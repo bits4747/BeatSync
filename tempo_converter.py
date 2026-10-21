@@ -1489,25 +1489,43 @@ def _ramp_plans(beats, dur: float, target: float,
     lo_r = 1.0 - max(0.0, float(max_slowdown))
     hi_r = 1.0 + max(0.0, float(max_speedup))
     eps = 1e-9
+
+    def _rates_of(chunks, T):
+        return [(beats[j] - beats[i]) / ((j - i) * T) for (i, j) in chunks]
+
+    def _score(cpb):
+        """按候选 cpb 实际分块后评分。
+
+        可行性看**块级速率**而不是逐拍局部速度：渲染时每块是一个恒定速率，
+        块内速率是多拍的平均值，个别测偏的拍会被摊平。真实录音里常有一两个
+        离群拍（瞬态密集处），拿逐拍 p2/p98 判可行性会把这些噪声当成真实速度
+        范围，把整首渐变判死。
+        """
+        a2 = float(target) / float(cpb)
+        T = 60.0 / a2
+        chunks = _greedy_chunks(beats, a2, budget_s)
+        if not chunks or len(chunks) > RAMP_MAX_CHUNKS:
+            return None
+        rates = _rates_of(chunks, T)
+        bad = sum(1 for r in rates if r < lo_r - eps or r > hi_r + eps)
+        key = (bad,
+               max(abs(math.log2(max(r, 1e-9))) for r in rates),
+               0 if float(cpb).is_integer() else 1, float(cpb))
+        return (key, a2, float(cpb), chunks)
+
     best = None
     for cpb in CPB_CANDIDATES:
-        a2 = float(target) / float(cpb)
-        rmin, rmax = a2 / hi_b, a2 / lo_b
-        if rmin < lo_r - eps or rmax > hi_r + eps:
-            continue
-        key = (max(abs(math.log2(max(rmin, 1e-9))), abs(math.log2(max(rmax, 1e-9)))),
-               0 if float(cpb).is_integer() else 1, float(cpb))
-        if best is None or key < best[0]:
-            best = (key, a2, float(cpb))
+        got = _score(cpb)
+        if got is not None and (best is None or got[0] < best[0]):
+            best = got
     if best is None:
-        return None, "limits"
-    _key, a2, cpb = best
+        return None, "many"
+    _key, a2, cpb, chunks = best
     T = 60.0 / a2
-    chunks = _greedy_chunks(beats, a2, budget_s)
     for _round in range(10):
         if len(chunks) > RAMP_MAX_CHUNKS:
             return None, "many"
-        rates = [(beats[j] - beats[i]) / ((j - i) * T) for (i, j) in chunks]
+        rates = _rates_of(chunks, T)
         bad = [k for k, r in enumerate(rates) if r < lo_r - eps or r > hi_r + eps]
         if not bad:
             break
@@ -2004,6 +2022,12 @@ def _ramp_try(path, opt, y, sr, y_mono, shape, row, notes, log_fn, rel_base,
     if len(plans) < 2:
         return None
     info["shape"] = shape["shape"]
+    # 报告的「原速区间」优先取速度曲线首尾（平滑、抗噪），网格首尾中位数只在
+    # 曲线缺值时才用：真实录音的拍网格边缘常有零星错拍，直接取中位数会把
+    # 区间报成「136.0→136.0」这种明显不对的值（曲线同例是 136.6→114.9）。
+    if shape.get("bpm_start") and shape.get("bpm_end"):
+        info["bpm_start"] = float(shape["bpm_start"])
+        info["bpm_end"] = float(shape["bpm_end"])
     return _process_ramp(path, opt, y, sr, y_mono, plans, info,
                          row, notes, log_fn, rel_base)
 
