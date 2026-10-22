@@ -89,8 +89,12 @@ def _setup_numba_cache() -> str:
 
 NUMBA_CACHE_DIR = _setup_numba_cache()
 
-# 支持的输入格式（m4a/aac/wma 需要系统安装 ffmpeg 才能读取）
+# 支持的输入格式。前五种（wav/mp3/flac/ogg/aiff）由 libsndfile 直接解码；
+# m4a/aac/wma 只作为**可添加**的扩展名保留：解码库读不了它们，添加后会给出一条
+# 明确提示（见 load_audio），而不是让文件在扫描阶段无声消失。
 SUPPORTED_EXTS = {".wav", ".mp3", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".wma", ".aif", ".aiff"}
+# 解码库明确不支持的容器（librosa 1.0 起无 audioread 回退，ffmpeg 也救不了）
+_UNREADABLE_EXTS = {".m4a", ".aac", ".wma"}
 
 # 测速结果**不再**归一化到 [70,180) —— 测到什么就报什么。
 # 这两个常量仅保留供历史代码/文档引用，不再参与检测结果的换算。
@@ -110,6 +114,14 @@ TEMPO_LOW, TEMPO_HIGH = 70.0, 180.0
 DEFAULT_MAX_SLOWDOWN = 0.20
 DEFAULT_MAX_SPEEDUP = 0.50
 LIMIT_MIN, LIMIT_MAX = 0.0, 1.0        # 两个上限的可调范围：0%~100%
+
+# 变速上限的判定余量（rate 单位，0.005 = 0.5 个百分点）。
+# 上限是硬边界，但测速本身有抖动：同一首 120 BPM 的曲子，44.1k / 48k / 22.05k
+# 三种采样率下实测检测值 119.92 / 119.95 / 120.34（±0.3 BPM）。默认上限下
+# 120→180 恰好压在 +50% 边界上，检测只要偏低 0.01 BPM 就会被判「需加速 50.0%，
+# 上限 50%」而整首跳过——最常见的使用场景会随机失败。所以边界外留 0.5% 余量：
+# 宁可多转 0.5%，也不要把刚好卡在边界的歌随机丢掉。
+RATE_LIMIT_TOL = 0.005
 
 # OGG/Vorbis 单次可安全写出的采样点数上限（保守取值，实测崩溃点在 ~500900）。
 # libsndfile 超限时是原生崩溃而非异常，必须提前绕开，见 write_audio。
@@ -369,11 +381,9 @@ def choose_stretched_tempo(detected: float, target: float, strict: bool = False,
 
     **若一个候选都不满足 → 返回 None**，表示"这首歌两个上限都不满足"，
     调用方（process_file）应**跳过该文件**而不是硬套一个超限的方案。
-    注意：上限是硬边界，会存在"减速差一点、加速也差一点"的空隙（例如
-    原速 120、目标 180，上限 20%/41% 时 减速需 25%、加速需 50%，两个都超）。
-    默认 20%/50% 下这个特定空隙不存在（120→180 走 +50% 加速档），但仍应知道
-    空隙随上限组合可能出现；另外测速有正常误差（实测 song_120bpm 检测为
-    120.19），上限贴着真实需求设就会被误差顶出边界。
+    判定时边界外留 `RATE_LIMIT_TOL`（0.5%）余量：上限是硬边界，但测速有正常
+    误差（同一首 120 BPM 曲在 44.1k/48k/22.05k 下实测 119.92~120.34），
+    默认上限下 120→180 恰好压在 +50% 边界上，不放余量会随机被判越限跳过。
 
     strict=True 时忽略上限，直接精确拉伸到目标（那是用户显式要求的"真变速"）。
 
@@ -391,8 +401,9 @@ def choose_stretched_tempo(detected: float, target: float, strict: bool = False,
     cpb_candidates = CPB_CANDIDATES
     lo = 1.0 - max(0.0, float(max_slowdown))
     hi = 1.0 + max(0.0, float(max_speedup))
-    # 浮点容差：rate 恰好等于边界时应当**保留**（如 120→90 恰好 -25%）
-    eps = 1e-9
+    # 边界容差：既覆盖「rate 恰好等于边界」（如 120→90 恰好 -25%），
+    # 也吸收测速误差（见 RATE_LIMIT_TOL 的说明）。
+    eps = RATE_LIMIT_TOL
     best = None
     for cpb in cpb_candidates:
         a2 = target / cpb
@@ -487,7 +498,22 @@ def load_audio(path: Path):
     """读取音频，返回 (y, sr)。y 形状统一为 (声道, 采样数)。"""
     import librosa
 
-    y, sr = librosa.load(str(path), sr=None, mono=False)
+    try:
+        y, sr = librosa.load(str(path), sr=None, mono=False)
+    except Exception as exc:  # noqa: BLE001
+        # librosa 1.0 已彻底移除 audioread 回退，而 libsndfile 不支持
+        # M4A / AAC / WMA 这几种容器——**装 ffmpeg 也读不出来**。
+        # 这三种后缀仍留在 SUPPORTED_EXTS 里，是为了让用户添加后能看到一条
+        # 可操作的提示，而不是被静默跳过或只看到底层的英文解码噪声。
+        if Path(path).suffix.lower() in _UNREADABLE_EXTS:
+            raise RuntimeError(tr(
+                "无法读取该文件：本程序的音频解码库不支持 M4A / AAC / WMA 格式"
+                "（安装 ffmpeg 也无效）。请先用其它工具转成 wav / mp3 / flac 再处理。",
+                "Cannot read this file: the bundled audio decoder does not support "
+                "M4A / AAC / WMA (installing ffmpeg does not help). "
+                "Convert it to wav / mp3 / flac first.",
+                get_lang())) from exc
+        raise
     if y.ndim == 1:
         y = y[np.newaxis, :]
     return y.astype(np.float32), int(sr)
@@ -1960,7 +1986,7 @@ def main(argv=None) -> int:
     pairs = list(collect_inputs_with_base(args.inputs, args.recursive))
     if not pairs:
         print(e("没有可处理的音频文件。支持格式：", "No audio files to process. Supported formats: ")
-              + " ".join(sorted(SUPPORTED_EXTS)))
+              + " ".join(sorted(SUPPORTED_EXTS - _UNREADABLE_EXTS)))
         return 1
     files = [f for f, _b in pairs]
 

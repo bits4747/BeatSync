@@ -134,6 +134,27 @@ def test_rate_always_positive():
             assert p.rate > 0 and p.clicks_per_beat > 0
 
 
+def test_limit_tolerance_absorbs_detection_jitter():
+    """120→180 恰好压在 +50% 边界上，测速偏低一点不应被判越限。
+
+    实测同一首 120 BPM 的曲子在不同采样率下会测成 119.92~120.34，若把边界
+    当严格不等式，检测值一旦低于 120.0 就会「需加速 50.0%，上限 50%」而整首
+    跳过——最常见的使用场景会随机失败。
+    """
+    for src in (119.7, 119.9, 119.99, 120.0, 120.34):
+        p = tc.choose_stretched_tempo(src, 180.0)
+        assert p is not None, f"{src}→180 被误判越限"
+        assert abs(p.a2 - 180.0) < 1e-6
+
+
+def test_limit_still_rejects_clearly_out_of_range():
+    """容差只吸收抖动，明显超限的歌仍应跳过。"""
+    # 180/119.4 = +50.8%，超出 50%+0.5% 的判定上限
+    assert tc.choose_stretched_tempo(119.4, 180.0) is None
+    # 90/105 = -14.3%，但把放慢上限压到 5% 后两个方向都超
+    assert tc.choose_stretched_tempo(105.0, 90.0, max_slowdown=0.05) is None
+
+
 # ---------------------------------------------------------------- 节拍网格
 
 def test_beat_grid_no_phase_drift():

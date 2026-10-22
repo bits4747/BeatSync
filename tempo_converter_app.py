@@ -500,8 +500,8 @@ class Api:
         paths = [str(p) for p in (paths or [])]
         files = list(tc.collect_inputs(paths, recursive=True))
         if not files:
-            return {"ok": False, "error": tc.tr("没有可处理的音频文件（支持 wav/mp3/flac/ogg/m4a 等）",
-                                               "No audio files to process (supports wav/mp3/flac/ogg/m4a, etc.)", lang)}
+            return {"ok": False, "error": tc.tr("没有可处理的音频文件（支持 wav/mp3/flac/ogg/aiff）",
+                                               "No audio files to process (supports wav/mp3/flac/ogg/aiff)", lang)}
 
         # 每个文件对应的「添加时的根」。前端按输入项逐个回传（roots[i] ↔ paths[i]）。
         # 注意 paths 有两种形态，roots 的语义随之不同，两者都要支持：

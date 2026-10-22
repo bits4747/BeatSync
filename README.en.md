@@ -9,13 +9,13 @@ English | [中文](README.md)
 - **Runners**: fit your music to your cadence, so every step lands on a beat.
 - **Musicians**: practise fundamentals at a given BPM with music playing; adjust a track's BPM precisely.
 
-BeatSync avoids large tempo changes -- **the metronome always clicks at the target tempo, and the music is only shifted the smallest possible amount.**
+BeatSync avoids large tempo changes — **the metronome always clicks at the target tempo, and the music is only shifted the smallest possible amount.**
 
 ## How tempo matching works
 
 Move the music to **n times or 1/n times** the target tempo (n is a whole number).
 
-1. **Detect**: measure the source tempo A (or specify it by hand). The detected value is reported **as measured, without octave folding** — a 60 BPM track is reported as 60 BPM (since v1.1.0; older versions folded slow songs into the [70, 180) range).
+1. **Detect**: measure the source tempo A (or specify it by hand).
 2. **Choose**: among all candidates, pick the one that changes the tempo least.
 3. **Respect the limits**: the change must stay inside the allowed range, otherwise the other direction is tried; if both directions exceed the limits, the file is skipped.
 
@@ -29,18 +29,20 @@ Target 180 BPM, default limits: slow down 20%, speed up 50% (both adjustable)
 | 85     | music at 90 (+5.9%); 2 clicks per beat                     |
 | 100    | music at 90 (-10%); 2 clicks per beat                      |
 | 120    | music at 180 (+50%); 1 click per beat                      |
-| 360    | music stays at 360, **no change**; 1 click every 2 beats   |
 
-The table holds for both **automatic detection** and **manually specified tempo**. Known limitation: beat detection may land on an octave multiple/submultiple for non-4/4 material (3/4, 6/8, half-time) and sparse percussion; after the removal of folding, such misreads show up directly in the report. When in doubt, enter the tempo manually.
+The table holds for both **automatic detection** and **a manually specified tempo** (all figures are measured). A source of 120 sits exactly on the +50% limit, so the check leaves a 0.5% margin to absorb detection jitter — otherwise a track measured at 119.99 would be judged "needs +50.0%, limit 50%" and skipped entirely.
+
+Automatic detection is most reliable in the **70–180 BPM** range. When the real tempo clearly falls outside it (a 360 BPM track is measured at about 120), pass `--bpm` to state the source tempo yourself: `--bpm 360` then gives "music unchanged, 1 click every 2 beats".
 
 ## Highlights
 
 - **Smallest tempo change**: the music is only moved to a position that is a simple multiple of the target tempo (n times or 1/n times, n a whole number), choosing the least change while keeping the beat natural.
 - **Adjustable speed-up / slow-down limits**: set how far it may slow down and how far it may speed up; anything beyond the limits is left alone rather than stretched until it sounds broken.
 - **Accurate detection, metronome that never drifts**: detection uses autocorrelation refined on a comb grid, so steady-tempo tracks are pinned down to roughly 0.1 BPM. The metronome does not stack fixed intervals; it is placed directly on the music's own beat time line, so it never drifts or misses a beat.
+- **Per-section speed change**: for tracks that change tempo or time signature midway, the music is not stretched in one go — it is split into sections and each section is brought to the target tempo precisely.
 - **Six percussion sounds, adjustable relative level**: audition and pick a sound; its level follows the track's own loudness and the relative amount is adjustable.
 - **Batch processing**: process a whole library in one go.
-- **Several output formats**: WAV / MP3 / FLAC. MP3 output **matches the input file's bitrate by default** (no quality downgrade); you can also pick 320/256/192/160/128 explicitly.
+- **Several output formats**: WAV / MP3 / FLAC. MP3 output **matches the input file's bitrate by default** (no quality downgrade); you can also pick 320/256/192/160/128 and so on explicitly.
 - **Keep the folder structure**: when converting a whole library, the output directory mirrors the input tree instead of piling every track into one level; this can be turned off in the interface (output then lands flat in the output directory).
 - **Bilingual interface**: switch between Chinese and English with the "中 / EN" button in the top-right corner.
 
@@ -63,7 +65,7 @@ Availability per platform:
 | Windows 7 / 8.1 | available (**source runs only**) | desktop version will not start (no WebView2); the tkinter interface works |
 | macOS / Linux | available (**source runs only**) | needs a little porting (the interface code currently contains Windows-specific calls) |
 
-> The installer offers the Windows graphical interface only, and it has **no command line** -- every "command line" entry in these tables means running from source.
+> The installer offers the Windows graphical interface only, and it has **no command line** — every "command line" entry in these tables means running from source.
 > The installer itself is compiled for **Windows 10 (1803 or later) / Windows 11 64-bit**; for older systems and other platforms, run from source.
 
 - **The command line and the core algorithm (detection, stretching, metronome, batching, CSV report) are cross-platform**: they only depend on librosa / soundfile / numpy / scipy, all of which ship official wheels, so they run wherever those are installed.
@@ -82,7 +84,7 @@ Download `BeatSyncSetup.exe` and click Next through the wizard; shortcuts are cr
 It installs to `C:\Users\<you>\AppData\Local\Programs\BeatSync` by default.
 During setup you can choose whether to create a desktop shortcut, and the program folder also carries the Chinese and English manuals (`README.md` / `README.en.md`) and the license (`LICENSE`).
 
-**The folder holding `BeatSyncSetup.exe` must not contain Chinese characters** -- only plain ASCII letters, digits and symbols.
+**The folder holding `BeatSyncSetup.exe` must not contain Chinese characters** — only plain ASCII letters, digits and symbols.
 Double-clicking it from a folder whose path contains Chinese characters does nothing at all (it exits silently); move it to a plain ASCII path.
 
 **What the installer gives you**: two graphical interfaces (desktop version + compatibility interface); every conversion feature is available in the interface, with no Python, no network and no command line needed.
@@ -96,7 +98,7 @@ pip install -r requirements.txt
 python tempo_converter_app.py
 ```
 
-On Windows you can also just double-click `BeatSync.bat` (a launcher that lives in the **source repository**, shipped with the source -- source only; the installer does not include it).
+On Windows you can also just double-click `BeatSync.bat` (a launcher that lives in the **source repository**, shipped with the source — the installer does not include it).
 
 The interface defaults to Chinese; the "中 / EN" button in the top-right corner switches to English. See [Interface language](#interface-language).
 
@@ -114,7 +116,7 @@ The interface defaults to Chinese; the "中 / EN" button in the top-right corner
 The desktop version depends on WebView2 and .NET (pythonnet). On a few machines it fails to start because one of those components is missing or its load is refused
 (the typical error is `Win32Exception: Access is denied`, and it is written to `app_error.log` in the program folder).
 
-**Once the desktop version will not open, no button inside the interface can be clicked** -- so start the compatibility interface **from the Start menu**:
+**Once the desktop version will not open, no button inside the interface can be clicked** — so start the compatibility interface **from the Start menu**:
 
 1. Click the Start menu (or press `Win`) and pick **BeatSync (Compatibility)** from the app list.
 2. **Double-click `BeatSync-Compatibility.bat` in the install folder** (simplest, recommended).
@@ -189,7 +191,7 @@ For every option see `python tempo_converter.py --help` (Chinese) or `--lang en 
 | `--format` | `source` (default, same as the input) / `wav` / `mp3` / `flac` / `ogg` |
 | `--mp3-bitrate` | mp3 output bitrate: `auto` (default, match the input file) / `320` / `256` / `224` / `192` / `160` / `128` / `112` / `96` |
 | `-o, --out-dir` | output directory (default: `tempo_converted/` beside each source file) |
-| `--no-mirror-dirs` | with an output directory, do not mirror the tree -- write everything flat |
+| `--no-mirror-dirs` | with an output directory, do not mirror the tree — write everything flat |
 | `--recursive` | search subfolders recursively |
 | `--report` | CSV report path (default `conversion_report.csv` in the current directory) |
 | `--max-slowdown` | maximum slow-down percentage, default 20 |
@@ -200,37 +202,11 @@ For every option see `python tempo_converter.py --help` (Chinese) or `--lang en 
 
 ## Per-section speed change
 
-**`auto` is the default**: the whole track is matched to a single detected BPM, but if a clear tempo change is detected (sections differ by ≥15%) it is split into speed sections, each stretched with its own minimum-stretch plan. Use `--segments on` to force segmentation, `--segments off` to disable it (or the "Auto per-section" switch in either interface).
+A track is matched to a single detected BPM, but if a clear tempo change is detected inside it (sections differ by ≥15%) it is split into speed sections, each stretched with its own minimum-stretch plan. You can also force segmentation with `--segments on` or disable it with `--segments off` (or the "Auto per-section" switch in either interface).
 
 Why it matters: on tracks like Rush's "YYZ", the intro runs at a different tempo from the body. One global rate (140→180, ×1.28) leaves the intro's metronome completely off — the intro's own pulse is around 208 BPM, so after stretching it sits near 266, nowhere near the 180 clicks. With segmentation the intro is handled at its own tempo and the clicks land.
 
-The pipeline:
-
-1. the tempo curve is split at detected change points by least-squares segmentation; a steady track yields one section and falls back to the normal single-plan path, and sections closer than 15% are not split (no seam for a few percent);
-2. each section is measured and stretched on its own, using the original minimum-stretch rule;
-3. **grid-quality gate**: every section's beat grid is scored by "mean onset strength at the beats ÷ mean onset strength over the section" (>1 means the beats land on attacks, ≈1 means the grid is unrelated to the music). A section scoring below 1.10 is merged into the more trustworthy neighbour and re-measured rather than clicked blindly;
-4. each seam searches a low-energy cut on **both** sides and applies a 5 ms equal-power cross-fade, so the join stays below the music's own transient level (a "seam score > 1" note in the report means "worth an ear check");
-5. the metronome follows each section's own beat grid, so clicks stay on the beat across seams;
-6. **if a section has no feasible plan within the current limits** (say a 6-second transition that is "a bit too fast to slow down and a bit too slow to speed up"), `auto` merges it into the nearer-in-tempo neighbour and re-measures — as long as the merged section is feasible the file is produced, and **a short section never throws the whole track away**. `on` (forced) keeps the strict contract: if **any** section is infeasible the **whole track is left unchanged** (no file is produced; the remark starts with "Skipped:"). We never stretch only the feasible sections — that would leave the two sides of a seam at different speeds.
-
-The report is still one row: the detected BPM / stretched BPM / speed change of the sections are joined with ` / `, and per-section details go into the remarks; the UI also lists each section's speed side by side (e.g. `100→90｜154→180`). A steady track under `auto` behaves exactly like the single-plan path (one section detected → normal path).
-
-Measured on "YYZ", target 180 — hit-ratio for the single-rate path vs automatic segmentation, all four regions improve:
-
-| Region | Single rate | Auto segmented |
-| --- | --- | --- |
-| Intro 0–32.9s | 0.946 (worse than random) | **1.531** |
-| Transition 32.9–42.6s | 0.858 | 0.922 |
-| Body 42.6–253.2s | 1.220 | **2.021** |
-| Outro 253.2–267s | 0.980 | 1.118 |
-
-The two sections chosen automatically are `0–42.6s @102.8 → 90 BPM (−12.5%, 2 clicks per beat)` and `42.6–267s @140.7 → 180 BPM (+27.9%, 1 click per beat)`, both clicking at 180.
-
-## Gradual tempo change (accelerando / ritardando)
-
-A track that speeds up or slows down continuously has **no constant tempo**, so it is outside the scope of per-section stretching — segmentation only handles tracks that jump to a new tempo at one point and stay there. Such material is processed at a single global rate: the whole track is stretched at the detected average tempo and the metronome clicks evenly on the average beat grid, so the beginning and the end drift away from the beat.
-
-If you need a better result, pass a representative tempo with `--bpm`, or cut the track into steady-tempo sections and process them separately. The program does not try to follow the tempo change.
+**Gradual changes (accelerando / ritardando) are out of scope**: such a track has no constant tempo, so it is processed at one global rate and the clicks drift away from the beat towards the beginning and the end. Pass a representative tempo with `--bpm`, or cut the track into steady-tempo pieces and process them separately.
 
 ## Output
 
@@ -243,20 +219,40 @@ with `-o` the input tree is mirrored into that directory.
 
 ---
 
+## Supported input formats
+
+| Format | Notes |
+| --- | --- |
+| **WAV / MP3 / FLAC / OGG / AIFF** | supported directly, no extra components needed |
+| **M4A / AAC / WMA** | **not supported**: the bundled decoder (libsndfile) does not read these containers, and librosa 1.0 no longer falls back to ffmpeg, so **installing ffmpeg does not help**. Convert them to wav / mp3 / flac first |
+
+Both the interface and the command line scan for these extensions; M4A / AAC / WMA files are accepted into the list but produce a clear "the audio decoder does not support this format" message instead of vanishing silently.
+
+Output formats are listed in the option reference under `--format` (`source` / `wav` / `mp3` / `flac` / `ogg`) and in the interface's format selector.
+OGG is a command-line-only option: a single write is limited in sample count, so **over-long audio is saved as WAV instead and the remark says so**.
+
+---
+
 ## Project layout
 
 **This is the source repository layout** (what you see when running from source or developing on it).
-The installer does not unpack these `.py` files -- it has a single `BeatSync.exe`, an `_internal\` folder,
-plus `README.md`, `README.en.md`, `LICENSE` and `assets\`.
+The installer does not unpack these `.py` files — it has `BeatSync.exe`, `BeatSync.exe.config`,
+`BeatSync-Compatibility.bat`, an `_internal\` folder, plus `README.md`, `README.en.md`,
+`LICENSE` and `assets\`.
 
 ```
 tempo_converter.py        core: detection / candidate choice / stretching / metronome / batch / report; CLI entry
 tempo_converter_app.py    desktop shell: pywebview window + JS bridge + drag and drop + smoke test
 tempo_converter_gui.py    tkinter fallback interface
-frontend/                 index.html + app.css + app.js (no external dependencies)
+frontend/                 index.html + app.css + app.js (no external dependencies, no build step)
+tests/                    unit tests (pytest; click tracks are synthesised in memory, no audio files needed)
+assets/                   icons (icon.svg source plus the derived icon.png / icon.ico)
 BeatSync.bat              double-click launcher on Windows (source only; not in the installer)
-assets/                   icon source icon.svg (shared by the interface and the installer)
-requirements.txt          Python dependencies
+pyproject.toml            packaging metadata, dependency groups, pytest configuration
+requirements.txt          Python dependencies (used when installing with plain pip)
+.github/workflows/ci.yml  GitHub Actions: unit tests across platforms and Python versions
+CHANGELOG.md              changelog (including the version-numbering rule)
+CONTRIBUTING.md           contribution guide (dev setup, tests, commit conventions)
 LICENSE                   MIT license
 ```
 
@@ -268,7 +264,7 @@ Dependencies: librosa, soundfile, numpy, scipy, pywebview (**only needed when ru
 
 The graphical interface **defaults to Chinese**; the "中 / EN" button in the top-right corner (just left of the day/night mode button) switches between Chinese and English in one click.
 
-- **What switches**: every piece of text in the interface -- the file list, parameter labels, tempo-limit hints, sound names (Beep / Woodblock / Cowbell / Click / Sidestick / Clap), buttons, progress and result messages, dialog texts.
+- **What switches**: every piece of text in the interface — the file list, parameter labels, tempo-limit hints, sound names (Beep / Woodblock / Cowbell / Click / Sidestick / Clap), buttons, progress and result messages, dialog texts.
 - **The button's own tooltip**: in Chinese the button reads "中 / EN" and its tooltip points at "switch to English"; in English it is the other way round.
 - After switching in the desktop version, the **log, result notes, click relationships and the CSV report** are all produced by the backend in the same language, so no Chinese leaks into the English interface.
 - **The tkinter fallback interface** has the same "中 / EN" button in the top-right corner: switching rebuilds the interface while the added files and all settings are kept as they are. Its conversion parameters match the desktop version: a "keep the original folder structure" checkbox (greyed out when no output directory is set), two tempo-limit boxes (0-100, defaults 20 / 50), and a metronome level that can be typed as a dB value in addition to the slider, all synchronised live.
