@@ -253,6 +253,7 @@ requirements.txt          Python dependencies (used when installing with plain p
 .github/workflows/ci.yml  GitHub Actions: unit tests across platforms and Python versions
 CHANGELOG.md              changelog (including the version-numbering rule)
 CONTRIBUTING.md           contribution guide (dev setup, tests, commit conventions)
+CONTRIBUTING.en.md        same guide in English
 LICENSE                   MIT license
 ```
 

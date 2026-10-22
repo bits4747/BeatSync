@@ -253,6 +253,7 @@ requirements.txt          Python 依赖（直接 pip 安装时用这份）
 .github/workflows/ci.yml  GitHub Actions：多平台 × 多 Python 版本的单元测试
 CHANGELOG.md              更新日志（含版本号规则）
 CONTRIBUTING.md           贡献指南（开发环境、测试、提交约定）
+CONTRIBUTING.en.md        贡献指南英文版
 LICENSE                   MIT 许可证
 ```
 

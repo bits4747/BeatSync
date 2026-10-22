@@ -1,5 +1,7 @@
 # 贡献指南
 
+[English](CONTRIBUTING.en.md) | 中文
+
 感谢你愿意参与 BeatSync。这份文档说明本地的开发、测试与提交约定。
 
 ## 环境准备
