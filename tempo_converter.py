@@ -595,9 +595,33 @@ def write_audio(path: Path, y, sr: int, lang=None, mp3_bitrate=None):
 
 # ---------------------------------------------------------------- 测速
 
+def _dilate_max(onset, w: int = 2):
+    """onset 包络的 ±w 帧滑窗最大值（越界按截断处理）。
+
+    与 ``np.array([onset[max(0, x-w): x+w+1].max() for x in ...])`` 逐点等价，
+    但用一次滑窗滤波算好整条包络，供 _grid_score 反复取值——梳状网格搜索要
+    打分上万次，逐点切片是这里的主要开销。
+    """
+    env = np.asarray(onset, dtype=np.float64)
+    if w <= 0 or len(env) == 0:
+        return env
+    pad = np.full(w, -np.inf, dtype=np.float64)
+    padded = np.concatenate([pad, env, pad])
+    try:
+        from scipy.ndimage import maximum_filter1d
+        out = maximum_filter1d(padded, size=2 * w + 1, mode="constant", cval=-np.inf)
+        return out[w:w + len(env)]
+    except Exception:                                    # scipy 缺失时退回逐点
+        return np.array([env[max(0, i - w): i + w + 1].max() for i in range(len(env))])
+
+
 def _grid_score(onset, fps: int, P: float, phase: float, t_start: float, t_end: float,
-                w: int = 2) -> float:
-    """节拍网格与 onset 包络的对齐能量：网格点上 onset 的平均值（±w 帧取最大）。"""
+                w: int = 2, onset_max=None) -> float:
+    """节拍网格与 onset 包络的对齐能量：网格点上 onset 的平均值（±w 帧取最大）。
+
+    onset_max 可传入 ``_dilate_max(onset, w)`` 的预计算结果，批量打分时省掉
+    逐点切片（数值与现算完全一致）。
+    """
     n_frames = len(onset)
     k0 = int(np.ceil((t_start - phase) / P - 1e-9))
     k1 = int(np.floor((t_end - phase) / P + 1e-9))
@@ -607,8 +631,9 @@ def _grid_score(onset, fps: int, P: float, phase: float, t_start: float, t_end: 
     f = f[(f >= 0) & (f < n_frames)]
     if len(f) < 4:
         return -1.0
-    vals = np.array([onset[max(0, x - w): x + w + 1].max() for x in f])
-    return float(np.mean(vals))
+    if onset_max is None:
+        onset_max = _dilate_max(onset, w)
+    return float(np.mean(np.asarray(onset_max, dtype=np.float64)[f]))
 
 
 def _comb_refine(onset, sr: int, beat_times):
@@ -638,19 +663,20 @@ def _comb_refine(onset, sr: int, beat_times):
     if t_b <= t_a + 4 * P0:
         t_a, t_b = 0.0, duration
     t0 = float(beat_times[0])
+    omax = _dilate_max(onset, 2)          # 一次算好，下面上万次打分复用
 
-    best = [P0, t0, _grid_score(onset, fps, P0, t0, t_a, t_b)]
+    best = [P0, t0, _grid_score(onset, fps, P0, t0, t_a, t_b, onset_max=omax)]
     # 粗搜：周期 ±4%，相位覆盖整个周期（含旧的 ±P/8 邻域）
     for P in np.linspace(P0 * 0.96, P0 * 1.04, 41):
         for ph in np.linspace(t0 - P, t0 + P, 25, endpoint=False):
-            sc = _grid_score(onset, fps, P, ph, t_a, t_b)
+            sc = _grid_score(onset, fps, P, ph, t_a, t_b, onset_max=omax)
             if sc > best[2]:
                 best = [P, ph, sc]
     # 细搜：周期 ±0.15%，相位 ±3%
     P1, ph1, _ = best
     for P in np.linspace(P1 * 0.9985, P1 * 1.0015, 31):
         for ph in np.linspace(ph1 - 0.03 * P1, ph1 + 0.03 * P1, 9):
-            sc = _grid_score(onset, fps, P, ph, t_a, t_b)
+            sc = _grid_score(onset, fps, P, ph, t_a, t_b, onset_max=omax)
             if sc > best[2]:
                 best = [P, ph, sc]
     return float(best[0]), float(best[1])
@@ -952,14 +978,30 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
     rms = librosa.feature.rms(y=y_mono, frame_length=2048, hop_length=256)[0]
 
     infos = []
+    detected_cache = {}
+
+    def _detect_seg(a: int, b: int):
+        """同一段音频（同一 a/b 切片）只测一次速。
+
+        合并重测时只有被合并的那一段变了，其余段的切片与上一轮完全相同；
+        测速是这里最贵的一步（4 分钟的歌每段 2~6 秒），重复算没有意义。
+        """
+        key = (a, b)
+        got = detected_cache.get(key)
+        if got is None:
+            try:
+                got = detect_tempo(y_mono[a:b], sr, lang)
+            except RuntimeError:
+                got = (0.0, np.asarray([], dtype=np.float64))
+            got = (got[0], np.asarray(got[1], dtype=np.float64).copy())
+            detected_cache[key] = got
+        return got
+
     for _round in range(8):
         infos = []
         for (t0, t1) in segs:
             a, b = int(t0 * sr), int(t1 * sr)
-            try:
-                bpm, beats = detect_tempo(y_mono[a:b], sr, lang)
-            except RuntimeError:
-                bpm, beats = 0.0, np.asarray([], dtype=np.float64)   # 该段读不出 → 并入邻段
+            bpm, beats = _detect_seg(a, b)
             rel = np.asarray(beats, dtype=np.float64)
             plan = (choose_stretched_tempo(bpm, target, strict, max_slowdown, max_speedup)
                     if bpm > 0 else None)
@@ -1115,7 +1157,13 @@ def detect_tempo(y_mono, sr: int, lang: str | None = None):
     """
     import librosa
 
-    onset = librosa.onset.onset_strength(y=y_mono, sr=sr)
+    # 一次 mel 谱派生两档 hop 的 onset：hop=512 的 STFT 帧正好是 hop=256 的偶数帧，
+    # 所以 S[:, ::2] 与「直接按 hop=512 再算一遍 mel」逐位相同（实测 max|diff|=0），
+    # 省掉一次重复的 STFT/mel（长曲上这一步占测速的三分之一左右）。
+    mel = np.abs(librosa.feature.melspectrogram(y=y_mono, sr=sr, hop_length=256,
+                                                fmax=0.5 * sr))
+    onset = librosa.onset.onset_strength(S=librosa.power_to_db(mel[:, ::2]),
+                                         sr=sr, hop_length=512)
     tempo, beats = librosa.beat.beat_track(onset_envelope=onset, sr=sr,
                                            units="time", trim=False)
     beat_times = np.asarray(beats, dtype=np.float64)
@@ -1129,7 +1177,8 @@ def detect_tempo(y_mono, sr: int, lang: str | None = None):
         return bpm, beat_times
 
     # 精修：在检测结果 ±4% 内做梳状网格拟合（细帧分辨率）
-    onset_fine = librosa.onset.onset_strength(y=y_mono, sr=sr, hop_length=256)
+    onset_fine = librosa.onset.onset_strength(S=librosa.power_to_db(mel),
+                                              sr=sr, hop_length=256)
     P, phase = _comb_refine(onset_fine, sr, beat_times)
     if P is None:
         P = float(np.median(np.diff(beat_times)))
@@ -1529,17 +1578,18 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
         y_mono = y.mean(axis=0) if y.shape[0] > 1 else y[0]
 
         # 1) 测速
-        if opt.bpm and opt.bpm > 0:
-            detected = float(opt.bpm)
-            beat_times = None
-            how = tr("手动指定", "Manual", L)
-        else:
-            detected, beat_times = detect_tempo(y_mono, sr, L)
-            how = tr("自动检测", "Auto", L)
-        row["检测BPM"] = f"{detected:.2f}"
-        row["检测方式"] = how
+        #    自动检测推迟到「分段变速」判定之后再跑：分段一旦接手，整曲测速的结果
+        #    就用不上，先跑等于白算一遍全曲（4 分钟的歌约 3 秒，占单曲总耗时 15%）。
+        manual = bool(opt.bpm and opt.bpm > 0)
+        detected = float(opt.bpm) if manual else None
+        beat_times = None
+        how = tr("手动指定", "Manual", L) if manual else tr("自动检测", "Auto", L)
 
         if opt.detect_only:
+            if detected is None:
+                detected, beat_times = detect_tempo(y_mono, sr, L)
+            row["检测BPM"] = f"{detected:.2f}"
+            row["检测方式"] = how
             log_fn(f"  {path.name}: {detected:.1f} BPM")
             row["备注"] = tr("仅检测速度", "Tempo only", L)
             return row
@@ -1552,7 +1602,7 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
         seg_mode = _segments_mode(opt)
         seg_plans = None
         seg_infeasible = None
-        if seg_mode != "off" and not (opt.bpm and opt.bpm > 0):
+        if seg_mode != "off" and not manual:
             try:
                 cand, seg_infeasible = _segment_plans(
                     y_mono, sr, opt.target_bpm, opt.strict,
@@ -1579,6 +1629,9 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
                                 "segmented mode not applicable (", L) + _why
                              + tr("），已按整曲处理", "); processed as one piece", L))
             else:
+                if detected is None:
+                    detected, beat_times = detect_tempo(y_mono, sr, L)
+                row["检测BPM"] = f"{detected:.2f}"
                 row["检测方式"] = tr("自动检测·分段", "Auto · segmented", L)
                 row["备注"] = (tr("跳过：", "Skipped: ", L)
                                + tr("分段变速中有段落超出加减速上限",
@@ -1587,6 +1640,12 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
                                + tr("，整首不做变速", "; the whole track is left unchanged", L))
                 log_fn("  " + row["备注"])
                 return row
+
+        # 1.9) 整曲测速（分段没接手时才做；手动指定时 detected 已有值）
+        if detected is None:
+            detected, beat_times = detect_tempo(y_mono, sr, L)
+        row["检测BPM"] = f"{detected:.2f}"
+        row["检测方式"] = how
 
         # 2) 选最小变速方案（受用户设定的变速上限约束；都不满足 → 跳过该文件）
         plan = choose_stretched_tempo(detected, opt.target_bpm, opt.strict,
