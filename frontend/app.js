@@ -45,8 +45,6 @@ const ZH = {
   detectOnly: "只测速",
   segments: "自动分段变速",
   segSpeeds: "每段速度",
-  rampSpeeds: "渐变拉平",
-  rampChunks: "分 {n} 块",
   enginePv: "保音高",
   enginePvSub: "变速不变调",
   engineRs: "磁带机式",
@@ -150,8 +148,6 @@ const EN = {
   detectOnly: "Detect only",
   segments: "Auto per-section",
   segSpeeds: "Section BPM",
-  rampSpeeds: "Flattened ramp",
-  rampChunks: "{n} chunks",
   enginePv: "Keep pitch",
   enginePvSub: "changes tempo, keeps pitch",
   engineRs: "Tape style",
@@ -369,8 +365,6 @@ function mockBridge() {
             { detected: "130.0", a2: "180.0", rate: "1.3846" },
           ] },
         { status: "done", detected: "140.2", a2: "180.0", rate: "1.2839", relation: "每拍敲 1 下", clickBpm: "180" },
-        { status: "done", detected: "140.0→110.0", a2: "180.0", rate: "1.29~1.64", relation: "每拍敲 1 下", clickBpm: "180",
-          ramp: { shape: "ramp_down", from: "140.0→110.0", to: "180.0", chunks: 9, cpb: 1 } },
         { status: "done", detected: "163.9", a2: "180.0", rate: "1.0982", relation: "每拍敲 1 下", clickBpm: "180" },
       ];
       files.forEach((p, i) => setTimeout(() => {
@@ -383,7 +377,6 @@ function mockBridge() {
           detected: m.detected, a2: m.a2, rate: m.rate,
           relation: m.relation, clickBpm: m.clickBpm, note: m.note || "",
           segments: m.segments || null,
-          ramp: m.ramp || null,
           out: m.status === "done" ? p.replace(/\.(\w+)$/, "_180bpm.wav") : "",
         });
         __appEvent({ type: "progress", done: i + 1, total: files.length });
@@ -598,17 +591,7 @@ function fileRow(item) {
   // 完整细节在 CSV 报告的「备注」列里。
   const parts = [];
   const segs = item.info && Array.isArray(item.info.segments) ? item.info.segments : null;
-  const ramp = item.info && item.info.ramp && item.info.ramp.chunks ? item.info.ramp : null;
-  if (ramp) {
-    // 渐变拉平：原速区间 → 拉平后的恒定速度，再补一句分了几块
-    const from = ramp.from != null ? ramp.from : item.info.detected;
-    const to = ramp.to != null ? ramp.to : item.info.a2;
-    const pct = item.info.rate ? `（${item.info.rate}）` : "";
-    parts.push(`<span class="accent">${t("rampSpeeds")}</span> `
-      + `${escapeHtml(String(from))} ⇒ ${escapeHtml(String(to))}${escapeHtml(pct)}`);
-    parts.push(t("rampChunks", { n: ramp.chunks }));
-    if (item.info.relation) parts.push(item.info.relation);
-  } else if (segs && segs.length >= 2) {
+  if (segs && segs.length >= 2) {
     // 分段变速：把每一段自己的速度标出来，如「每段速度 100→90（-10.0%）｜140→180（+28.4%）」
     const list = segs.map((s) => {
       const pct = fmtPercent(s.rate);
