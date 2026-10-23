@@ -206,6 +206,8 @@ A track is matched to a single detected BPM, but if a clear tempo change is dete
 
 Why it matters: on tracks like Rush's "YYZ", the intro runs at a different tempo from the body. One global rate (140→180, ×1.28) leaves the intro's metronome completely off — the intro's own pulse is around 208 BPM, so after stretching it sits near 266, nowhere near the 180 clicks. With segmentation the intro is handled at its own tempo and the clicks land.
 
+**Neighbouring sections are merged automatically**: when two sections differ only by measurement jitter (same output tempo and the same click density per beat) they are not split apart — every split means another splice and another seam. Before merging, the combined section is re-measured, and the merge only happens if its beat grid lines up at least as well as the better of the two originals; a genuine tempo change makes that alignment drop, so it is never swallowed.
+
 **Gradual changes (accelerando / ritardando) are out of scope**: such a track has no constant tempo, so it is processed at one global rate and the clicks drift away from the beat towards the beginning and the end. Pass a representative tempo with `--bpm`, or cut the track into steady-tempo pieces and process them separately.
 
 ## Output

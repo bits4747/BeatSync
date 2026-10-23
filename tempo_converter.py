@@ -789,15 +789,23 @@ class SegmentPlan(NamedTuple):
     plan: "StretchPlan"
 
 
-def _frame_logtempo(y_mono, sr: int, hop: int = 512):
+def _frame_logtempo(y_mono, sr: int, hop: int = 512, mel=None):
     """逐帧 BPM 曲线（log2 域，3 帧中值平滑）。
 
     librosa.feature.tempo 不开 aggregate，每帧自己估一次；倍频跳变在 log 域是
     台阶，适合做分段常数拟合。中位数 ±2.2 倍裁剪把个别乱跳的帧压回合理带内，
     裁剪后取 log 前先 np.maximum 兜底，避免除零。
+
+    mel：可选的整曲 mel 谱（hop=256）。hop=512 的帧正好是它的偶数帧，所以
+    S=mel[:, ::2] 与「按 hop=512 重算一遍」等价，能省掉一次重复的 STFT。
     """
     import librosa
-    onset = librosa.onset.onset_strength(y=y_mono, sr=sr, hop_length=hop)
+    if mel is None:
+        onset = librosa.onset.onset_strength(y=y_mono, sr=sr, hop_length=hop)
+    else:
+        step = max(1, hop // 256)
+        onset = librosa.onset.onset_strength(S=librosa.power_to_db(mel[:, ::step]),
+                                             sr=sr, hop_length=hop)
     tp = np.asarray(librosa.feature.tempo(onset_envelope=onset, sr=sr,
                                           aggregate=None)).ravel().astype(np.float64)
     med = float(np.median(tp[tp > 0])) if np.any(tp > 0) else 120.0
@@ -845,18 +853,21 @@ def _binary_segment(x, cs, ss, beta, min_len=8):
 
 
 def detect_tempo_segments(y_mono, sr: int, dedup_s=2.0, merge_ratio=0.10,
-                          min_seg_s=4.0, min_analyze_s=12.0, lang=None):
+                          min_seg_s=4.0, min_analyze_s=12.0, lang=None,
+                          mel=None):
     """变拍检测：返回 [(t0, t1), ...]（输入秒轴，覆盖全曲）；恒速歌返回单段。
 
     做法：逐帧 log-BPM 曲线 → 递归二分找变点 → 相邻过近( <dedup_s )的变点合并
     → 短段(<min_seg_s)并入邻段、速度差 <merge_ratio 的邻段并成一段。
     边界实测误差 <0.7 s（合成曲验收）。
     每段至少 min_analyze_s 秒，否则 detect_tempo 拍点太少不可靠。
+
+    mel：可选的整曲 mel 谱（hop=256、fmax=0.5*sr），用于省掉重算 STFT。
     """
     total = len(y_mono) / sr
     if total < min_analyze_s * 1.5:
         return [(0.0, total)]
-    logt, tf = _frame_logtempo(y_mono, sr)
+    logt, tf = _frame_logtempo(y_mono, sr, mel=mel)
     n = len(logt)
     cs = np.concatenate([[0.0], np.cumsum(logt)])
     ss = np.concatenate([[0.0], np.cumsum(logt * logt)])
@@ -877,21 +888,42 @@ def detect_tempo_segments(y_mono, sr: int, dedup_s=2.0, merge_ratio=0.10,
     def seg_dur(a, b):
         return float(tf[min(b, n - 1)] - tf[a])
 
+    def _med(a, b):
+        return float(np.median(logt[a:max(b, a + 1)]))
+
+    # 合并循环。必须「只 pop 两段之间那条边界」，并且要挑最该并的那一对再动手：
+    # 旧版遇到最后一个短段时会 pop edges[1]（把开头两段并掉），于是不断从头重来，
+    # 短段越多级联越猛，实测同一首曲子 min_seg_s=4 给出 1 段、min_seg_s=8 给出
+    # 10 段（对 min_seg_s 非单调），完全是这个 bug 造成的。
     changed = True
-    while changed and len(edges) > 2:
+    guard = 0
+    while changed and len(edges) > 2 and guard < 4 * len(edges) + 8:
+        guard += 1
         changed = False
-        for i in range(len(edges) - 1):
-            a, b = edges[i], edges[i + 1]
-            nxt = edges[i + 2] if i + 2 < len(edges) else None
-            if seg_dur(a, b) < min_seg_s:
-                edges.pop(i + 1 if i + 1 < len(edges) - 1 else 1)
+        nseg = len(edges) - 1
+        meds = [_med(edges[i], edges[i + 1]) for i in range(nseg)]
+        # 1) 先处理太短的段：并入 log 速度更接近的那一侧（不硬塞给任意邻居）
+        short = [i for i in range(nseg) if seg_dur(edges[i], edges[i + 1]) < min_seg_s]
+        if short:
+            i = min(short, key=lambda k: seg_dur(edges[k], edges[k + 1]))
+            opts = []
+            if i > 0:
+                opts.append((abs(meds[i - 1] - meds[i]), i - 1))
+            if i + 1 < nseg:
+                opts.append((abs(meds[i + 1] - meds[i]), i))
+            if opts:
+                edges.pop(min(opts)[1] + 1)      # 只删 lo 与 hi 的公共边界
                 changed = True
-                break
-            if nxt is not None and abs(float(np.median(logt[a:b]))
-                                       - float(np.median(logt[b:nxt]))) < thr:
-                edges.pop(i + 1)
-                changed = True
-                break
+                continue
+        # 2) 再合并「速度差小于 merge_ratio」的相邻段，每次只并最接近的一对
+        best = None
+        for i in range(nseg - 1):
+            d = abs(meds[i] - meds[i + 1])
+            if d < thr and (best is None or d < best[0]):
+                best = (d, i)
+        if best is not None:
+            edges.pop(best[1] + 1)
+            changed = True
     times = [float(tf[e]) if e < n else total for e in edges]
     times[0], times[-1] = 0.0, float(total)
     out = []
@@ -909,6 +941,11 @@ def detect_tempo_segments(y_mono, sr: int, dedup_s=2.0, merge_ratio=0.10,
 SEG_GRID_MIN_SCORE = 1.10   # 段内拍网格「命中比」低于此值 → 认为该段拍子没跟上
 SEG_MIN_SPREAD = 1.15       # auto 模式：最快/最慢段速度比低于此值不值得分段
 SEG_MIN_SEG_S = 8.0         # 分段最短时长（太短的段测速不可靠，并入邻段）
+# 相邻段测得速度只差这么一点（相对）、且每拍点击数相同时，认为两段输出等价 → 合并。
+# 为什么需要：段间测速本身有 ±1~3% 抖动（同一段音乐换切点就会差这么多），不合并就会
+# 出现「相邻段 a2 与 cpb 完全一样、只有 rate 差千分之几」的多余分段——用户听不出区别，
+# 却白白多一次拼接、多一处接缝。旧判据是 rate 精确到 1e-9 相等，几乎永不命中。
+SEG_MERGE_RATIO = 0.06
 
 
 def _seg_align_score(onset, rms, sr: int, beats, t0: float, t1: float,
@@ -1000,7 +1037,14 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
         return [(segs[0][0], segs[0][1], None)], None
 
     import librosa
-    onset = librosa.onset.onset_strength(y=y_mono, sr=sr, hop_length=256)
+    # 整首的 mel 谱算一次，后面各段测速、onset 包络全都复用它：分段时同一首曲子
+    # 的十几段被反复测速，每段各做一次 STFT/mel 是纯重复劳动（长曲上单段就 0.5 秒）。
+    # mel 是逐帧的线性变换，按帧切片与「对切片重算」只差边界窗，实测测速结果
+    # 一致（bpm 差 ≤0.05）。只在这里算——恒速歌走上面的早退分支，不必付这份成本。
+    mel_all = np.abs(librosa.feature.melspectrogram(y=y_mono, sr=sr, hop_length=256,
+                                                    fmax=0.5 * sr))
+    onset = librosa.onset.onset_strength(S=librosa.power_to_db(mel_all),
+                                         sr=sr, hop_length=256)
     rms = librosa.feature.rms(y=y_mono, frame_length=2048, hop_length=256)[0]
 
     infos = []
@@ -1015,8 +1059,10 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
         key = (a, b)
         got = detected_cache.get(key)
         if got is None:
+            fa = int(round(a / 256))            # 采样点 → 帧号（hop=256）
+            fb = max(fa + 1, int(round(b / 256)))
             try:
-                got = detect_tempo(y_mono[a:b], sr, lang)
+                got = detect_tempo(y_mono[a:b], sr, lang, mel=mel_all[:, fa:fb])
             except RuntimeError:
                 got = (0.0, np.asarray([], dtype=np.float64))
             got = (got[0], np.asarray(got[1], dtype=np.float64).copy())
@@ -1077,19 +1123,124 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
             return [(s["t0"], s["t1"], None)], (s["t0"], s["t1"], float(s["bpm"]), reason)
     out = [(s["t0"], s["t1"], SegmentPlan(s["t0"], s["t1"], s["bpm"], s["beats"], s["plan"]))
            for s in infos]
-    # 相邻段方案完全相同（同倍频档同 rate）→ 合并，少一次无谓拼接
+    # 相邻段方案输出等价（拉伸比几乎一样、每拍点击数相同）→ 合并，少一次无谓拼接。
+    # 判据为什么用「bpm 相对差」而不是「a2 或 rate」：
+    #   * a2 恒等于 target/cpb，cpb=1 时每段的 a2 都是 180，拿它判会把速度真的差 20%
+    #     的两段也并到一起（并完是同一 rate，输出速度就会在段内漂移）。
+    #   * rate = a2/bpm，所以 |Δrate|/rate 与 |Δbpm|/bpm 是同一个量，取 bpm 更直观。
+    # 阈值取 SEG_MERGE_RATIO：比这更小的速度差听不出「换了一段」，并掉它省一次拼接、
+    # 少一处接缝。旧判据要求 rate 精确到 1e-9 相等，几乎永不命中，于是留下大量
+    # 「a2/cpb 完全相同」的多余分段。
+    # 合并后按拼接后的拍点重算 bpm 与方案（不直接沿用前一段的 rate），
+    # 保证合并段的平均速度仍然朝向目标，不会累积偏移。
     merged = []
     for item in out:
         prev = merged[-1] if merged else None
-        if prev is not None and abs(prev[2].plan.rate - item[2].plan.rate) < 1e-9 \
+        if prev is not None and prev[2].bpm > 0 and item[2].bpm > 0 \
+                and abs(math.log2(prev[2].bpm / item[2].bpm)) <= math.log2(1.0 + SEG_MERGE_RATIO) \
                 and abs(float(prev[2].plan.clicks_per_beat)
                         - float(item[2].plan.clicks_per_beat)) < 1e-9:
-            t0, t1, sp = prev
+            t0, _t1, sp = prev
             beats = np.concatenate([sp.beats, item[2].beats + (item[0] - t0)])
-            merged[-1] = (t0, item[1], SegmentPlan(t0, item[1], sp.bpm, beats, sp.plan))
-        else:
-            merged.append(item)
+            t1 = item[1]                     # 区间终点必须取后一段的结尾
+            bpm = 60.0 * len(beats) / max(1e-9, (t1 - t0))
+            plan = choose_stretched_tempo(bpm, target, strict, max_slowdown, max_speedup)
+            if plan is not None:
+                merged[-1] = (t0, t1, SegmentPlan(t0, t1, bpm, beats, plan))
+                continue
+        merged.append(item)
+    # 第三道闸门：相邻段「其实是一段」时合并。
+    # 两种常见冗余：
+    #   1) 输出等价——a2 与每拍点击数都相同（输出音乐速度、点击密度完全一样），
+    #      只有段内测速差了几个百分点（146 vs 160）。听感上就是一段，切两段只是
+    #      白白多一处接缝。
+    #   2) 倍频层——同一段音乐测速落在 1.5 / 2 / 3 家族的隔壁层（88 报成 176、
+    #      106.7 报成 160），相邻段输出速度来回跳（180 → 90 → 180），用户听到的
+    #      是「一直在拼接」。
+    # 判据都不看速度本身，而是合并后重新测速、看拍网格对位变不变差：合并段的命中
+    # 比不低于原来两段里的较大者（留 12% 余量）才合并；明显变差说明是真的变拍，
+    # 保留原分段。每合并一次就重扫，直到没有可合并的。
+    rejected = set()
+    changed = True
+    while changed and len(merged) > 1:
+        changed = False
+        for i in range(len(merged) - 1):
+            a, b = merged[i], merged[i + 1]
+            if a[2] is None or b[2] is None or a[2].bpm <= 0 or b[2].bpm <= 0:
+                continue
+            key = (a[0], a[1], b[0], b[1])
+            if key in rejected:
+                continue
+            r = b[2].bpm / a[2].bpm
+            cpb_same = abs(float(a[2].plan.clicks_per_beat)
+                           - float(b[2].plan.clicks_per_beat)) < 1e-9
+            a2_same = abs(a[2].plan.a2 - b[2].plan.a2) < 0.5
+            same_out = a2_same and cpb_same
+            jitter = same_out and abs(math.log2(r)) <= math.log2(1.0 + SEG_MERGE_RATIO)
+            layer = False
+            for k in (1.5, 2.0, 3.0):
+                if abs(math.log2(r / k)) < 0.045 or abs(math.log2(r * k)) < 0.045:
+                    layer = True                  # 约 3% 以内落在节拍层上
+                    break
+            if not (jitter or same_out or layer):
+                continue
+            # 三类候选（都不重测合并段，见下）：
+            #   jitter  段间测速抖动（146 vs 152，同一个输出方案），并掉只会少一处接缝。
+            #   same_out 输出方案相同但速度差得更多（146 vs 160）。**不能只看方案相同**：
+            #           121 BPM 用 rate 1.49、146 BPM 用 rate 1.23 都能到 180，并成一段
+            #           后 121 那段只会变成 149，那是真的变拍。所以要用「合并后的方案
+            #           必须仍然是前一段那个方案」来判——真变拍并起来方案会变。
+            #   layer   落在 1.5 / 2 / 3 家族的隔壁节拍层（88 报成 176、107 报成 160），
+            #           合并会改变输出速度，同样要求方案不变。
+            t0, t1 = a[0], b[1]
+            if jitter:
+                # 速度差不到 6%、输出方案又完全一样：合并只是少一处接缝，直接串
+                # 拍点即可，不必再花一次整段测速（一段 4 分钟的重测要 1~2 秒）。
+                beats = np.concatenate([np.asarray(a[2].beats),
+                                        np.asarray(b[2].beats) + (b[0] - t0)])
+                bpm = 60.0 * len(beats) / max(1e-9, (t1 - t0))
+                plan = (choose_stretched_tempo(bpm, target, strict,
+                                               max_slowdown, max_speedup)
+                        if bpm > 0 else None)
+                if plan is None or not (abs(plan.a2 - a[2].plan.a2) < 0.5
+                                        and abs(float(plan.clicks_per_beat)
+                                                - float(a[2].plan.clicks_per_beat)) < 1e-9):
+                    rejected.add(key)
+                    continue
+            else:
+                # 合并前对合并后的整段重新测速：拼接两段各自的拍点等于假设「两段
+                # 之间也没有换速度」，而重测才是对「它们本来就是一段」的直接检验。
+                bpm, beats = _detect_seg(int(t0 * sr), int(t1 * sr))
+                plan = (choose_stretched_tempo(bpm, target, strict,
+                                               max_slowdown, max_speedup)
+                        if bpm > 0 else None)
+                if plan is None:
+                    rejected.add(key)
+                    continue
+                # 合并后的方案必须仍是**前一段**的方案；拿两段之间的 cpb 比是错的
+                # （107/cpb2 与 160/cpb1 本来就不同，合并后又回到 cpb2）。
+                if not (abs(plan.a2 - a[2].plan.a2) < 0.5
+                        and abs(float(plan.clicks_per_beat)
+                                - float(a[2].plan.clicks_per_beat)) < 1e-9):
+                    rejected.add(key)
+                    continue
+                # 方案相同还不够：真变拍的两段也可能都到 180（121 用 rate 1.49、
+                # 146 用 rate 1.23），并成一段后 121 那段只会变成 149。用「合并后的
+                # 拍网格对位不差于原来较好的那段」兜底——真变拍时混合网格的命中比
+                # 会明显掉下来。
+                sa = _seg_align_score(onset, rms, sr, np.asarray(a[2].beats) + a[0], a[0], a[1])
+                sb = _seg_align_score(onset, rms, sr, np.asarray(b[2].beats) + b[0], b[0], b[1])
+                sm = _seg_align_score(onset, rms, sr, np.asarray(beats) + t0, t0, t1)
+                need = (0.88 if layer else 1.0) * max(sa, sb)
+                if sm < need:
+                    rejected.add(key)                 # 合并后对位变差 → 真的变拍
+                    continue
+            merged[i:i + 2] = [(t0, t1,
+                                SegmentPlan(t0, t1, bpm, np.asarray(beats), plan))]
+            changed = True
+            break
     return merged, None
+
 
 
 def _xfade(a, b, ov):
@@ -1174,20 +1325,25 @@ def _no_tempo_msg(lang: str | None = None) -> str:
               lang)
 
 
-def detect_tempo(y_mono, sr: int, lang: str | None = None):
+def detect_tempo(y_mono, sr: int, lang: str | None = None, mel=None):
     """检测速度，返回 (bpm, beat_times)。
 
     bpm 为精修后的原值（**不再归一化**：测到 60 BPM 就报 60 BPM），
     beat_times 为拉伸前的时间轴节拍位置（稳定速度歌曲为精修规整网格）。
     lang 只影响检测失败时抛出的 RuntimeError 文案。
+
+    mel：可选的预计算 mel 谱（hop=256、fmax=0.5*sr、对 y_mono 的**同一个切片**算的）。
+    分段时要对同一首曲子的十几段反复测速，每段各算一次 mel 是纯重复劳动；
+    调用方按帧切好传进来即可跳过这一步（最长的一段能省 0.5 秒）。
     """
     import librosa
 
     # 一次 mel 谱派生两档 hop 的 onset：hop=512 的 STFT 帧正好是 hop=256 的偶数帧，
     # 所以 S[:, ::2] 与「直接按 hop=512 再算一遍 mel」逐位相同（实测 max|diff|=0），
     # 省掉一次重复的 STFT/mel（长曲上这一步占测速的三分之一左右）。
-    mel = np.abs(librosa.feature.melspectrogram(y=y_mono, sr=sr, hop_length=256,
-                                                fmax=0.5 * sr))
+    if mel is None:
+        mel = np.abs(librosa.feature.melspectrogram(y=y_mono, sr=sr, hop_length=256,
+                                                    fmax=0.5 * sr))
     onset = librosa.onset.onset_strength(S=librosa.power_to_db(mel[:, ::2]),
                                          sr=sr, hop_length=512)
     tempo, beats = librosa.beat.beat_track(onset_envelope=onset, sr=sr,

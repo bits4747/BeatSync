@@ -403,6 +403,68 @@ def test_segmented_options_default_auto():
     assert tc.ConvertOptions().segments == "auto"
 
 
+def test_segments_merge_equivalent_neighbours():
+    """相邻段输出方案完全相同（a2 与每拍点击数一样）时不得留下多余分段。
+
+    这正是用户报告的问题：报告里相邻段 a2/clicks 一模一样，只有 rate 差千分之几，
+    听感上是同一段音乐，却白白多一处接缝。判据用 SEG_MERGE_RATIO，别再退回到
+    「rate 精确相等」——那样几乎永不命中。
+    """
+    y, half = _two_section_track()          # 100 → 140，两段输出方案不同
+    plans, inf = tc._segment_plans(y, SR, 180.0, False,
+                                   tc.DEFAULT_MAX_SLOWDOWN, tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+    assert inf is None
+    real = [p for p in plans if p[2] is not None]
+    for a, b in zip(real[:-1], real[1:]):
+        same = (abs(a[2].plan.a2 - b[2].plan.a2) < 1e-9
+                and abs(float(a[2].plan.clicks_per_beat)
+                        - float(b[2].plan.clicks_per_beat)) < 1e-9)
+        assert not same, f"相邻段输出方案相同（{a[2].bpm:.1f}/{b[2].bpm:.1f}）却没被合并"
+
+
+def test_segment_plans_cover_whole_track():
+    """分段必须无缝覆盖全曲：不留空洞、不重叠——否则那段音频会被吞掉或敲两遍。"""
+    y, _ = _two_section_track()
+    plans, _inf = tc._segment_plans(y, SR, 180.0, False,
+                                    tc.DEFAULT_MAX_SLOWDOWN, tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+    total = len(y) / SR
+    assert abs(plans[0][0]) < 1e-9, f"首段必须从 0 开始，实际 {plans[0][0]}"
+    assert abs(plans[-1][1] - total) < 1e-6, f"末段必须到结尾 {total}，实际 {plans[-1][1]}"
+    for a, b in zip(plans[:-1], plans[1:]):
+        assert abs(a[1] - b[0]) < 1e-9, f"段 {a[:2]} 与 {b[:2]} 之间不连续"
+
+
+def test_detect_tempo_accepts_precomputed_mel():
+    """分段反复测速时复用整曲 mel：结果必须与单独重算一致。
+
+    这是纯提速路径（长曲上单段省 0.3~0.5 秒），一旦结果漂移就会改写分段决策，
+    必须锁住「同一段音乐的 bpm 不因换 mel 来源而变」。
+    """
+    import librosa
+    y = _accent_track(120.0, 20.0)
+    bpm_a, beats_a = tc.detect_tempo(y, SR)
+    mel = np.abs(librosa.feature.melspectrogram(y=y, sr=SR, hop_length=256, fmax=0.5 * SR))
+    bpm_b, beats_b = tc.detect_tempo(y, SR, mel=mel)
+    assert abs(bpm_a - bpm_b) < 0.1, f"复用 mel 后 bpm 从 {bpm_a:.2f} 变成 {bpm_b:.2f}"
+    assert len(beats_a) == len(beats_b)
+
+
+def test_detect_tempo_mel_slice_matches_whole():
+    """按帧切出来的 mel 片段，测速结果要与「对那段音频单独算」一致（误差 ≤0.5 BPM）。
+
+    切片的边界窗与单独算略有不同，但不应影响测出的速度；差太多说明帧号换算错了。
+    """
+    import librosa
+    y = _accent_track(100.0, 30.0)
+    mel_all = np.abs(librosa.feature.melspectrogram(y=y, sr=SR, hop_length=256,
+                                                    fmax=0.5 * SR))
+    a, b = int(4.0 * SR), int(24.0 * SR)
+    fa, fb = int(round(a / 256)), int(round(b / 256))
+    bpm_seg, _ = tc.detect_tempo(y[a:b], SR)
+    bpm_mel, _ = tc.detect_tempo(y[a:b], SR, mel=mel_all[:, fa:fb])
+    assert abs(bpm_seg - bpm_mel) < 0.5, f"切片 {bpm_mel:.2f} vs 单独算 {bpm_seg:.2f}"
+
+
 # ---------------------------------------------------------------- mp3 码率
 
 def test_mp3_bitrate_default_is_auto():
