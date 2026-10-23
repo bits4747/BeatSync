@@ -208,6 +208,12 @@ Why it matters: on tracks like Rush's "YYZ", the intro runs at a different tempo
 
 **Neighbouring sections are merged automatically**: when two sections differ only by measurement jitter (same output tempo and the same click density per beat) they are not split apart — every split means another splice and another seam. Before merging, the combined section is re-measured, and the merge only happens if its beat grid lines up at least as well as the better of the two originals; a genuine tempo change makes that alignment drop, so it is never swallowed.
 
+**Layer jitter inside one piece of music collapses into a single section**: frame-by-frame tempo estimation sometimes counts the same music at different metrical layers (90 and 120 alternating, for example), which looks like a tempo change but is only a different way of counting. When the section tempi all fall inside one integer-ratio family (up to 16×, tolerance about 1.35×) and the tempo does not move in one direction only, they are treated as layer jitter and merged; inside a family, the layer is chosen purely by stretch cost — the one with the smallest stretch wins. A genuine one-directional change (90→120→150) does not qualify and is still split.
+
+**Detected tempo converges to an integer-ratio family**: the reported tempo is an integer multiple or integer fraction of the real tempo (n or 1/n), never a fraction such as 2/3 or 3/2 — those cannot be compensated for and would put the clicks off the beat. Within a family the cheapest layer wins, so a track that is really 180 may be reported as 90 (1/2, two clicks per beat, still on the beat).
+
+**Sections whose beat is genuinely ambiguous can still miss the integer ratio**: a few stretches have two almost equally good tempo candidates (the YYZ intro measures 102.8 against a hand-labelled 114, a ratio of 1.109) and the program can only pick the better-scoring one. Use "Source BPM" to set such a tempo by hand.
+
 **Gradual changes (accelerando / ritardando) are out of scope**: such a track has no constant tempo, so it is processed at one global rate and the clicks drift away from the beat towards the beginning and the end. Pass a representative tempo with `--bpm`, or cut the track into steady-tempo pieces and process them separately.
 
 ## Output

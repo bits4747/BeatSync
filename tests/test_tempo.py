@@ -465,6 +465,113 @@ def test_detect_tempo_mel_slice_matches_whole():
     assert abs(bpm_seg - bpm_mel) < 0.5, f"切片 {bpm_mel:.2f} vs 单独算 {bpm_seg:.2f}"
 
 
+# ---------------------------------------------------------------- 整数家族
+
+def _mk_merged(*bpms, dur: float = 12.0):
+    """构造 _collapse_same_family 的输入：每段 dur 秒、拍点按该段速度铺满。"""
+    merged = []
+    t0 = 0.0
+    for bpm in bpms:
+        t1 = t0 + dur
+        beats = np.arange(0.0, dur, 60.0 / bpm)
+        beats = beats + t0
+        plan = tc.choose_stretched_tempo(bpm, 180.0, False,
+                                         tc.DEFAULT_MAX_SLOWDOWN,
+                                         tc.DEFAULT_MAX_SPEEDUP)
+        merged.append((t0, t1, tc.SegmentPlan(t0, t1, float(bpm), beats, plan)))
+        t0 = t1
+    return merged
+
+
+def test_int_ratio_accepts_integers_and_rejects_fractions():
+    """整数比判据：n 倍 / 1/n 通过，2/3、3/2 这类分数比必须拒绝。
+
+    用户 m07810 的硬要求：测出的速度只能是真实 BPM 的整数倍或整数分之一。
+    分数比补不回来（CPB_CANDIDATES 只含整数与 1/整数）→ 节拍器真的错频。
+    """
+    assert tc._int_ratio(120.0, 60.0) == 2
+    assert tc._int_ratio(60.0, 180.0) == 3
+    assert tc._int_ratio(90.0, 90.0) == 1
+    assert tc._int_ratio(120.0, 180.0) is None      # 3/2：分数比
+    assert tc._int_ratio(100.0, 150.0) is None      # 3/2
+    assert tc._int_ratio(140.4, 102.8) is None      # YYZ 实测两段：非整数比
+    assert tc._int_ratio(0.0, 90.0) is None
+
+
+def test_snap_family_absorbs_layer_miscount():
+    """同一段音乐被数成不同节拍层（90 vs 120，即 4/3）时能吸附到同一家族。
+
+    SNAP_MAX = log2(1.35) 就是为吸收这类层级误差而设；而 YYZ 前奏 102.8 与
+    主体 140.4 相差 1.366 倍 > 1.35，必须留在家族外（否则会被并成一段错频）。
+    """
+    d, layer = tc._snap_family(120.0, 90.0)
+    assert d <= tc.SNAP_MAX, f"120 应能吸附到 90 的家族，实际距离 {d:.3f}"
+    assert abs(layer - 90.0) < 1e-6, f"应吸附到 90 这一层，实际 {layer}"
+    d2, _ = tc._snap_family(140.4, 102.8)
+    assert d2 > tc.SNAP_MAX, "YYZ 两段不该被吸附成同一家族"
+
+
+def test_min_cost_layer_prefers_smallest_stretch():
+    """家族内选层只看变速代价：rate 最接近 1 的那层胜出。"""
+    mc = tc._min_cost_layer(90.0, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                            tc.DEFAULT_MAX_SPEEDUP)
+    assert mc is not None
+    _key, cpb, a2, rate = mc
+    assert abs(rate - 1.0) < 1e-9 and cpb == 2 and abs(a2 - 90.0) < 1e-9
+    # 150 → 180：cpb=1 的 +20% 比 cpb=2 的 -40% 更接近 1
+    mc2 = tc._min_cost_layer(150.0, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                             tc.DEFAULT_MAX_SPEEDUP)
+    assert mc2 is not None and mc2[1] == 1 and abs(mc2[3] - 1.2) < 1e-9
+
+
+def test_collapse_same_family_merges_layer_jitter():
+    """测速在同一段音乐上来回跳档（120|90|120|90）→ 合成一段。
+
+    这是用户 m07727 报的「恒速歌被切成 7 段」：各段互为整数比、本就是同一段
+    音乐的不同层，切段纯属多余，只增加接缝。
+    """
+    merged = _mk_merged(120.0, 90.0, 120.0, 90.0)
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP)
+    assert len(out) == 1, f"应塌缩成 1 段，实际 {len(out)} 段"
+    t0, t1, sp = out[0]
+    assert abs(t0 - merged[0][0]) < 1e-9 and abs(t1 - merged[-1][1]) < 1e-9
+    # 选层规则：最低的有可行方案的实测段速（最接近音乐真实拍速的那一层）
+    assert abs(sp.bpm - 90.0) < 1e-9, f"应选最低实测层 90，实际 {sp.bpm:.1f}"
+    assert abs(sp.plan.a2 - 90.0) < 1e-9 and abs(sp.plan.rate - 1.0) < 1e-9
+    # 拍点必须接成一条完整时间轴，不得丢段
+    beats = np.asarray(sp.beats)
+    assert beats[0] < t0 + 1.0 and beats[-1] > t1 - 60.0 / 90.0 - 1.0
+    assert np.all(np.diff(beats) > 0), "拼接后的拍点必须严格递增"
+
+
+def test_collapse_keeps_monotonic_true_change():
+    """单调推进的真变拍（90|120|150）不得被塌缩——方向只有一次，不是抖动。"""
+    merged = _mk_merged(90.0, 120.0, 150.0)
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP)
+    assert len(out) == 3, f"真变拍应保留 3 段，实际 {len(out)} 段"
+
+
+def test_collapse_keeps_non_integer_ratio_sections():
+    """非整数比的两段（YYZ 式 102.8|140.4）不得塌缩。
+
+    塔缩会让其中一段被拉到错的速度 → 节拍器错频，宁可保留分段。
+    """
+    merged = _mk_merged(102.8, 140.4, 102.8)
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP)
+    assert len(out) == 3, f"非整数比应保留分段，实际 {len(out)} 段"
+
+
+def test_collapse_touches_nothing_under_three_sections():
+    """少于 3 段谈不上「来回横跳」，一律不动（两段变速必须保留）。"""
+    merged = _mk_merged(120.0, 90.0)
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP)
+    assert len(out) == 2
+
+
 # ---------------------------------------------------------------- mp3 码率
 
 def test_mp3_bitrate_default_is_auto():
