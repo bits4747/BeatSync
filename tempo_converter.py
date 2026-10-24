@@ -1652,8 +1652,8 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
     # 短曲（例如 12 秒的合成测试素材）自动缩到 2 秒，不至于把所有段都丢掉。
     short_s = min(SEG_SHAPE_MIN_S, max(2.0, SEG_SHAPE_FRAC * dur_all))
     long_bpms = [sp.bpm for t0, t1, sp in merged if (t1 - t0) >= short_s]
-    if len(long_bpms) < 3:
-        return merged                      # 长段不足 3 个，谈不上「来回」，不动
+    if len(long_bpms) < 2:
+        return merged                      # 长段不足 2 个，没有可信速度可对照，不动
     # 还要把「差一点点」的相邻段先归并成一个台阶，再看方向：主体段落内部
     # 140.61 / 140.34 / 140.86 这种千分之几的抖动，方向算出来也会升降交替，
     # 但那是同一个速度的测速噪声，不是一个台阶。只有相差超过 10% 才算换了台阶。
@@ -1662,14 +1662,29 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
         if abs(math.log2(v / steps[-1])) < math.log2(1.10):
             continue                       # 同一个台阶，忽略
         steps.append(v)
-    if len(steps) < 3:
-        return merged                      # 去掉抖动后只剩两个台阶 → 保留
-    # 段数门槛 3：少于 3 段根本谈不上「来回」，一律不动（两段变速必须保留）。
-    ups = sum(1 for i in range(1, len(steps)) if steps[i] > steps[i - 1])
-    downs = len(steps) - 1 - ups
-    if not (ups >= 1 and downs >= 1):
-        return merged                      # 单调 → 真变拍，保留分段
-    pairs = [(sp.bpm, max(1e-6, t1 - t0)) for t0, t1, sp in merged]
+    # 「来回横跳」之外的第二种层抖动：**长段全部在同一台阶**。长段（≥short_s）
+    # 的测速可靠，它们彼此一致就说明歌里没有真变拍；此时夹在中间的短段给出
+    # 的离谱值（实测「我不用问」中段 9.7 秒被数成 95×4/3=126.2 并被拉伸
+    # +42.6%）只能是短段测速不可靠，交给下面的家族 + 命中率闸门去收拾——
+    # 命中率闸会验证长段的速度网格真能解释短段，解释不了仍会拒绝合并。
+    # （原来的门槛要求长段 ≥3 且方向有升有降，恰好把「两长一短、长段平」
+    # 这种最常见的形态漏掉了。）
+    if len(steps) > 1:
+        if len(steps) < 3:
+            return merged                  # 去掉抖动后只剩两个台阶 → 保留
+        # 段数门槛 3：少于 3 段根本谈不上「来回」，一律不动（两段变速必须保留）。
+        ups = sum(1 for i in range(1, len(steps)) if steps[i] > steps[i - 1])
+        downs = len(steps) - 1 - ups
+        if not (ups >= 1 and downs >= 1):
+            return merged                  # 单调 → 真变拍，保留分段
+        pairs = [(sp.bpm, max(1e-6, t1 - t0)) for t0, t1, sp in merged]
+    else:
+        # 平台阶：家族与层**只取长段**。短段的测速值不可信（「我不用问」的
+        # 126.2、「满月」前奏的 141.95 都来自几秒的段），让它们参与选层会把
+        # 层拖到垃圾值上；它们是否真的能按长段的层走，由下面的命中率闸门
+        # 在整段范围上验证。
+        pairs = [(sp.bpm, max(1e-6, t1 - t0)) for t0, t1, sp in merged
+                 if (t1 - t0) >= short_s]
     base, layer, cpb, a2, rate = _common_family(
         pairs, target, max_slowdown, max_speedup)
     if base is None:

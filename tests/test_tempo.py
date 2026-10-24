@@ -599,6 +599,55 @@ def test_collapse_keeps_monotonic_true_change():
     assert len(out) == 3, f"真变拍应保留 3 段，实际 {len(out)} 段"
 
 
+def test_collapse_absorbs_short_odd_segment_between_flat_longs():
+    """两长夹一短、长段同一台阶 → 短段的离谱值按测速抖动收编。
+
+    「我不用问」实测形态：全曲 ~95 BPM，中段 9.7 秒被数成 126.2（=95×4/3 的
+    附点档），旧门槛（长段 ≥3 且方向有升有降）两头都够不着，导致该段被单独
+    拉伸 +42.6%、听感「中间莫名其妙加速」。长段彼此一致说明没有真变拍，
+    短段值不可信，应塌缩到长段的家族层。
+    """
+    t0 = 0.0
+    merged = []
+    for bpm, dur in ((95.3, 86.2), (126.2, 9.7), (95.0, 142.0)):
+        t1 = t0 + dur
+        beats = np.arange(0.0, dur, 60.0 / bpm) + t0
+        plan = tc.choose_stretched_tempo(bpm, 180.0, False,
+                                         tc.DEFAULT_MAX_SLOWDOWN,
+                                         tc.DEFAULT_MAX_SPEEDUP)
+        merged.append((t0, t1, tc.SegmentPlan(t0, t1, float(bpm), beats, plan)))
+        t0 = t1
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP)
+    assert len(out) == 1, f"应塌缩成 1 段，实际 {len(out)} 段"
+    _t0, t1, sp = out[0]
+    assert abs(t1 - 237.9) < 1e-6
+    # 层取家族内最低实测段速，方案与拍点自洽
+    assert abs(sp.bpm - 95.0) < 0.5, f"应选 ~95 层，实际 {sp.bpm:.1f}"
+    assert sp.plan.a2 == 90.0 and abs(sp.plan.rate - 90.0 / sp.bpm) < 1e-9
+
+
+def test_collapse_keeps_two_step_longs_with_short_middle():
+    """长段成两个台阶（102.8|140.4，YYZ 形态）+ 短中段 → 保留分段。
+
+    短段（<10s）不参与方向判断是 v1.1.1 为 YYZ 定的规则：它的 8 秒弱音尾奏
+    测出 119.6，若参与方向判断会把单向真变拍变成「有升有降」而被误塌缩。
+    """
+    t0 = 0.0
+    merged = []
+    for bpm, dur in ((102.8, 32.9), (119.6, 8.0), (140.4, 200.0)):
+        t1 = t0 + dur
+        beats = np.arange(0.0, dur, 60.0 / bpm) + t0
+        plan = tc.choose_stretched_tempo(bpm, 180.0, False,
+                                         tc.DEFAULT_MAX_SLOWDOWN,
+                                         tc.DEFAULT_MAX_SPEEDUP)
+        merged.append((t0, t1, tc.SegmentPlan(t0, t1, float(bpm), beats, plan)))
+        t0 = t1
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP)
+    assert len(out) == 3, f"两个台阶应保留 3 段，实际 {len(out)} 段"
+
+
 def test_collapse_keeps_non_integer_ratio_sections():
     """非整数比的两段（YYZ 式 102.8|140.4）不得塌缩。
 
