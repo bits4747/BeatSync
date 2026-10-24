@@ -965,6 +965,8 @@ INT_FAMILY_MAX = 16          # 家族最大整数倍数
 INT_RATIO_TOL = 0.04         # 判「互为整数比」的相对容差（4%）
 SNAP_MAX = 0.43              # 吸附到家族层的最大 log2 距离（≈1.35 倍）
 SEG_HIT_MIN = 0.75           # 单层塌缩前要求的最小网格命中率（真变拍实测 0.33~0.40）
+SEG_SHAPE_MIN_S = 10.0       # 判「来回横跳」时只用不短于它的段（短段测速不可靠）
+SEG_SHAPE_FRAC = 0.06        # 同上，同时要求段长至少占全曲这个比例
 
 
 def _min_cost_layer(bpm: float, target: float, max_slowdown: float,
@@ -1031,50 +1033,117 @@ def _family_layer(base: float, target: float, max_slowdown: float,
     return best
 
 
-def _common_family(bpms, target: float, max_slowdown: float,
-                   max_speedup: float):
-    """找公共基础脉冲 B，使每个段速度都≈B×n 或 B/n（n 为整数）。
+def _common_family(pairs, target: float, max_slowdown: float,
+                   max_speedup: float, nmax: int = INT_FAMILY_MAX,
+                   min_frac: float = 0.80):
+    """找公共基础脉冲 B，使**足够时长**的段速度都落在 B 的整数家族里。
 
-    返回 (base, layer_info) 或 (None, None)。
+    参数 pairs 是 [(bpm, 时长)] 列表。
+    返回 (B, layer, cpb, a2, rate)，找不到返回五个 None。
 
-    只在**实测段速**里挑 B（不扫稠密网格）：稠密扫描配 4% 容差几乎能让任意
-    一组速度都凑出某个 B（130.5 与 132.7 差 1.7%，随便乘个大 n 就对齐了），
-    等于把真变拍也吞掉。
+    判据用 `_snap_family` 的 log2 距离（≤ SNAP_MAX）而不是「两两整数比容差」：
+    YYZ 的 102.8 与 140.4 相差 1.366 倍，按「整数比 ±4%」会被 4/3=1.333 蒙混
+    过关（差 2.4%），整首歌的前奏变拍就被抹掉了。SNAP_MAX=log2(1.35) 恰好把
+    1.366 挡在外面，同时仍能吸收「同一段音乐被数成 4/3 或 3/4」这类层级误差。
 
-    吸附容差 SNAP_MAX 取 log2(1.35)：够吸收「同一段音乐被数成 4/3 或 3/4」
-    这种层级误差，又不至于把真的相差 1.5 倍以上的变拍拉进同一家族（YYZ 前奏
-    102.8 与主体 140.4 相差 1.366 倍 > 1.35，因此保持分段）。
+    为什么 base 只取**实测段速**、不扫稠密网格：稠密扫描配 4% 容差几乎能让任意
+    一组速度都凑出某个 base（130.5 与 132.7 差 1.7%，乘个大 n 就对齐了），等于
+    把真变拍也吞掉。
 
-    层值取**最低的实测段速**（吸附到该 base 家族后）：低层是这一族里最接近
-    音乐真实拍速的那一层，用它算 rate 最小、clicks_per_beat 的语义也对
-    （测 86、目标 180 → a2=90、每拍敲 2 下；若取 174 那层会得到 a2=180、
-    每拍 1 下，而音乐实际只有 90，点击密度就和报告对不上了）。
+    为什么允许 min_frac=0.80 的时长落在家族外：短段的测速噪声会给出与家族无关
+    的孤立值（奢香夫人有一处 8.3 秒的 112.35，只占全曲 3.2%），把它当成「真变拍」
+    会让整首歌拒绝合并、退化成多段乱变速。
+
+    层值取**家族内最低的实测段速**：低层是这一族里最接近音乐真实拍速的那一层，
+    用它算 rate 最小、clicks_per_beat 的语义也对（测 86、目标 180 → a2=90、
+    每拍敲 2 下）；若取 174 那层会得到 a2=180、每拍 1 下，而音乐实际只有 90，
+    点击密度就和报告对不上了。
     """
-    bpms = [float(v) for v in bpms if v and v > 0]
-    if not bpms:
-        return None, None
+    ps = [(float(v), float(w)) for v, w in pairs if v and v > 0 and w and w > 0]
+    if not ps:
+        return None, None, None, None, None
+    total = sum(w for _v, w in ps) or 1.0
     best = None
-    for base in sorted({round(v, 3) for v in bpms}):
-        ok = True
-        for v in bpms:
-            d, _layer = _snap_family(v, base)
+    for base in sorted({round(v, 3) for v, _w in ps}):
+        good = 0.0
+        members = []
+        for v, w in ps:
+            d, _layer = _snap_family(v, base, nmax)
             if d > SNAP_MAX:
-                ok = False
-                break
-        if not ok:
+                continue
+            good += w
+            members.append(v)
+        if not members or good / total < min_frac:
             continue
-        # 该家族里最低的实测段速 = 最接近真实拍速的一层
-        low = min(bpms)
-        _d, layer = _snap_family(low, base)
+        low = min(members)
+        _d, layer = _snap_family(low, base, nmax)
         mc = _min_cost_layer(layer, target, max_slowdown, max_speedup)
         if mc is None:
             continue
-        lay = ((mc[0], 1), layer, mc[1], mc[2], mc[3])
-        if best is None or lay[0] < best[0][0]:
-            best = (lay, base)
+        key = (round(mc[0][0], 4), mc[0][1])
+        if best is None or key < best[0]:
+            best = (key, base, layer, mc[1], mc[2], mc[3])
     if best is None:
-        return None, None
-    return best[1], best[0]
+        return None, None, None, None, None
+    _key, base, layer, cpb, a2, rate = best
+    return base, layer, cpb, a2, rate
+
+
+def _phase_grid(onset, sr: int, bpm: float, t0: float, t1: float,
+                nphase: int = 64, tol_frac: float = 0.045,
+                hop: int = 256):
+    """在 [t0, t1) 上按 bpm 生成**相位最优**的规整网格，返回 (grid_rel, hit_frac)。
+
+    网格与 bpm 严格自洽（间距恒为 60/bpm），这是硬要求：段方案里的 `bpm` 与
+    实际拍点间距必须一致，否则 `click_schedule` 会按错的拍距去敲——表现为
+    「节拍器变成机关枪」（实测拍距 0.46s 却记成 93 BPM，点击密度 261/min
+    而目标只有 180/min）。
+
+    hit_frac 是这条网格真正踩到起音的比例（同 `_seg_hit_frac` 的口径），
+    用来确认这一层确实能解释这段音乐：层选错了（例如把 134.9 的歌当成 93），
+    网格只能命中六成左右的点，会被拒掉。
+
+    grid_rel 是相对 t0 的拍时刻（SegmentPlan.beats 的约定）。
+    """
+    if bpm <= 0 or t1 - t0 < 1.0:
+        return None, 0.0
+    fa = max(0, int(t0 * sr / hop))
+    fb = max(fa + 1, int(t1 * sr / hop))
+    env = np.asarray(onset[fa:fb], dtype=np.float64)
+    pos = env[env > 0]
+    if pos.size < 8:
+        return None, 0.0
+    thr = float(np.percentile(pos, 90)) * 0.30
+    T = 60.0 / bpm
+    half = max(1, int(tol_frac * T * sr / hop))
+    omax = _dilate_max(onset, half)
+    n = len(onset)
+    best = (-1.0, 0.0)
+    for k in range(nphase):
+        ph = k / nphase * T
+        cnt = int((t1 - t0 - ph) / T) + 1
+        if cnt < 6:
+            continue
+        g = t0 + ph + np.arange(cnt) * T
+        g = g[g < t1]
+        if len(g) < 6:
+            continue
+        idx = np.round(g * sr / hop).astype(np.int64)
+        idx = idx[(idx >= 0) & (idx < n)]
+        if len(idx) < 6:
+            continue
+        frac = float(np.mean(omax[idx] >= thr))
+        if frac > best[0]:
+            best = (frac, ph)
+    if best[0] < 0:
+        return None, 0.0
+    ph = best[1]
+    cnt = int((t1 - t0 - ph) / T) + 1
+    g = t0 + ph + np.arange(cnt) * T
+    g = g[(g >= t0) & (g < t1)]
+    if len(g) < 6:
+        return None, 0.0
+    return g - t0, best[0]
 
 
 def _seg_align_score(onset, rms, sr: int, beats, t0: float, t1: float,
@@ -1452,52 +1521,69 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
     if any(sp is None or sp.bpm <= 0 or len(np.asarray(sp.beats)) < 4
            for _t0, _t1, sp in merged):
         return merged
-    bpms = [sp.bpm for _t0, _t1, sp in merged]
     # 只收拾「来回横跳」的测速抖动，不动单向的真变拍。
     # 同一段音乐被数成不同节拍层时，各段速度会反复来回（120 → 90 → 120 → 90），
     # 段数多、方向反转；而真正的变拍（90 → 120 → 150）是单调推进的，方向只有一次。
     # 两者在「速度比」上无法区分（都是 4/3 一类），所以用序列形状来区分。
+    #
+    # 判方向时必须**丢掉过短的段**：YYZ 末尾有个 8 秒的弱音尾奏，测速给出 119.6，
+    # 它把「103 → 141」这条单向的真变拍变成了「升一次、降一次」，于是整首歌被
+    # 误判成层抖动、前奏的变拍被抹掉。短段的测速本来就不可靠，不该参与形状判断。
+    dur_all = merged[-1][1] - merged[0][0]
+    # 判方向时必须**丢掉过短的段**：YYZ 末尾有个 8 秒的弱音尾奏，测速给出 119.6，
+    # 它把「103 → 141」这条单向的真变拍变成了「升一次、降一次」，于是整首歌被
+    # 误判成层抖动、前奏的变拍被抹掉。短段的测速本来就不可靠，不该参与形状判断。
+    # 阈值取「全曲 6%」并夹在 [2s, SEG_SHAPE_MIN_S] 之间：长曲按比例放宽，
+    # 短曲（例如 12 秒的合成测试素材）自动缩到 2 秒，不至于把所有段都丢掉。
+    short_s = min(SEG_SHAPE_MIN_S, max(2.0, SEG_SHAPE_FRAC * dur_all))
+    long_bpms = [sp.bpm for t0, t1, sp in merged if (t1 - t0) >= short_s]
+    if len(long_bpms) < 3:
+        return merged                      # 长段不足 3 个，谈不上「来回」，不动
+    # 还要把「差一点点」的相邻段先归并成一个台阶，再看方向：主体段落内部
+    # 140.61 / 140.34 / 140.86 这种千分之几的抖动，方向算出来也会升降交替，
+    # 但那是同一个速度的测速噪声，不是一个台阶。只有相差超过 10% 才算换了台阶。
+    steps = [long_bpms[0]]
+    for v in long_bpms[1:]:
+        if abs(math.log2(v / steps[-1])) < math.log2(1.10):
+            continue                       # 同一个台阶，忽略
+        steps.append(v)
+    if len(steps) < 3:
+        return merged                      # 去掉抖动后只剩两个台阶 → 保留
     # 段数门槛 3：少于 3 段根本谈不上「来回」，一律不动（两段变速必须保留）。
-    ups = sum(1 for i in range(1, len(bpms)) if bpms[i] > bpms[i - 1])
-    downs = len(bpms) - 1 - ups
+    ups = sum(1 for i in range(1, len(steps)) if steps[i] > steps[i - 1])
+    downs = len(steps) - 1 - ups
     if not (ups >= 1 and downs >= 1):
         return merged                      # 单调 → 真变拍，保留分段
-    base, lay = _common_family(bpms, target, max_slowdown, max_speedup)
+    pairs = [(sp.bpm, max(1e-6, t1 - t0)) for t0, t1, sp in merged]
+    base, layer, cpb, a2, rate = _common_family(
+        pairs, target, max_slowdown, max_speedup)
     if base is None:
         return merged                      # 不是同一家族 → 保留原分段
-    # 同族之后，层从**实测段速**里挑（不从 base×n 的稠密网格里挑）：
-    # 层取得越高，rate 越接近 1、变速代价看着越小，但那不是音乐的真实拍速——
-    # 实测拿 base×n 挑"代价最小"会一路挑到 base×3（86→50.7、146→48.7），
-    # 报告里写的检测速度就变成真值的 1/1.7，用户直接看出不对。
-    # 规则：取**最低的、有可行方案的实测段速**，它就是这一族里最接近音乐真实
-    # 拍速的那一层；再用网格命中率把关，确认这一层真的能解释全曲。
-    long_segs = [(a, b) for a, b, _sp in merged if b - a >= SEG_MIN_SEG_S]
-    tot_len = sum(b - a for a, b in long_segs) or 1.0
-    chosen = None
-    for cand in sorted({round(v, 3) for v in bpms}):
-        mc = _min_cost_layer(cand, target, max_slowdown, max_speedup)
-        if mc is None:
-            continue                       # 这一层没有可行方案，试更高的一层
-        if onset is not None and sr > 0 and long_segs:
-            # 时长加权命中率：这条网格要能解释全曲 75% 以上的时长。逐段取 min 会被
-            # 一个 8 秒的弱段否决掉本来正确的层。
-            good = sum(b - a for a, b in long_segs
-                       if _seg_hit_frac(onset, sr, cand, a, b) >= 0.80)
-            if good / tot_len < SEG_HIT_MIN:
-                continue
-        chosen = (cand, mc[1], mc[2], mc[3])
-        break
-    if chosen is None:
-        return merged
-    layer, cpb, a2, rate = chosen
     t0 = merged[0][0]
     t1 = merged[-1][1]
-    beats = np.concatenate([np.asarray(merged[0][2].beats)] +
-                           [np.asarray(sp.beats) + (s_t0 - t0)
-                            for s_t0, _s_t1, sp in merged[1:]])
+    # 拍网格必须**按选定的层重建**，不能把各段自己的拍点拼起来：
+    # 各段的拍点间距对应的是它们各自的实测速度（例如 134.9 BPM），而这里把
+    # bpm 记成家族层（93.0）。两者不一致时 click_schedule 会按错的拍距敲，
+    # 实测点击密度 261/min（目标 180），听感就是「节拍器变机关枪」。
+    # 重建后再用命中率确认这一层真的能解释这段音乐——层选错（把 134.9 的歌
+    # 当成 93）时规整网格只能命中一部分起音，会被下面这道闸门拒掉。
+    if onset is not None and sr > 0:
+        grid, hit = _phase_grid(onset, sr, layer, t0, t1)
+        if grid is None or len(grid) < 4:
+            return merged
+        if hit < SEG_HIT_MIN:
+            return merged                  # 这一层解释不了这段音乐 → 不是层抖动
+    else:
+        # 没有音频包络时（单元测试直接调本函数）用规整网格兜底：间距恒为
+        # 60/layer，与 bpm 自洽即可，命中率无从判也就不判。
+        T = 60.0 / layer
+        grid = np.arange(0.0, t1 - t0, T)
+        if len(grid) < 4:
+            return merged
     plan = StretchPlan(float(a2), float(rate), float(target), float(cpb), 0)
-    # 该段的「检测速度」记成所选家族层的速度：报告里写的是真正采用的层
-    return [(t0, t1, SegmentPlan(t0, t1, float(layer), beats, plan))]
+    # 该段的「检测速度」记成所选家族层的速度：报告里写的是真正采用的层，
+    # 且与 beats 的间距严格自洽（60/layer）。
+    return [(t0, t1, SegmentPlan(t0, t1, float(layer), grid, plan))]
 
 
 def _xfade(a, b, ov):
