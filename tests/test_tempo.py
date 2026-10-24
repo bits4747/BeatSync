@@ -85,6 +85,52 @@ def test_detected_value_is_plausible():
         assert 30.0 <= detected <= 300.0
 
 
+# ---------------------------------------------------------------- 附点档修正
+
+def _spike_envelope(bpm: float, dur: float = 30.0, sr: int = SR) -> np.ndarray:
+    """构造 hop=256 的 onset 包络：每拍一个 6 帧平台脉冲（供修正判据直测）。"""
+    fps = sr / 256
+    env = np.zeros(int(dur * fps))
+    t = 0.0
+    while t < dur - 0.1:
+        i = int(round(t * fps))
+        env[i:i + 6] = 1.0
+        t += 60.0 / bpm
+    return env
+
+
+def test_thirds_ratio_quiet_on_straight_grid():
+    """直拍网格的三度位显著度必须低于触发阈值（附点档修正的判据基础）。"""
+    env = _spike_envelope(90.0)
+    ratio = tc._thirds_ratio(env, SR / 256, 60.0 / 90.0, 0.0)
+    assert ratio < tc.DOTTED_FIRE, f"直拍三度位显著度 {ratio:.3f} 不应触发"
+
+
+def test_dotted_fix_moves_128_down_to_96():
+    """128 档上真拍落在 1/3、2/3 位（96 = 128×3/4）时必须修到 96 档。
+
+    「乏善可陈」的实测形态：96 BPM 的歌被 120 先验判到 128，且数据判据
+    （网格分/自相关）在 96 与 192 之间偏向 192，只有感知锚点能修对。
+    """
+    env = _spike_envelope(96.0)
+    P, _ = tc._dotted_level_fix(env, SR, 60.0 / 128.0, 0.0)
+    assert abs(60.0 / P - 96.0) < 1.0, f"修正到 {60.0 / P:.2f}，期望 96"
+
+
+def test_dotted_fix_noop_when_thirds_quiet():
+    """三度位安静（正常直拍）时必须原样返回，不动档位。"""
+    env = _spike_envelope(90.0)
+    P, phase = tc._dotted_level_fix(env, SR, 60.0 / 90.0, 0.0)
+    assert P == 60.0 / 90.0 and phase == 0.0
+
+
+def test_dotted_fix_picks_in_range_neighbour():
+    """出界的邻档不参与选择：60 档的 3/4 邻档 45 低于下限，必须修到 90。"""
+    env = _spike_envelope(180.0)
+    P, _ = tc._dotted_level_fix(env, SR, 60.0 / 60.0, 0.0)
+    assert abs(60.0 / P - 90.0) < 1.0, f"修正到 {60.0 / P:.2f}，期望 90"
+
+
 # ---------------------------------------------------------------- 速度方案
 
 def test_exact_target_returns_rate_one():

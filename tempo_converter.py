@@ -708,6 +708,121 @@ def _comb_refine(onset, sr: int, beat_times):
     return float(best[0]), float(best[1])
 
 
+def _comb_fit_at(onset, sr, P0):
+    """在指定拍周期档（±4%）做与 _comb_refine 同粒度的两段搜索。
+
+    与 _comb_refine 的区别：相位不依赖 beat_track 的拍，直接搜整周期——
+    供附点档修正重扫邻档用（邻档的拍位与原档的拍没有整数倍关系）。
+    返回 (period_sec, phase_sec)；不可拟合时返回 (None, None)。
+    """
+    fps = sr / 256
+    n_frames = len(onset)
+    if not (0.2 <= P0 <= 2.5) or n_frames < 8:
+        return None, None
+    duration = n_frames / fps
+    t_a = min(0.05 * duration, 5.0)
+    t_b = max(duration - min(0.05 * duration, 5.0), t_a + 4 * P0)
+    if t_b <= t_a + 4 * P0:
+        t_a, t_b = 0.0, duration
+    omax = _dilate_max(onset, 2)
+    best = [P0, 0.0, _grid_score(onset, fps, P0, 0.0, t_a, t_b, onset_max=omax)]
+    for P in np.linspace(P0 * 0.96, P0 * 1.04, 41):
+        for ph in np.linspace(0, P, 25, endpoint=False):
+            sc = _grid_score(onset, fps, P, ph, t_a, t_b, onset_max=omax)
+            if sc > best[2]:
+                best = [P, ph, sc]
+    P1, ph1, _ = best
+    for P in np.linspace(P1 * 0.9985, P1 * 1.0015, 31):
+        for ph in np.linspace(ph1 - 0.03 * P1, ph1 + 0.03 * P1, 9):
+            sc = _grid_score(onset, fps, P, ph, t_a, t_b, onset_max=omax)
+            if sc > best[2]:
+                best = [P, ph, sc]
+    return float(best[0]), float(best[1])
+
+
+# 附点档修正参数。
+# 真拍与检测档成 3/4 或 3/2 倍（附点关系）时，真拍恰好落在检测网格的 1/3、
+# 2/3 位上——此时节拍器有一半点击落在拍间，听感明显错拍。这类错误的根源是
+# beat_track 的 120 BPM 先验：真档自相关峰只比 120 附近的假档强一点点时，
+# 先验就把它翻掉（实测：180 BPM 的「失败的晚餐」判 120、96 BPM 的
+# 「乏善可陈」判 128）。判据用「三度位显著度」：三度位的 onset 均值 ÷ 拍位
+# 均值。真实曲上分离干净——正常档（三度位只有弱细分）实测 ≤0.77，附点错误
+# 档实测 ≥0.99；阈值取中间并留余量。
+DOTTED_FIRE = 0.85
+# 修正方向：×3/4 与 ×3/2 两个邻档都可能。自相关/网格分在这两档之间的排序
+# 不可靠（八分音符网格会骗过能量判据：实测「乏善可陈」真值 96 与八分档 192
+# 的分数几乎并列甚至倒挂），拿不准时回到 120 BPM 感知锚点——与 beat_track
+# 的 start_bpm 同源：人打拍子的生理舒适区。
+DOTTED_ANCHOR_BPM = 120.0
+DOTTED_BPM_LO = 50.0
+DOTTED_BPM_HI = 240.0
+
+
+def _thirds_ratio(onset, fps, P, phase, omax=None):
+    """检测网格的「三度位显著度」：1/3、2/3 拍位处 onset 均值 ÷ 拍位均值。
+
+    分析窗口与 _comb_refine 相同（避开首尾 5%，前奏/尾奏常无稳定节拍）。
+    """
+    n_frames = len(onset)
+    fps = float(fps)
+    duration = n_frames / fps
+    t_a = min(0.05 * duration, 5.0)
+    t_b = max(duration - min(0.05 * duration, 5.0), t_a + 4 * P)
+    if t_b <= t_a + 4 * P:
+        t_a, t_b = 0.0, duration
+    if omax is None:
+        omax = _dilate_max(onset, 2)
+
+    def mean_at(offset):
+        k0 = int(np.ceil((t_a - phase - offset) / P - 1e-9))
+        k1 = int(np.floor((t_b - phase - offset) / P + 1e-9))
+        if k1 <= k0:
+            return -1.0
+        f = np.round((phase + offset + np.arange(k0, k1 + 1) * P) * fps).astype(int)
+        f = f[(f >= 0) & (f < n_frames)]
+        if len(f) < 4:
+            return -1.0
+        return float(np.mean(np.asarray(omax, dtype=np.float64)[f]))
+
+    beat = mean_at(0.0)
+    if beat <= 0:
+        return 0.0
+    third_a, third_b = mean_at(P / 3), mean_at(2 * P / 3)
+    if third_a < 0 or third_b < 0:
+        return 0.0
+    return max(third_a, third_b) / beat
+
+
+def _dotted_level_fix(onset, sr, P, phase):
+    """附点档修正：检测档的三度位上有拍级能量时，改判到 3/4 或 3/2 倍邻档。
+
+    返回修正后的 (P, phase)；不修正时原样返回。邻档重新做梳状拟合，并用
+    三度位显著度复核——若邻档仍显著（连环附点）再走一步；两步后仍显著就
+    按当前档返回（不猜第三步，连环三层以上的附点关系没有实例）。
+    """
+    n_frames = len(onset)
+    if n_frames < 8:
+        return P, phase
+    fps = sr / 256
+    omax = _dilate_max(onset, 2)
+    if _thirds_ratio(onset, fps, P, phase, omax) < DOTTED_FIRE:
+        return P, phase
+    for _ in range(2):
+        bpm0 = 60.0 / P
+        cands = [bpm0 * m for m in (0.75, 1.5)
+                 if DOTTED_BPM_LO <= bpm0 * m <= DOTTED_BPM_HI]
+        if not cands:
+            break
+        bc = min(cands, key=lambda b: abs(np.log2(b / DOTTED_ANCHOR_BPM)))
+        P2, phase2 = _comb_fit_at(onset, sr, 60.0 / bc)
+        if P2 is None:
+            break
+        P, phase = P2, phase2
+        if _thirds_ratio(onset, fps, P, phase, omax) < DOTTED_FIRE:
+            break
+    return P, phase
+
+
 def _smooth_beat_grid(beat_times, P: float, phase: float, duration: float):
     """把实测节拍拟合到一条**平滑**的节拍时间轴上，返回规整的节拍序列。
 
@@ -1708,6 +1823,16 @@ def detect_tempo(y_mono, sr: int, lang: str | None = None, mel=None):
     if P is None:
         P = float(np.median(np.diff(beat_times)))
         phase = float(beat_times[0])
+    else:
+        # 附点档修正：检测档的 1/3、2/3 位上有拍级能量（真拍在 3/4 或 3/2 倍
+        # 档上，120 BPM 先验把档位拽错的典型形态）时改判档位。修正后的拍列
+        # 与 beat_track 的拍不再对齐，按精修网格重建规整拍列——能触发修正的
+        # 歌速度稳定，规整网格即真实拍。
+        P2, phase2 = _dotted_level_fix(onset_fine, sr, P, phase)
+        if (P2, phase2) != (P, phase):
+            P, phase = P2, phase2
+            k_end = int(np.floor((duration - phase) / P + 1e-9))
+            beat_times = phase + np.arange(0, k_end + 1) * P
     bpm = 60.0 / P
     if bpm <= 0:
         raise RuntimeError(_no_tempo_msg(lang))
