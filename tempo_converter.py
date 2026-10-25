@@ -2294,6 +2294,53 @@ def click_schedule(beat_times, rate: float, click_bpm: float, duration: float,
     return times
 
 
+def _output_beats(y2, sr: int, a2: float, duration: float,
+                  clicks_per_beat: float | None = None):
+    """在**变速后的音频**上直接找拍，返回输出轴拍时刻列表（供 click_schedule
+    以 rate=1 铺点击）；跟踪不可靠时返回 None，调用方退回网格插值路径。
+
+    为什么（用户 2026-10-25 口径：按变好速度后的音乐加节拍器）：理论链
+    「输入轴检测网格 ÷ 拉伸比」的每一步误差（层值精度、网格拟合、相位
+    声码器映射）都会累积进点击时刻；在最终听到的这份音频上逐拍跟踪
+    （周期锚定 60/a2 方案值，±1/4 拍窗内取最强 onset 帧），点击必然踩在
+    音乐自己的瞬态上。偶数 cpb 的点击集对半拍平移不变；奇数/分数 cpb
+    需要底鼓带裁决半拍相位（八分低音会把粗锚拽到八分位）。
+    """
+    import librosa
+    ym = np.asarray(y2, dtype=np.float32)
+    if ym.ndim > 1:
+        ym = ym.mean(axis=0)
+    onset = librosa.onset.onset_strength(y=ym, sr=sr, hop_length=256)
+    P = 60.0 / a2
+    grid0, _hit = _phase_grid(onset, sr, a2, 0.0, duration)
+    if grid0 is None or len(grid0) < 4:
+        return None
+    phase0 = float(grid0[0]) % P
+    frac_cpb = clicks_per_beat is not None and \
+        abs(clicks_per_beat - round(clicks_per_beat)) > 1e-9
+    odd_cpb = clicks_per_beat is not None and \
+        round(clicks_per_beat) % 2 == 1 and not frac_cpb
+    if frac_cpb or odd_cpb:
+        mel2 = np.abs(librosa.feature.melspectrogram(y=ym, sr=sr, hop_length=256,
+                                                     fmax=0.5 * sr))
+        phase0, _fl = _kick_phase_align(mel2, sr, P, phase0, 0.0, duration)
+    ks, ts = _relock_beats(onset, sr, P, phase0, 0.0, duration)
+    if len(ks) < 8 or len(ks) < 0.4 * len(grid0):
+        return None
+    # 首尾按局部拍距外推补齐到 [0, duration]，保证点击密度与旧路径同口径
+    ts = list(ts)
+    if len(ts) > 2:
+        d_head = ts[1] - ts[0]
+        d_tail = ts[-1] - ts[-2]
+    else:
+        d_head = d_tail = P
+    while ts[0] - d_head >= -1e-9:
+        ts.insert(0, ts[0] - d_head)
+    while ts[-1] + d_tail < duration:
+        ts.append(ts[-1] + d_tail)
+    return np.asarray(ts, dtype=np.float64)
+
+
 def build_click_track(n_samples: int, sr: int, click_times, timbre: str, rng,
                       music_rms_db: float = -18.0, rel_db: float = -6.0, lang=None) -> np.ndarray:
     """在 click_times（秒）位置铺设节拍器音轨（所有敲击等响、无重音）。
@@ -2420,13 +2467,23 @@ def _process_segmented(path, opt, y, sr, y_mono, seg_plans, row, notes,
     times = []
     for i, (t0, t1, sp) in enumerate(seg_plans):
         dur_out = float((t1 - t0) / sp.plan.rate) + 0.5
-        ct = click_schedule(sp.beats, sp.plan.rate, sp.plan.click_bpm, dur_out,
-                           clicks_per_beat=sp.plan.clicks_per_beat)
+        o0 = int(round(origins[i] * sr))
+        o1 = min(y2.shape[1], o0 + int(round(dur_out * sr)))
+        bt_out = (_output_beats(y2[:, o0:o1], sr, float(sp.plan.a2),
+                                (o1 - o0) / sr,
+                                clicks_per_beat=float(sp.plan.clicks_per_beat))
+                  if o1 - o0 > 8 * sr else None)
+        if bt_out is not None:
+            ct = click_schedule(bt_out, 1.0, sp.plan.click_bpm, dur_out,
+                                clicks_per_beat=sp.plan.clicks_per_beat)
+        else:
+            ct = click_schedule(sp.beats, sp.plan.rate, sp.plan.click_bpm, dur_out,
+                                clicks_per_beat=sp.plan.clicks_per_beat)
+            if sp.beats is None or len(sp.beats) < 4:
+                notes.append(tr(f"第{i + 1}段未取到可靠节拍位置，该段节拍器按速率均匀敲",
+                                f"segment {i + 1} has no reliable beat positions; "
+                                "its metronome clicks are spaced evenly", L))
         times.extend(origins[i] + float(c) for c in ct)
-        if sp.beats is None or len(sp.beats) < 4:
-            notes.append(tr(f"第{i + 1}段未取到可靠节拍位置，该段节拍器按速率均匀敲",
-                            f"segment {i + 1} has no reliable beat positions; "
-                            "its metronome clicks are spaced evenly", L))
     times = sorted(t for t in times if 0.0 <= t < y2.shape[1] / sr)
     if opt.metronome:
         n = y2.shape[1]
@@ -2625,11 +2682,19 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
         row["音乐响度dB"] = f"{music_rms_db:.1f}"
         if opt.metronome:
             n = y2.shape[1]
-            times = click_schedule(beat_times, plan.rate, plan.click_bpm, n / sr,
-                                   clicks_per_beat=plan.clicks_per_beat)
-            if beat_times is None or len(beat_times) < 4:
-                notes.append(tr("未取到可靠节拍位置，节拍器按速率均匀敲",
-                                "no reliable beat positions; metronome clicks spaced evenly", L))
+            # 按变速后的音乐直接找拍（输出轴逐拍跟踪）；不可靠再退回
+            # 「输入轴网格 ÷ 拉伸比」的理论路径。
+            bt_out = _output_beats(y2, sr, float(plan.a2), n / sr,
+                                   clicks_per_beat=float(plan.clicks_per_beat))
+            if bt_out is not None:
+                times = click_schedule(bt_out, 1.0, plan.click_bpm, n / sr,
+                                       clicks_per_beat=plan.clicks_per_beat)
+            else:
+                times = click_schedule(beat_times, plan.rate, plan.click_bpm, n / sr,
+                                       clicks_per_beat=plan.clicks_per_beat)
+                if beat_times is None or len(beat_times) < 4:
+                    notes.append(tr("未取到可靠节拍位置，节拍器按速率均匀敲",
+                                    "no reliable beat positions; metronome clicks spaced evenly", L))
             rng = np.random.default_rng(20260606)
             click = build_click_track(n, sr, times, opt.metronome, rng,
                                       music_rms_db=music_rms_db, rel_db=opt.click_rel_db, lang=L)

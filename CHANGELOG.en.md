@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.5**. Every release bumps the version
+**Versioning rules**: current version **1.2.6**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,32 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.2.6] — 2026-10-25
+
+Only the metronome placement changes; detection/layer/segmentation behaviour is
+identical to 1.2.5 (13-song re-check, item for item).
+
+### Fixed
+
+- **Metronome clicks are now placed directly on the time-stretched music.**
+  Previously click times were derived theoretically as "input-axis detection
+  grid ÷ stretch ratio" — every error along that chain (layer-value precision,
+  grid fitting, phase-vocoder mapping) accumulated into the click times. The
+  audible result: "slightly off from the very start, only occasionally landing
+  on a beat" (the stretch itself was fine; the metronome was wrong). **New
+  behaviour**: after the music is stretched, beats are tracked beat-by-beat on
+  the **final output audio** (period anchored to the plan's stretched BPM; the
+  strongest onset frame within a ±1/4-beat window), and clicks land on this
+  music's own beats. For odd/fractional clicks-per-beat, a kick-band half-beat
+  adjudication runs first (even click sets are invariant under a half-beat
+  shift); if tracking is unreliable (<40% locked beats), the theoretical path
+  is used as fallback. Verification: on synthetic drums (exact known beat
+  positions) the click offset is **+2.4 ms**; four real slowcore/indie tracks
+  show no phase-drift trend (within ±6 ms). Each segment of segmented
+  conversions is likewise tracked on its own stretched audio.
 
 ---
 
