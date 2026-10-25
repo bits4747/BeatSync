@@ -847,29 +847,7 @@ def _smooth_beat_grid(beat_times, P: float, phase: float, duration: float):
         return None
     k = np.round((bt - phase) / P)
 
-    keep = np.ones(len(bt), dtype=bool)
-    fit = None
-    for deg in (1, 2, 3):
-        # 先用当前 deg 做一次稳健拟合（迭代重加权：按绝对残差剔除离群拍）
-        kk, tt = k[keep], bt[keep]
-        if len(kk) < max(6, deg + 3):
-            break
-        coef = np.polyfit(kk, tt, deg)
-        for _ in range(3):
-            resid = bt - np.polyval(coef, k)
-            inl = np.abs(resid - np.median(resid[keep])) <= max(0.25 * P,
-                                                               5.0 * np.median(np.abs(resid[keep] - np.median(resid[keep]))))
-            if inl.sum() < max(6, deg + 3):
-                break
-            keep = inl
-            coef = np.polyfit(k[keep], bt[keep], deg)
-        resid_in = (bt - np.polyval(coef, k))[keep]
-        # 系统性残差（中位绝对残差）是否已经够小？够小就不必升阶
-        sys_err = float(np.median(np.abs(resid_in - np.median(resid_in))))
-        if sys_err <= 0.12 * P:
-            fit = coef
-            break
-        fit = coef  # 记录当前最好，继续尝试更高阶
+    fit = _robust_beat_fit(k, bt, P)
     if fit is None:
         return None
 
@@ -897,6 +875,118 @@ def _regular_grid(beat_times, P: float, phase: float, duration: float):
     if k_end <= k0:
         return bt
     return phase + np.arange(k0, k_end + 1) * P
+
+
+def _robust_beat_fit(k, t, P: float):
+    """(拍号 → 拍时刻) 的稳健低阶多项式拟合，返回系数或 None。
+
+    阶数自适应：速度稳定 1 阶（= 规整网格）；确有系统性变速升到 2~3 阶
+    （跟随变速但不跟随逐拍抖动）。迭代剔除离群拍（残差 >0.25P 或 5×MAD）。
+    """
+    k = np.asarray(k, dtype=np.float64)
+    t = np.asarray(t, dtype=np.float64)
+    keep = np.ones(len(t), dtype=bool)
+    fit = None
+    for deg in (1, 2, 3):
+        kk, tt = k[keep], t[keep]
+        if len(kk) < max(6, deg + 3):
+            break
+        coef = np.polyfit(kk, tt, deg)
+        for _ in range(3):
+            resid = t - np.polyval(coef, k)
+            med = np.median(resid[keep])
+            inl = np.abs(resid - med) <= max(0.25 * P,
+                                             5.0 * np.median(np.abs(resid[keep] - med)))
+            if inl.sum() < max(6, deg + 3):
+                break
+            keep = inl
+            coef = np.polyfit(k[keep], t[keep], deg)
+        resid_in = (t - np.polyval(coef, k))[keep]
+        # 系统性残差（中位绝对残差）是否已经够小？够小就不必升阶
+        sys_err = float(np.median(np.abs(resid_in - np.median(resid_in))))
+        if sys_err <= 0.12 * P:
+            return coef
+        fit = coef  # 记录当前最好，继续尝试更高阶
+    return fit
+
+
+def _relock_beats(onset, sr: int, P: float, phase: float, t0: float, t1: float,
+                  hop: int = 256):
+    """把恒速骨架（phase + k·P）的拍位重新锁回音乐自己的瞬态上。
+
+    **逐拍跟踪**（锁相环式）：下一拍的预测位置 = 上一锁定拍 + (拍号差)·P，
+    在预测位 ±0.25P 窗内取**过阈且离预测最近**的帧。恒速骨架只用于初始
+    锚定（前部骨架漂移可忽略）——骨架与真实拍的偏差是累积性的（层值误差
+    ×几百拍，2026-10-25 实测 0.4% 失配 4 分钟漂出约 1 秒），固定窗重锁会在
+    漂出 ±1/4 拍后锁不到真拍；逐拍跟踪则每拍吸收偏差、不累积。
+
+    ±0.25P 窗保证不会跳层：半拍位（八分低音）在窗外，永远选不中；窗内
+    零散噪声峰由 _refit_grid 的稳健拟合剔除。窗内无过阈帧的拍（安静段落）
+    被丢弃，交给拟合外推。
+
+    窗内取**过阈帧中 onset 最强**的（不是离预测最近的）：「最近」有惰性——
+    锁定点被骨架拽着走，速度修正打折（实测真实 95.3 只修到 95.0）；「最强」
+    直接锁在拍瞬态中心。跳层风险不变：半拍位仍在 ±0.25P 窗外。
+
+    返回 (拍号数组, 拍时刻数组，绝对秒)。
+    """
+    onset = np.asarray(onset, dtype=np.float64)
+    n = len(onset)
+    fps = sr / hop
+    pos = onset[onset > 0]
+    if pos.size < 8:
+        return np.array([]), np.array([])
+    thr = float(np.percentile(pos, 90)) * 0.35
+    half = max(1, int(round(0.25 * P * fps)))
+    k0 = int(np.ceil((t0 - phase) / P))
+    k1 = int(np.floor((t1 - phase) / P))
+    if k1 - k0 < 3:
+        return np.array([]), np.array([])
+    ks, ts = [], []
+    last_t, last_k = None, None
+    for k in range(k0, k1 + 1):
+        if last_t is None:
+            c = int(round((phase + k * P) * fps))
+        else:
+            c = int(round((last_t + (k - last_k) * P) * fps))
+        a, b = max(0, c - half), min(n, c + half + 1)
+        if b - a < 2:
+            continue
+        w = onset[a:b]
+        j = a + int(np.argmax(w))
+        if w[j - a] < thr:
+            continue
+        t = j / fps
+        ks.append(k)
+        ts.append(t)
+        last_t, last_k = t, k
+    return np.asarray(ks, dtype=np.float64), np.asarray(ts, dtype=np.float64)
+
+
+def _refit_grid(onset, sr: int, P: float, phase: float, t0: float, t1: float,
+                hop: int = 256):
+    """恒速骨架的「贴合化」：重锁实测拍 → 稳健多项式拟合 → 整数拍号网格。
+
+    拍号范围与恒速网格完全一致（拍数不变，节拍器密度不受影响），但每个
+    拍位贴回音乐真实瞬态，点击跟随音乐拍、不再累积漂移。拟合失败或形状
+    护栏（严格单调、间距 0.75~1.25P）不过时返回 None，调用方退回恒速网格。
+    返回绝对秒时刻数组。
+    """
+    ks, ts = _relock_beats(onset, sr, P, phase, t0, t1, hop)
+    if len(ks) < 8:
+        return None
+    fit = _robust_beat_fit(ks, ts, P)
+    if fit is None:
+        return None
+    k0 = int(np.ceil((t0 - phase) / P))
+    k_end = int(np.floor((t1 - phase) / P + 1e-9))
+    if k_end <= k0:
+        return None
+    kg = np.arange(k0, k_end + 1, dtype=np.float64)
+    grid = np.polyval(fit, kg)
+    if np.any(np.diff(grid) <= 0.5 * P) or np.any(np.abs(np.diff(grid) - P) > 0.25 * P):
+        return None
+    return grid
 
 
 class SegmentPlan(NamedTuple):
@@ -1608,7 +1698,8 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
     return merged, None
 
 
-def _family_layer_candidates(measured_bpms, target, max_slowdown, max_speedup):
+def _family_layer_candidates(measured_bpms, target, max_slowdown, max_speedup,
+                             weights=None):
     """家族层候选：长段实测速度的**倍频**层（×2/÷2），按用户口径排序。
 
     只走倍频格、不走 ×3/÷3 这类整数倍：倍频层与真拍格保持整数关系（点集
@@ -1625,6 +1716,14 @@ def _family_layer_candidates(measured_bpms, target, max_slowdown, max_speedup):
         一样），且测量噪声会让"恒相同"变成差千分之一——并列必须给容差，容差
         内取低层（v1.1.0 定则：低层最接近音乐真实拍速），「每拍敲 N 下」的
         文案才与真实拍数一致。
+      * **主导实测层保护（2026-10-25）**：代价判据只在层都为真时才有意义——
+        「夜间独白」六段全部实测 110.x（真实层），半层 55 从未被测出，代价却
+        更小（|log2 1.09|=0.13 < |log2 0.82|=0.29）；选假层的代价是谎言（名义
+        +9%、实际把 110 的音乐拉到 120，与点击 180 成 3/2，全程错频）。当
+        **时长加权主导的实测层**与最优候选的代价差落在 (0.02, 0.35] 八度
+        （超过并列带、又不到「值得为代价抛弃实测层」的程度）时，实测层提到
+        最前。满月不回归：其主导实测 124 与 61.99 代价差 0.49 > 0.35，仍按
+        代价选 61.99。
     候选是否真能解释音乐，由调用方的命中率闸门逐个验证，这里不做判断。
     """
     out = []
@@ -1652,8 +1751,43 @@ def _family_layer_candidates(measured_bpms, target, max_slowdown, max_speedup):
         cmin = uniq[0][0]
         band = sorted((c for c in uniq if c[0] <= cmin + 0.02),
                       key=lambda t: t[2])
-        return band + [c for c in uniq if c[0] > cmin + 0.02]
+        rest = [c for c in uniq if c[0] > cmin + 0.02]
+        # 主导实测层保护：见 docstring。weights 与 measured_bpms 对齐（段时长）。
+        guard = _dominant_measured_guard(out, measured_bpms, weights, cmin)
+        if guard is not None:
+            return [guard] + [c for c in band if c is not guard] + rest
+        return band + rest
     return uniq
+
+
+def _dominant_measured_guard(cands, measured_bpms, weights, cmin, band=0.35):
+    """主导实测层保护：返回应提到最前的实测层候选，不适用时返回 None。
+
+    主导实测层 = 时长加权后占时最多的实测速度簇（±5% 合并；无 weights 时
+    不启用——平权会把「满月」少数段的 95.3 当主导而错误触发）。该层的
+    候选代价与全局最优差在 (0.02, band] 八度时才保护：≤0.02 属于代价并列
+    （已有并列带规则），> band 说明代价收益大到值得偏离实测层（满月 0.49）。
+    """
+    if weights is None or len(weights) != len(measured_bpms):
+        return None
+    pairs = sorted(zip(measured_bpms, weights))
+    clusters = []      # [ [总时长, 代表速度] ]
+    for v, w in pairs:
+        if clusters and abs(v / clusters[-1][1] - 1.0) <= 0.05:
+            clusters[-1][0] += w
+        else:
+            clusters.append([w, v])
+    dom_v = max(clusters)[1]
+    best = None
+    for c in cands:
+        if c[1] == 0 and abs(c[2] / dom_v - 1.0) <= 0.05:
+            if best is None or (c[0], c[2]) < (best[0], best[2]):
+                best = c
+    if best is None:
+        return None
+    if 0.02 < best[0] - cmin <= band:
+        return best
+    return None
 
 
 def _long_segments(merged, short_s: float):
@@ -1745,25 +1879,31 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
     spans = [(s0, s1) for s0, s1, _sp in longs]
     for _cost, _mflag, L, mc in _family_layer_candidates(
             [sp.bpm for _s0, _s1, sp in longs], target,
-            max_slowdown, max_speedup):
+            max_slowdown, max_speedup,
+            weights=[s1 - s0 for s0, s1, _sp in longs]):
         if not _layer_explains_all(onset, sr, L, spans):
             continue
         grid, _hit = _phase_grid(onset, sr, L, t0, t1)
         if grid is None or len(grid) < 4:
             continue
         P_L = 60.0 / L
+        ph_grid = t0 + float(grid[0]) % P_L   # 骨架相位（绝对轴）
         if mel is not None:
             # 底鼓带相位裁决（同 detect_tempo）：八分低音盖过底鼓时网格会
-            # 半拍反相；翻转后按新相位重铺规整网格（段相对轴）。
-            ph_new, flipped = _kick_phase_align(mel, sr, P_L,
-                                                t0 + float(grid[0]) % P_L,
-                                                t0, t1)
+            # 半拍反相；翻转后骨架相位平移半拍（段相对轴）。
+            ph_new, flipped = _kick_phase_align(mel, sr, P_L, ph_grid, t0, t1)
             if flipped:
+                ph_grid = ph_new
                 k0 = int(np.ceil((t0 - ph_new) / P_L))
                 k1 = int(np.floor((t1 - ph_new) / P_L))
                 grid = ph_new - t0 + np.arange(k0, k1 + 1) * P_L
                 if len(grid) < 4:
                     continue
+        # 贴合化：恒速网格只在平均速度上与音乐一致，速度起伏会让点击累积
+        # 漂移；用 onset 重锁 + 稳健拟合把拍位贴回音乐（拍数不变、密度不变）。
+        grid2 = _refit_grid(onset, sr, P_L, ph_grid, t0, t1)
+        if grid2 is not None and len(grid2) >= 4:
+            grid = grid2 - t0
         plan = StretchPlan(float(mc[2]), float(mc[3]), float(target),
                            float(mc[1]), 0)
         # 检测速度记成所选层的速度：报告与拍点间距严格自洽（60/L）。
@@ -1944,15 +2084,25 @@ def detect_tempo(y_mono, sr: int, lang: str | None = None, mel=None):
         P2, phase2 = _dotted_level_fix(onset_fine, sr, P, phase)
         if (P2, phase2) != (P, phase):
             P, phase = P2, phase2
-            k_end = int(np.floor((duration - phase) / P + 1e-9))
-            beat_times = phase + np.arange(0, k_end + 1) * P
+            # 改档后旧拍编号失效。优先 onset 重锁 + 拟合重建贴合网格
+            # （恒速网格不跟真实拍，速度起伏会让点击累积漂移）；失败退恒速。
+            grid2 = _refit_grid(onset_fine, sr, P, phase, 0.0, duration)
+            if grid2 is not None:
+                beat_times = grid2
+            else:
+                k_end = int(np.floor((duration - phase) / P + 1e-9))
+                beat_times = phase + np.arange(0, k_end + 1) * P
         # 底鼓带相位裁决：八分低音盖过底鼓时网格会锁到八分位（半拍反相），
-        # 按纯底鼓频段裁决并平移。翻转后拍列用新相位的规整网格重建（原检测
-        # 拍对半拍新相位是半整数，平滑拟合失效）。
+        # 按纯底鼓频段裁决并平移。翻转后原检测拍对新相位是半整数、平滑拟合
+        # 失效，同样用 onset 重锁重建贴合网格。
         phase, flipped = _kick_phase_align(mel, sr, P, phase, 0.0, duration)
         if flipped:
-            k_end = int(np.floor((duration - phase) / P + 1e-9))
-            beat_times = phase + np.arange(0, k_end + 1) * P
+            grid2 = _refit_grid(onset_fine, sr, P, phase, 0.0, duration)
+            if grid2 is not None:
+                beat_times = grid2
+            else:
+                k_end = int(np.floor((duration - phase) / P + 1e-9))
+                beat_times = phase + np.arange(0, k_end + 1) * P
     bpm = 60.0 / P
     if bpm <= 0:
         raise RuntimeError(_no_tempo_msg(lang))

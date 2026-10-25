@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.4**. Every release bumps the version
+**Versioning rules**: current version **1.2.5**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,62 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.2.5] — 2026-10-25
+
+Bug fixes only: the two root causes of metronome/music misalignment (cumulative
+drift of constant-tempo grids, and the family collapse discarding measured layers).
+
+### Fixed
+
+- **Beat-grid rebuilds now re-lock beat by beat, removing the cumulative drift
+  of constant-tempo grids.** After the phase flip (1.2.4), the dotted-level fix
+  (1.2.0) and the family collapse (1.2.2), the beat grid was rebuilt as a
+  **constant-tempo grid** (`phase + k × period`). Real songs have ±1%-level
+  tempo fluctuation (live recordings especially), and the detected layer value
+  itself carries 0.1–0.5% error — the deviation between a constant grid and the
+  music's true beats is **cumulative** (measured: a 0.4% mismatch drifts about
+  one second over 4 minutes). It sounds like "the metronome drifts more and
+  more out of sync". **New behaviour**: all three rebuild points re-lock beats
+  by tracking — the next beat takes the strongest onset frame within ±1/4 beat
+  of "last locked beat + period" (phase-locked-loop style: deviation is
+  absorbed per beat, never accumulates; off-beat positions lie outside the
+  window so eighth-note bass cannot be locked), then a robust polynomial fit
+  smooths the result. Clicks now follow the music's own beats. Beat count is
+  identical to the constant skeleton, so metronome density still equals the
+  target BPM exactly.
+- **Family collapse now protects the dominant measured layer, fixing 3/2
+  misfrequencies.** When every segment measures the same tempo (e.g. 110) but
+  a half layer (55) has a smaller stretch cost, the collapse picked a layer no
+  segment ever measured — that cost is a lie: nominally +9%, it actually
+  stretches 110→120, a 3/2 relation against the 180 metronome, misaligned for
+  the whole track. **New behaviour**: if the duration-weighted dominant
+  measured layer's cost is within (0.02, 0.35] octaves of the best candidate,
+  the measured layer wins. Regression checks: "Full Moon"'s dominant measured
+  124 vs 61.57 differs by 0.49 > 0.35, so 61.57 is still chosen (no
+  regression); "She Xiang"'s two layers tie (0.0008 < 0.02), so the lower
+  83.02 is still chosen (no regression).
+- **Measured fix cases** (the deca joins batch reported as "still misaligned"
+  on 2026-10-25): Yan Jing Li 54.97→**109.93**, Ye Jian Du Bai 54.99→**109.98**,
+  Go Slow 59.91→**110.02** (all three repaired from wrong-layer 3/2
+  misfrequency to the measured layer, 2 clicks per beat on the beat); Wo Bu
+  Yong Wen / Fa Shan Ke Chen / Somewhere now have clicks that follow the music
+  instead of slowly drifting. YYZ still 2 segments (102.8 / 140.7), She Xiang
+  83.02 one segment, Hong Chen Ke Zhan 89.94 one segment, Full Moon 61.57 one
+  segment.
+
+### Known limitations
+
+- **Songs whose segments all fall to the same wrong layer may still pick the
+  wrong layer**: if per-segment detection consistently counts every segment at
+  a half layer (measured: "Xia Ye Wan Feng" — every segment measures 55.01,
+  true tempo ≈110), the family collapse picks within that wrong family; the
+  measured-layer protection has no true value to protect. Whole-track
+  detection often gets these right (that is how Yan Jing Li was fixed), but
+  the two cases cannot be told apart automatically; setting the source BPM
+  manually is recommended.
 
 ---
 
