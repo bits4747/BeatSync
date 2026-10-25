@@ -1177,7 +1177,7 @@ SEG_HIT_MIN = 0.75           # 单层塌缩前要求的最小网格命中率（�
 COLLAPSE_FAMILY_COVER = 0.98  # 塌缩要求：一个 base 吸附 ≥98% 的长段时长才算「同一首音乐」
 KICK_FLIP_RATIO = 1.02        # 底鼓带相位裁决：反拍 onset 超过正拍 2% 即判网格半拍反相
 OUTBEATS_FIX_EVERY = 8        # 输出轴节拍器：每隔几拍用音乐校一次相位
-OUTBEATS_MAX_STEP = 0.012     # 相邻校准块之间相位修正量的上限（秒）——带宽限幅
+OUTBEATS_MAX_STEP = 0.060     # 单块相位修正量上限（秒）——比例控制 0.5×偏差的限幅
 SEG_SHAPE_MIN_S = 10.0       # 判「来回横跳」时只用不短于它的段（短段测速不可靠）
 SEG_SHAPE_FRAC = 0.06        # 同上，同时要求段长至少占全曲这个比例
 
@@ -2338,19 +2338,26 @@ def _output_beats(y2, sr: int, a2: float, duration: float,
         mel2 = np.abs(librosa.feature.melspectrogram(y=ym, sr=sr, hop_length=256,
                                                      fmax=0.5 * sr))
         phase0, _fl = _kick_phase_align(mel2, sr, P, phase0, 0.0, duration)
-    # 块质心校准：块 b 覆盖拍号 [b*E, (b+1)*E)，质心 = 拍位±0.15P 窗内
-    # onset 幅值加权位置相对拍格的平均偏移。
+    # 块质心校准：块 b 覆盖拍号 [b*E, (b+1)*E)，质心 = 拍位（含当前曲线
+    # 修正）±0.15P 窗内 onset 幅值加权位置的平均偏移。**比例控制**：每块
+    # 只修残余偏差的一半、上限 OUTBEATS_MAX_STEP——固定小限速在「间奏段
+    # 无锚（格子按恒速走、音乐按真速走，偏差在间奏里累积到 ~1/4 拍）」
+    # 之后要几十秒才爬得回来（实测乏善可陈间奏后 46-77s 偏 109→142ms）；
+    # 比例控制让恢复时间与偏差成正比（140ms 约 2-3 块 ≈15s 内拉回），
+    # 而稳态时质心噪声被 0.5 增益减半、块内线性摊开后间隔偏差 <2ms。
+    # 质心离散度过大（间奏里独奏音符冒充拍）的块整块弃用。
     E = OUTBEATS_FIX_EVERY
     half = max(1, int(round(0.15 * P * fps)))
     thr = float(np.percentile(onset[onset > 0], 90)) * 0.30 if np.any(onset > 0) else 0.0
     ks_ctl, offs_ctl = [0.0], [0.0]
     n_blk = n_beat // E
     n_valid = 0
+    cur = 0.0
     for b in range(n_blk):
         k0b = b * E
         offsets, weights = [], []
         for k in range(k0b, k0b + E):
-            c = int(round((phase0 + k * P) * fps))
+            c = int(round((phase0 + k * P + cur) * fps))
             a, bb = c - half, c + half + 1
             if a < 0 or bb > len(onset):
                 continue
@@ -2359,27 +2366,21 @@ def _output_beats(y2, sr: int, a2: float, duration: float,
             if not np.any(w > 0):
                 continue
             pos = np.arange(a, bb) / fps
-            offsets.append(float(np.sum(pos * w) / np.sum(w)) - (phase0 + k * P))
+            offsets.append(float(np.sum(pos * w) / np.sum(w)) - (phase0 + k * P + cur))
             weights.append(float(np.sum(w)))
-        if len(offsets) < max(2, E // 2):
-            continue
-        offs = float(np.average(offsets, weights=weights))
-        offs = max(-0.25 * P, min(0.25 * P, offs))   # 质心偏移不可能超过窗
+        if len(offsets) >= max(2, E // 2):
+            dev = float(np.average(offsets, weights=weights))
+            var = float(np.average((np.asarray(offsets) - dev) ** 2, weights=weights))
+            if abs(dev) <= 0.25 * P and math.sqrt(max(var, 0.0)) <= 0.08 * P:
+                cur += max(-OUTBEATS_MAX_STEP,
+                           min(OUTBEATS_MAX_STEP, 0.5 * dev))
+                n_valid += 1
         ks_ctl.append(float(k0b))
-        offs_ctl.append(offs)
-        n_valid += 1
+        offs_ctl.append(cur)
     if n_valid < max(2, int(0.4 * n_blk)):
         return None
     ks_ctl.append(float(n_beat))
     offs_ctl.append(offs_ctl[-1])
-    # 相位修正曲线：控制点间线性插值，相邻控制点差限幅（跟随带宽）
-    for i in range(2, len(offs_ctl)):
-        d = offs_ctl[i] - offs_ctl[i - 1]
-        lim = OUTBEATS_MAX_STEP
-        if d > lim:
-            offs_ctl[i] = offs_ctl[i - 1] + lim
-        elif d < -lim:
-            offs_ctl[i] = offs_ctl[i - 1] - lim
     ks_g = np.arange(n_beat, dtype=np.float64)
     curve = np.interp(ks_g, ks_ctl, offs_ctl)
     beats = phase0 + ks_g * P + curve

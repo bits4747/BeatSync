@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.7**. Every release bumps the version
+**Versioning rules**: current version **1.2.8**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,34 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.2.8] — 2026-10-25
+
+Fixes the post-interlude recovery speed of 1.2.7's phase following
+(user-reported: misaligned again after the interlude).
+
+### Fixed
+
+- **Misalignment after interludes**: an interlude has no beat transients, so
+  the constant grid keeps moving at nominal speed while the music moves at its
+  true speed — the offset accumulates inside the interlude (measured on Fa
+  Shan Ke Chen: ~1/4 beat over a 30 s interlude). 1.2.7's fixed correction
+  rate of 12 ms per block (every 8 beats) needed over 60 s to recover 140 ms,
+  so the verse right after the interlude stayed misaligned while crawling
+  back. **New behaviour**: the fixed rate becomes **proportional control** —
+  each block corrects half of the residual offset, capped at 60 ms per block,
+  so recovery time scales with the offset (140 ms recovers within ~2–3 blocks
+  ≈ 15 s). The centroid estimate also gains a dispersion filter (blocks whose
+  per-beat offsets have a weighted std > 8% of the beat period are discarded,
+  so solo notes inside an interlude cannot pose as beat anchors). In steady
+  state the centroid noise is halved by the 0.5 gain and spread linearly
+  within blocks, keeping intervals constant (std < 0.5 ms). Synthetic-drum
+  gold standard: +1.7 ms. Residual offsets inside the interlude itself (no
+  beats to align to) and across instrumentation changes (instruments naturally
+  attack at different offsets) are properties of the music; a constant-tempo
+  metronome aligns to the whole-track average beat position.
 
 ---
 
