@@ -592,10 +592,16 @@ def test_collapse_same_family_merges_layer_jitter():
 
 
 def test_collapse_keeps_monotonic_true_change():
-    """单调推进的真变拍（90|120|150）不得被塌缩——方向只有一次，不是抖动。"""
-    merged = _mk_merged(90.0, 120.0, 150.0)
+    """单调推进的真变拍（90|120|150）不得被塌缩——方向只有一次，不是抖动。
+
+    三段都在 30 的家族里（90=3×30、120=4×30、150=5×30），家族覆盖拦不住，
+    靠命中率闸门：任何倍频层都无法同时解释三段（90 层在 120 段上只有 ~1/3）。
+    """
+    levels = [(90.0, 0.0, 12.0), (120.0, 12.0, 24.0), (150.0, 24.0, 36.0)]
+    onset = _beat_spikes(levels, 36.0)
+    merged = _merged_from(levels)
     out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
-                                   tc.DEFAULT_MAX_SPEEDUP)
+                                   tc.DEFAULT_MAX_SPEEDUP, onset=onset, sr=SR)
     assert len(out) == 3, f"真变拍应保留 3 段，实际 {len(out)} 段"
 
 
