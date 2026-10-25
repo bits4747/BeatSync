@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.6**. Every release bumps the version
+**Versioning rules**: current version **1.2.7**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,32 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.2.7] — 2026-10-25
+
+Corrects the 1.2.6 output-axis metronome implementation (same direction:
+align with the time-stretched music).
+
+### Fixed
+
+- **The metronome must run at a constant target BPM — 1.2.6's
+  "track the music's transients beat by beat" went wrong** (user-reported:
+  extra clicks; rhythms turning dotted/syncopated). Beat-by-beat tracking let
+  click times follow the music's micro tempo fluctuations, making intervals
+  uneven, and beats lost by the tracker were split by gap-filling into extra
+  clicks. **New behaviour**: the beat grid has a **constant** interval of
+  60/stretched-BPM (click density exactly the target BPM; interval std
+  <0.5 ms — no dots, syncopation or extra clicks), and "alignment with the
+  music" happens only in **phase**: every 8 beats the phase is re-estimated
+  from an onset-weighted centroid around the beat positions, corrections are
+  capped at 12 ms and spread linearly between blocks. The metronome sounds
+  perfectly steady while the grid slowly tracks the music, so residual
+  layer-value error (~0.1%) no longer accumulates into drift. Verification:
+  synthetic-drum gold standard offset −3.8 ms (80th pct 4.0 ms); on three
+  real tracks the click-interval std is 0.04–0.40 ms with 0% outliers and
+  whole-track phase trend ≤46 ms (no drift).
 
 ---
 

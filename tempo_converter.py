@@ -1176,6 +1176,8 @@ SNAP_MAX = 0.43              # 吸附到家族层的最大 log2 距离（≈1.35
 SEG_HIT_MIN = 0.75           # 单层塌缩前要求的最小网格命中率（真变拍实测 0.33~0.40）
 COLLAPSE_FAMILY_COVER = 0.98  # 塌缩要求：一个 base 吸附 ≥98% 的长段时长才算「同一首音乐」
 KICK_FLIP_RATIO = 1.02        # 底鼓带相位裁决：反拍 onset 超过正拍 2% 即判网格半拍反相
+OUTBEATS_FIX_EVERY = 8        # 输出轴节拍器：每隔几拍用音乐校一次相位
+OUTBEATS_MAX_STEP = 0.012     # 相邻校准块之间相位修正量的上限（秒）——带宽限幅
 SEG_SHAPE_MIN_S = 10.0       # 判「来回横跳」时只用不短于它的段（短段测速不可靠）
 SEG_SHAPE_FRAC = 0.06        # 同上，同时要求段长至少占全曲这个比例
 
@@ -2296,21 +2298,33 @@ def click_schedule(beat_times, rate: float, click_bpm: float, duration: float,
 
 def _output_beats(y2, sr: int, a2: float, duration: float,
                   clicks_per_beat: float | None = None):
-    """在**变速后的音频**上直接找拍，返回输出轴拍时刻列表（供 click_schedule
-    以 rate=1 铺点击）；跟踪不可靠时返回 None，调用方退回网格插值路径。
+    """**恒速**节拍器格在变速后音频上的相位对齐（用户 2026-10-25 口径：
+    节拍器必须是目标 BPM、间隔恒定，只是用变好速的音乐对齐）。
 
-    为什么（用户 2026-10-25 口径：按变好速度后的音乐加节拍器）：理论链
-    「输入轴检测网格 ÷ 拉伸比」的每一步误差（层值精度、网格拟合、相位
-    声码器映射）都会累积进点击时刻；在最终听到的这份音频上逐拍跟踪
-    （周期锚定 60/a2 方案值，±1/4 拍窗内取最强 onset 帧），点击必然踩在
-    音乐自己的瞬态上。偶数 cpb 的点击集对半拍平移不变；奇数/分数 cpb
-    需要底鼓带裁决半拍相位（八分低音会把粗锚拽到八分位）。
+    返回输出轴拍时刻列表（供 click_schedule 以 rate=1 铺点击）；对齐不可
+    靠时返回 None，调用方退回网格插值路径。
+
+    做法（恒速格 + 慢速相位跟随）：
+      1. 拍格恒定间隔 P=60/a2（点击密度精确等于目标 BPM，间隔恒定，
+         绝不出现附点/切分/多敲）；
+      2. 粗相位由梳状最优给出（奇数/分数 cpb 先过底鼓带半拍裁决）；
+      3. 每隔 OUTBEATS_FIX_EVERY 拍，用该块拍位 ±0.15P 窗内的 onset
+         加权质心校一次相位，修正量限幅 OUTBEATS_MAX_STEP、并在块间
+         线性摊开——节拍器微观上仍是恒速（间隔偏差 <2ms），但格子的
+         相位缓慢贴住音乐，层值残余误差（~0.1%）不会累积成漂移。
+    （此前试过「逐拍跟踪音乐瞬态」的版本——节拍器跟着音乐的微观速度
+    波动走，间隔不均、丢拍处补漏拆分会多敲，听感成附点/切分，已废弃。）
     """
     import librosa
     ym = np.asarray(y2, dtype=np.float32)
     if ym.ndim > 1:
         ym = ym.mean(axis=0)
-    onset = librosa.onset.onset_strength(y=ym, sr=sr, hop_length=256)
+    onset = np.asarray(librosa.onset.onset_strength(y=ym, sr=sr, hop_length=256),
+                       dtype=np.float64)
+    fps = sr / 256
+    n_beat = int(np.floor(duration / (60.0 / a2))) + 2
+    if n_beat < 8:
+        return None
     P = 60.0 / a2
     grid0, _hit = _phase_grid(onset, sr, a2, 0.0, duration)
     if grid0 is None or len(grid0) < 4:
@@ -2324,21 +2338,55 @@ def _output_beats(y2, sr: int, a2: float, duration: float,
         mel2 = np.abs(librosa.feature.melspectrogram(y=ym, sr=sr, hop_length=256,
                                                      fmax=0.5 * sr))
         phase0, _fl = _kick_phase_align(mel2, sr, P, phase0, 0.0, duration)
-    ks, ts = _relock_beats(onset, sr, P, phase0, 0.0, duration)
-    if len(ks) < 8 or len(ks) < 0.4 * len(grid0):
+    # 块质心校准：块 b 覆盖拍号 [b*E, (b+1)*E)，质心 = 拍位±0.15P 窗内
+    # onset 幅值加权位置相对拍格的平均偏移。
+    E = OUTBEATS_FIX_EVERY
+    half = max(1, int(round(0.15 * P * fps)))
+    thr = float(np.percentile(onset[onset > 0], 90)) * 0.30 if np.any(onset > 0) else 0.0
+    ks_ctl, offs_ctl = [0.0], [0.0]
+    n_blk = n_beat // E
+    n_valid = 0
+    for b in range(n_blk):
+        k0b = b * E
+        offsets, weights = [], []
+        for k in range(k0b, k0b + E):
+            c = int(round((phase0 + k * P) * fps))
+            a, bb = c - half, c + half + 1
+            if a < 0 or bb > len(onset):
+                continue
+            w = onset[a:bb].copy()
+            w[w < thr] = 0.0
+            if not np.any(w > 0):
+                continue
+            pos = np.arange(a, bb) / fps
+            offsets.append(float(np.sum(pos * w) / np.sum(w)) - (phase0 + k * P))
+            weights.append(float(np.sum(w)))
+        if len(offsets) < max(2, E // 2):
+            continue
+        offs = float(np.average(offsets, weights=weights))
+        offs = max(-0.25 * P, min(0.25 * P, offs))   # 质心偏移不可能超过窗
+        ks_ctl.append(float(k0b))
+        offs_ctl.append(offs)
+        n_valid += 1
+    if n_valid < max(2, int(0.4 * n_blk)):
         return None
-    # 首尾按局部拍距外推补齐到 [0, duration]，保证点击密度与旧路径同口径
-    ts = list(ts)
-    if len(ts) > 2:
-        d_head = ts[1] - ts[0]
-        d_tail = ts[-1] - ts[-2]
-    else:
-        d_head = d_tail = P
-    while ts[0] - d_head >= -1e-9:
-        ts.insert(0, ts[0] - d_head)
-    while ts[-1] + d_tail < duration:
-        ts.append(ts[-1] + d_tail)
-    return np.asarray(ts, dtype=np.float64)
+    ks_ctl.append(float(n_beat))
+    offs_ctl.append(offs_ctl[-1])
+    # 相位修正曲线：控制点间线性插值，相邻控制点差限幅（跟随带宽）
+    for i in range(2, len(offs_ctl)):
+        d = offs_ctl[i] - offs_ctl[i - 1]
+        lim = OUTBEATS_MAX_STEP
+        if d > lim:
+            offs_ctl[i] = offs_ctl[i - 1] + lim
+        elif d < -lim:
+            offs_ctl[i] = offs_ctl[i - 1] - lim
+    ks_g = np.arange(n_beat, dtype=np.float64)
+    curve = np.interp(ks_g, ks_ctl, offs_ctl)
+    beats = phase0 + ks_g * P + curve
+    beats = beats[(beats >= 0.0) & (beats < duration)]
+    if len(beats) < 8:
+        return None
+    return beats
 
 
 def build_click_track(n_samples: int, sr: int, click_times, timbre: str, rng,
