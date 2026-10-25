@@ -648,6 +648,71 @@ def test_collapse_keeps_two_step_longs_with_short_middle():
     assert len(out) == 3, f"两个台阶应保留 3 段，实际 {len(out)} 段"
 
 
+def _beat_spikes(levels, dur_total: float, sr: int = SR) -> np.ndarray:
+    """合成 onset 包络（hop=256）：各区间按指定 bpm 铺 6 帧平台脉冲。
+
+    levels = [(bpm, t0, t1)]，用于直接驱动 _collapse_same_family 的
+    命中率闸门（真值节拍在哪里，哪一层的网格命中率就高）。
+    """
+    fps = sr / 256
+    env = np.zeros(int(dur_total * fps) + 8)
+    for bpm, t0, t1 in levels:
+        t = t0
+        while t < t1 - 0.01:
+            i = int(round(t * fps))
+            env[i:i + 6] = 1.0
+            t += 60.0 / bpm
+    return env
+
+
+def _merged_from(levels, target_bpm=180.0):
+    """按 [(bpm, t0, t1)] 构造 _collapse_same_family 的输入段列表。"""
+    merged = []
+    for bpm, t0, t1 in levels:
+        dur = t1 - t0
+        beats = np.arange(0.0, dur, 60.0 / bpm) + t0
+        plan = tc.choose_stretched_tempo(bpm, target_bpm, False,
+                                         tc.DEFAULT_MAX_SLOWDOWN,
+                                         tc.DEFAULT_MAX_SPEEDUP)
+        merged.append((t0, t1, tc.SegmentPlan(t0, t1, float(bpm), beats, plan)))
+    return merged
+
+
+def test_collapse_picks_unmeasured_low_layer_for_constant_song():
+    """「满月」形态：全曲真值 62（从未被任何段测出），两长段实测 95.3|124.0。
+
+    用户口径：整数倍/分数没关系（cpb 能补），音乐不能乱变速。塌缩应选家族
+    格点里变速代价最小的 62 层（=124 的一半、从未实测），全曲统一 −3.2%、
+    每拍敲 3 下；而不是两段各用各的层（95.3→−5.5%、124→+46.6%）让恒速曲
+    中途跳速度。
+    """
+    onset = _beat_spikes([(62.0, 0.0, 262.0)], 262.0)
+    merged = _merged_from([(95.3, 0.0, 16.2), (124.0, 16.2, 60.0),
+                           (124.0, 60.0, 262.0)])
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP, onset=onset, sr=SR)
+    assert len(out) == 1, f"应塌缩成 1 段，实际 {len(out)} 段"
+    _t0, _t1, sp = out[0]
+    assert abs(sp.bpm - 62.0) < 0.5, f"应选未实测的低代价层 62，实际 {sp.bpm:.2f}"
+    assert abs(sp.plan.a2 - 60.0) < 1e-9 and abs(sp.plan.rate - 60.0 / 62.0) < 1e-9
+
+
+def test_collapse_keeps_real_two_tempo_same_family():
+    """真变拍 90|120|90（同属 30 的家族）必须保留分段。
+
+    家族判定分不清「整数比真变拍」与「层抖动」，能分的是命中率：90 层在
+    120 段上只有 ~1/3、120 层在 90 段上也一样——逐长段闸门把家族格点里
+    所有层都拒掉，回到保留分段。
+    """
+    onset = _beat_spikes([(90.0, 0.0, 40.0), (120.0, 40.0, 80.0),
+                          (90.0, 80.0, 120.0)], 120.0)
+    merged = _merged_from([(90.0, 0.0, 40.0), (120.0, 40.0, 80.0),
+                           (90.0, 80.0, 120.0)])
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP, onset=onset, sr=SR)
+    assert len(out) == 3, f"真变拍应保留 3 段，实际 {len(out)} 段"
+
+
 def test_collapse_keeps_non_integer_ratio_sections():
     """非整数比的两段（YYZ 式 102.8|140.4）不得塌缩。
 

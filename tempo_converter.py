@@ -1613,6 +1613,54 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
     return merged, None
 
 
+def _family_layer_candidates(measured_bpms, target, max_slowdown, max_speedup):
+    """家族层候选：长段实测速度的**倍频**层（×2/÷2），按用户口径排序。
+
+    只走倍频格、不走 ×3/÷3 这类整数倍：倍频层与真拍格保持整数关系（点集
+    互为子集），每拍点击数能把它们补回来；÷3 层与真拍成 3/2 这类分数关系，
+    点击必然错频——正是家族机制要排除的东西（实测「奢香夫人」真值 83，从
+    166.23 ÷3 出来的 55.41 层就会让节拍器一半点击落在拍间）。
+
+    排序 = （变速代价小 → 代价并列 ±0.02 八度取层值低）。
+      * **代价优先**：整数倍/分数无所谓（cpb 能补回来），音乐不能乱变速——
+        「满月」（真值 61）全曲测在 123.98=2×真值，它的整数分之一 61.99 从没被
+        任何段测出来过，但代价 0.047 远小于实测层（95.3→0.082、123.98→0.538），
+        按代价选层才能让音乐几乎不动。实测值都是真值的 2 倍时，低层就是真值层。
+      * **代价并列取低层**：倍频层之间 rate 恒相同（85 与 170 的方案代价一模
+        一样），且测量噪声会让"恒相同"变成差千分之一——并列必须给容差，容差
+        内取低层（v1.1.0 定则：低层最接近音乐真实拍速），「每拍敲 N 下」的
+        文案才与真实拍数一致。
+    候选是否真能解释音乐，由调用方的命中率闸门逐个验证，这里不做判断。
+    """
+    out = []
+    for v in measured_bpms:
+        for k in range(0, 4):
+            for L in (v * (2 ** k), v / (2 ** k)):
+                if not (DOTTED_BPM_LO <= L <= DOTTED_BPM_HI):
+                    continue
+                mc = _min_cost_layer(L, target, max_slowdown, max_speedup)
+                if mc is None:
+                    continue
+                out.append((mc[0][0], 0 if k == 0 else 1, L, mc))
+    out.sort(key=lambda t: (t[0], t[1], t[2]))
+    seen, uniq = set(), []
+    for c in out:
+        k = round(c[2], 3)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(c)
+    # 代价并列（相差 ≤0.02 个八度 ≈ 1.4% 拉伸差）时取**最低层**——家族内低层
+    # 最接近音乐真实拍速（v1.1.0 定则）。浮点代价并列必须给容差：「奢香夫人」
+    # 实测 83.02 与 166.23 并存，两个层的 rate 只差千分之一（166.23≠2×83.02 的
+    # 测量噪声），按裸代价排会把 83 的歌报成 166。
+    if uniq:
+        cmin = uniq[0][0]
+        band = sorted((c for c in uniq if c[0] <= cmin + 0.02),
+                      key=lambda t: t[2])
+        return band + [c for c in uniq if c[0] > cmin + 0.02]
+    return uniq
+
+
 def _collapse_same_family(merged, target: float, max_slowdown: float,
                           max_speedup: float, onset=None, sr: int = 0):
     """各段速度若同属一个整数家族，就合成一段，并按变速代价最小选层。
@@ -1654,6 +1702,58 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
     long_bpms = [sp.bpm for t0, t1, sp in merged if (t1 - t0) >= short_s]
     if len(long_bpms) < 2:
         return merged                      # 长段不足 2 个，没有可信速度可对照，不动
+    t0 = merged[0][0]
+    t1 = merged[-1][1]
+
+    # 生产路径（有 onset 包络）：家族成立性只看**长段**（短段测速不可信，
+    # 「我不用问」的 126.2、「满月」前奏的 141.95 都来自几秒的段）；层在
+    # 「长段实测速度的整数倍/整数分之一」全格点上按 _family_layer_candidates
+    # 的口径（代价小 → 实测优先 → 层低）逐个过命中率闸门，第一个能解释整段
+    # 音乐的层获胜。这取代了旧的形状判断（来回横跳/平台阶）：真变拍 90|120
+    # 同属 30 的家族，但 90 层的网格在 120 段上只有 ~1/3 命中，会被闸门拦下、
+    # 保留分段；层抖动与「满月」式的全曲翻倍则能找到代价小且命中率高的层
+    # （实测值的整数分之一），塌缩成一段、全曲统一拉伸比——恒速曲不再出现
+    # 「前奏 −5.5%、主体 +46.6%」这种段间跳变。
+    if onset is not None and sr > 0:
+        long_spans = [(s0, s1) for s0, s1, sp in merged
+                      if (s1 - s0) >= short_s and sp.bpm > 0]
+        long_pairs = [(sp.bpm, s1 - s0) for (s0, s1), sp in
+                      zip(long_spans, [sp for _s0, _s1, sp in merged
+                                       if (_s1 - _s0) >= short_s and sp.bpm > 0])]
+        # 家族门槛 **min_frac=0.98**：必须有一个 base 覆盖几乎全部长段时长。
+        # 「满月」的垃圾前奏（95.27）吸附进 123.96 的家族、覆盖率 1.0 → 尝试；
+        # 「YYZ」最好的 base（140.65）只覆盖 86%（102.8 前奏游离在外，与其相差
+        # 1.366 倍超出 SNAP_MAX）→ 直接保留分段。旧的 0.80 会放行 YYZ——密集
+        # 织体下 102.8 网格对主体段命中率高达 0.988，命中率闸门拦不住它。
+        base, _l, _c, _a, _r = _common_family(long_pairs, target,
+                                              max_slowdown, max_speedup,
+                                              min_frac=0.98)
+        if base is None:
+            return merged                  # 没有一个 base 能覆盖长段 → 真变拍，保留
+        for _cost, _mflag, L, mc in _family_layer_candidates(
+                [v for v, _w in long_pairs], target, max_slowdown, max_speedup):
+            # 命中率闸门**逐长段**验证：全曲平均会被长段稀释（90|120 的 60 层
+            # 全曲均值能到 0.75，但 90 段自身只有 0.5——该层对那一段根本不成立，
+            # 塌缩过去节拍器就和那段音乐错频）。真变拍各段至少一段过不了，
+            # 层抖动/全曲翻倍则每段都能过。
+            ok = True
+            for s0, s1 in long_spans:
+                _g, hit_s = _phase_grid(onset, sr, L, s0, s1)
+                if _g is None or hit_s < SEG_HIT_MIN:
+                    ok = False
+                    break
+            if not ok:
+                continue
+            # 拍网格必须按选定的层重建（间距恒为 60/L）：bpm 与拍距不一致时
+            # click_schedule 会按错的拍距敲（v1.1.1 实测点击密度 261/min）。
+            grid, hit = _phase_grid(onset, sr, L, t0, t1)
+            if grid is None or len(grid) < 4 or hit < SEG_HIT_MIN:
+                continue
+            plan = StretchPlan(float(mc[2]), float(mc[3]), float(target), float(mc[1]), 0)
+            return [(t0, t1, SegmentPlan(t0, t1, float(L), grid, plan))]
+        return merged                      # 家族里没有任何层能解释 → 保留分段
+
+    # —— 无包络路径（单元测试直调）：沿用形状判断 + 家族内最低实测层 ——
     # 还要把「差一点点」的相邻段先归并成一个台阶，再看方向：主体段落内部
     # 140.61 / 140.34 / 140.86 这种千分之几的抖动，方向算出来也会升降交替，
     # 但那是同一个速度的测速噪声，不是一个台阶。只有相差超过 10% 才算换了台阶。
@@ -1662,54 +1762,29 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
         if abs(math.log2(v / steps[-1])) < math.log2(1.10):
             continue                       # 同一个台阶，忽略
         steps.append(v)
-    # 「来回横跳」之外的第二种层抖动：**长段全部在同一台阶**。长段（≥short_s）
-    # 的测速可靠，它们彼此一致就说明歌里没有真变拍；此时夹在中间的短段给出
-    # 的离谱值（实测「我不用问」中段 9.7 秒被数成 95×4/3=126.2 并被拉伸
-    # +42.6%）只能是短段测速不可靠，交给下面的家族 + 命中率闸门去收拾——
-    # 命中率闸会验证长段的速度网格真能解释短段，解释不了仍会拒绝合并。
-    # （原来的门槛要求长段 ≥3 且方向有升有降，恰好把「两长一短、长段平」
-    # 这种最常见的形态漏掉了。）
+    # 长段全部同一台阶（「平」）同样按层抖动塌缩——长段彼此一致说明没有真变拍，
+    # 夹在中间的短段给出离谱值只能是测速不可靠。
     if len(steps) > 1:
         if len(steps) < 3:
             return merged                  # 去掉抖动后只剩两个台阶 → 保留
-        # 段数门槛 3：少于 3 段根本谈不上「来回」，一律不动（两段变速必须保留）。
         ups = sum(1 for i in range(1, len(steps)) if steps[i] > steps[i - 1])
         downs = len(steps) - 1 - ups
         if not (ups >= 1 and downs >= 1):
             return merged                  # 单调 → 真变拍，保留分段
         pairs = [(sp.bpm, max(1e-6, t1 - t0)) for t0, t1, sp in merged]
     else:
-        # 平台阶：家族与层**只取长段**。短段的测速值不可信（「我不用问」的
-        # 126.2、「满月」前奏的 141.95 都来自几秒的段），让它们参与选层会把
-        # 层拖到垃圾值上；它们是否真的能按长段的层走，由下面的命中率闸门
-        # 在整段范围上验证。
         pairs = [(sp.bpm, max(1e-6, t1 - t0)) for t0, t1, sp in merged
                  if (t1 - t0) >= short_s]
     base, layer, cpb, a2, rate = _common_family(
         pairs, target, max_slowdown, max_speedup)
     if base is None:
         return merged                      # 不是同一家族 → 保留原分段
-    t0 = merged[0][0]
-    t1 = merged[-1][1]
-    # 拍网格必须**按选定的层重建**，不能把各段自己的拍点拼起来：
-    # 各段的拍点间距对应的是它们各自的实测速度（例如 134.9 BPM），而这里把
-    # bpm 记成家族层（93.0）。两者不一致时 click_schedule 会按错的拍距敲，
-    # 实测点击密度 261/min（目标 180），听感就是「节拍器变机关枪」。
-    # 重建后再用命中率确认这一层真的能解释这段音乐——层选错（把 134.9 的歌
-    # 当成 93）时规整网格只能命中一部分起音，会被下面这道闸门拒掉。
-    if onset is not None and sr > 0:
-        grid, hit = _phase_grid(onset, sr, layer, t0, t1)
-        if grid is None or len(grid) < 4:
-            return merged
-        if hit < SEG_HIT_MIN:
-            return merged                  # 这一层解释不了这段音乐 → 不是层抖动
-    else:
-        # 没有音频包络时（单元测试直接调本函数）用规整网格兜底：间距恒为
-        # 60/layer，与 bpm 自洽即可，命中率无从判也就不判。
-        T = 60.0 / layer
-        grid = np.arange(0.0, t1 - t0, T)
-        if len(grid) < 4:
-            return merged
+    # 没有音频包络时（单元测试直接调本函数）用规整网格兜底：间距恒为
+    # 60/layer，与 bpm 自洽即可，命中率无从判也就不判。
+    T = 60.0 / layer
+    grid = np.arange(0.0, t1 - t0, T)
+    if len(grid) < 4:
+        return merged
     plan = StretchPlan(float(a2), float(rate), float(target), float(cpb), 0)
     # 该段的「检测速度」记成所选家族层的速度：报告里写的是真正采用的层，
     # 且与 beats 的间距严格自洽（60/layer）。
