@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.3**. Every release bumps the version
+**Versioning rules**: current version **1.2.4**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,31 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.2.4] — 2026-10-25
+
+Bug fixes only.
+
+### Fixed
+
+- **The beat grid sat half a beat off when eighth-note bass drowned the kick**:
+  when a track's eighth notes are played by a bass guitar (low-frequency, same
+  band as the kick) at a level close to the beats, the full-band onset flux of
+  the comb fit locks the grid onto the eighth positions — tempo, stretch ratio
+  and reported numbers are all correct, but the metronome is **phase-inverted
+  by half a beat** and sounds misaligned throughout. Measured on 「乏善可陳」
+  (true 96): the kick band (<120 Hz) carries 5.1% more energy on the anti-phase
+  than on the detected grid. **New behaviour**: after refinement a "kick-band
+  phase verdict" runs — the onset strength of the pure kick band (<120 Hz) is
+  measured at the grid phase and at the anti-phase (±half a beat); if the
+  anti-phase exceeds the grid phase by 2%, the grid shifts by half a beat.
+  Calibrated on six known-tempo tracks: the two needing the flip (乏善可陳
+  1.051, 失败的晚餐 1.365 — detected as 90 = half of 180, so the anti-phase is
+  the true beat) and the four correct ones (0.689–0.935) are cleanly
+  separated; after the flip 乏善可陳's kick ratio turns 0.952 (grid phase
+  dominant).
 
 ---
 

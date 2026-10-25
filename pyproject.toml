@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beatsync"
-version = "1.2.3"
+version = "1.2.4"
 description = "鎶婇煶涔愬彉閫熷埌鐩爣 BPM锛屽苟鍙犲姞绮剧‘瀵归綈鐨勮妭鎷嶅櫒"
 readme = "README.md"
 requires-python = ">=3.11"
