@@ -1085,6 +1085,7 @@ INT_RATIO_TOL = 0.04         # 判「互为整数比」的相对容差（4%）
 SNAP_MAX = 0.43              # 吸附到家族层的最大 log2 距离（≈1.35 倍）
 SEG_HIT_MIN = 0.75           # 单层塌缩前要求的最小网格命中率（真变拍实测 0.33~0.40）
 COLLAPSE_FAMILY_COVER = 0.98  # 塌缩要求：一个 base 吸附 ≥98% 的长段时长才算「同一首音乐」
+KICK_FLIP_RATIO = 1.02        # 底鼓带相位裁决：反拍 onset 超过正拍 2% 即判网格半拍反相
 SEG_SHAPE_MIN_S = 10.0       # 判「来回横跳」时只用不短于它的段（短段测速不可靠）
 SEG_SHAPE_FRAC = 0.06        # 同上，同时要求段长至少占全曲这个比例
 
@@ -1442,7 +1443,7 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
                       SegmentPlan(s["t0"], s["t1"], s["bpm"], s["beats"], s["plan"]))
                      for s in infos]
             fast = _collapse_same_family(guess, target, max_slowdown, max_speedup,
-                                         onset=onset, sr=sr)
+                                         onset=onset, sr=sr, mel=mel)
             if len(fast) < len(guess):
                 return fast, None
         bad_plan = [i for i, s in enumerate(infos) if s["plan"] is None]
@@ -1681,7 +1682,8 @@ def _layer_explains_all(onset, sr: int, L: float, spans):
 
 
 def _collapse_same_family(merged, target: float, max_slowdown: float,
-                          max_speedup: float, onset=None, sr: int = 0):
+                          max_speedup: float, onset=None, sr: int = 0,
+                          mel=None):
     """各段速度同属一个家族（互为整数倍/整数分之一）时，塌缩成一段、全曲
     统一拉伸比，并按变速代价最小选层。
 
@@ -1749,6 +1751,19 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
         grid, _hit = _phase_grid(onset, sr, L, t0, t1)
         if grid is None or len(grid) < 4:
             continue
+        P_L = 60.0 / L
+        if mel is not None:
+            # 底鼓带相位裁决（同 detect_tempo）：八分低音盖过底鼓时网格会
+            # 半拍反相；翻转后按新相位重铺规整网格（段相对轴）。
+            ph_new, flipped = _kick_phase_align(mel, sr, P_L,
+                                                t0 + float(grid[0]) % P_L,
+                                                t0, t1)
+            if flipped:
+                k0 = int(np.ceil((t0 - ph_new) / P_L))
+                k1 = int(np.floor((t1 - ph_new) / P_L))
+                grid = ph_new - t0 + np.arange(k0, k1 + 1) * P_L
+                if len(grid) < 4:
+                    continue
         plan = StretchPlan(float(mc[2]), float(mc[3]), float(target),
                            float(mc[1]), 0)
         # 检测速度记成所选层的速度：报告与拍点间距严格自洽（60/L）。
@@ -1830,6 +1845,49 @@ def _stitch_segments(y, sr, plans, engine):
     return out, origins, head_trim, scores
 
 
+def _kick_phase_align(mel, sr: int, P: float, phase: float, t0: float, t1: float):
+    """底鼓带（<120Hz）相位裁决：网格若锁在低音八分位上，平移半拍回到真拍。
+
+    为什么需要：全带 onset 通量会被**低音吉他的八分音符**盖过底鼓——「乏善可陈」
+    的八分低音让梳状拟合把网格锁在八分位上（正拍位只剩 7.5% 的弱势），节拍器
+    整体半拍反相、听感全程错拍。纯底鼓频段（<120Hz，吉他够不着）在真拍位上
+    能量必然更高，用它裁决：反拍位（phase+P/2）的底鼓 onset 超过当前相位
+    KICK_FLIP_RATIO 倍时，把相位平移半拍。
+
+    phase 为**绝对时间**轴（整曲从 0 起）；验证窗口 [t0, t1]（整曲路径传
+    0/duration，塌缩路径传段的绝对起止）。
+
+    返回 (相位, 是否翻转)。翻转后调用方须用规整网格重建拍列（原检测拍在旧
+    相位上，对半拍新相位是半整数，多项式拟合会失效）。
+    """
+    import librosa
+    freqs = librosa.mel_frequencies(n_mels=mel.shape[0], fmin=0, fmax=0.5 * sr)
+    sub = mel[freqs <= 120]
+    if sub.shape[0] == 0:
+        return phase, False
+    e = np.asarray(librosa.onset.onset_strength(S=librosa.power_to_db(sub),
+                                                sr=sr, hop_length=256),
+                   dtype=np.float64)
+    mx = _dilate_max(e, 2)
+    fps = sr / 256
+
+    def mean_at(off):
+        k0 = int(np.ceil((t0 - off) / P))
+        k1 = int(np.floor((t1 - off) / P))
+        if k1 <= k0:
+            return 0.0
+        f = np.round((off + np.arange(k0, k1 + 1) * P) * fps).astype(int)
+        f = f[(f >= 0) & (f < len(mx))]
+        if len(f) < 4:
+            return 0.0
+        return float(np.mean(mx[f]))
+
+    a, b = mean_at(phase), mean_at((phase + P / 2) % P)
+    if a > 0 and b > a * KICK_FLIP_RATIO:
+        return phase + P / 2, True
+    return phase, False
+
+
 def _no_tempo_msg(lang: str | None = None) -> str:
     """检测失败的提示：随界面语言出中/英（英文界面不应漏中文）。"""
     return tr("无法检测速度（音频太短或太安静？），请用 --bpm 手动指定",
@@ -1886,6 +1944,13 @@ def detect_tempo(y_mono, sr: int, lang: str | None = None, mel=None):
         P2, phase2 = _dotted_level_fix(onset_fine, sr, P, phase)
         if (P2, phase2) != (P, phase):
             P, phase = P2, phase2
+            k_end = int(np.floor((duration - phase) / P + 1e-9))
+            beat_times = phase + np.arange(0, k_end + 1) * P
+        # 底鼓带相位裁决：八分低音盖过底鼓时网格会锁到八分位（半拍反相），
+        # 按纯底鼓频段裁决并平移。翻转后拍列用新相位的规整网格重建（原检测
+        # 拍对半拍新相位是半整数，平滑拟合失效）。
+        phase, flipped = _kick_phase_align(mel, sr, P, phase, 0.0, duration)
+        if flipped:
             k_end = int(np.floor((duration - phase) / P + 1e-9))
             beat_times = phase + np.arange(0, k_end + 1) * P
     bpm = 60.0 / P
