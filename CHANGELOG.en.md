@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.5**. Every release bumps the version
+**Versioning rules**: current version **1.2.6**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,37 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.2.6] — 2026-10-25
+
+Bug fixes only: the collapse gate's hit-rate check saturates on dense textures,
+letting unmeasured sparse layers through while vetoing the true layer.
+
+### Fixed
+
+- **Second "track-lock" criterion added to the collapse gate.** The constant-grid
+  hit rate (fraction of grid points landing on onsets) saturates on dense
+  textures — a sparse grid hits something at almost any tempo, while the true
+  layer can be vetoed by short segments whose layer was misdetected. Measured
+  on "Xia Ye Wan Feng" (a real two-tempo song, intro 152 / body 110): initial
+  segmentation misdetected several short segments as a 95–146 scatter; the true
+  110 layer was vetoed by a 141 segment's hit rate while sparse 55 — never
+  measured by any segment — passed, collapsing the whole track onto a wrong
+  layer with 1.5 clicks per beat. **New behaviour**: besides hit rate, the gate
+  measures a "lock ratio" per long segment by beat tracking (next beat = the
+  strongest onset frame within ±1/4 beat of "last locked beat + period") — the
+  prediction window cannot hold another tempo's beat series, so **real
+  tempo-change segments necessarily lose track**, while constant-speed segments
+  whose layer was misdetected still lock onto the true grid. Measured result:
+  Xia Ye Wan Feng now converts as two segments (intro 153 | body 109.7, each
+  aligned; the intro's onset-autocorrelation peak is 152.0 — it really is a
+  two-tempo song). Regression checks: the 90|120|90 real-tempo-change trap,
+  Full Moon 61.57, She Xiang 83.02, YYZ two segments, and the 1.2.5 fixes
+  (Yan Jing Li / Ye Jian Du Bai / Go Slow) all unchanged.
+- Refactor: dominant measured-cluster detection extracted from
+  `_dominant_measured_guard` into `_dominant_cluster` for reuse.
 
 ---
 

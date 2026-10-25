@@ -1760,14 +1760,8 @@ def _family_layer_candidates(measured_bpms, target, max_slowdown, max_speedup,
     return uniq
 
 
-def _dominant_measured_guard(cands, measured_bpms, weights, cmin, band=0.35):
-    """主导实测层保护：返回应提到最前的实测层候选，不适用时返回 None。
-
-    主导实测层 = 时长加权后占时最多的实测速度簇（±5% 合并；无 weights 时
-    不启用——平权会把「满月」少数段的 95.3 当主导而错误触发）。该层的
-    候选代价与全局最优差在 (0.02, band] 八度时才保护：≤0.02 属于代价并列
-    （已有并列带规则），> band 说明代价收益大到值得偏离实测层（满月 0.49）。
-    """
+def _dominant_cluster(measured_bpms, weights):
+    """时长加权占时最多的实测速度簇的代表速度（±5% 合并）。无权重返回 None。"""
     if weights is None or len(weights) != len(measured_bpms):
         return None
     pairs = sorted(zip(measured_bpms, weights))
@@ -1777,7 +1771,22 @@ def _dominant_measured_guard(cands, measured_bpms, weights, cmin, band=0.35):
             clusters[-1][0] += w
         else:
             clusters.append([w, v])
-    dom_v = max(clusters)[1]
+    if not clusters:
+        return None
+    return max(clusters)[1]
+
+
+def _dominant_measured_guard(cands, measured_bpms, weights, cmin, band=0.35):
+    """主导实测层保护：返回应提到最前的实测层候选，不适用时返回 None。
+
+    主导实测层 = 时长加权后占时最多的实测速度簇（±5% 合并；无 weights 时
+    不启用——平权会把「满月」少数段的 95.3 当主导而错误触发）。该层的
+    候选代价与全局最优差在 (0.02, band] 八度时才保护：≤0.02 属于代价并列
+    （已有并列带规则），> band 说明代价收益大到值得偏离实测层（满月 0.49）。
+    """
+    dom_v = _dominant_cluster(measured_bpms, weights)
+    if dom_v is None:
+        return None
     best = None
     for c in cands:
         if c[1] == 0 and abs(c[2] / dom_v - 1.0) <= 0.05:
@@ -1807,10 +1816,22 @@ def _layer_explains_all(onset, sr: int, L: float, spans):
     逐段而不是全曲平均：90|120 的 60 层全曲均值能凑到 0.75，但 90 段自身
     只有 0.5——塌缩过去节拍器就和那段音乐错频。真变拍必有至少一段不达标，
     层抖动与全曲翻倍则每段都能过。
+
+    2026-10-25 补充第二道「跟踪锁定率」：恒速命中率在密集织体下会饱和
+    （稀网格对什么都能命中六七成），但**逐拍跟踪**（±1/4 拍预测窗）在
+    「段内容真是另一个速度」时必然跟丢——预测窗容不下另一速度的拍列。
+    这区分的是段**内容**与段**层测值**：段测成 141 的恒速 110 段（live
+    织体让短段测错层）锁得住 110 网格，真变拍段锁不住——前者该放行、
+    后者该拦（「夏夜晚风」的乱层短段属前者）。
     """
+    P = 60.0 / L
     for s0, s1 in spans:
         grid, hit = _phase_grid(onset, sr, L, s0, s1)
         if grid is None or hit < SEG_HIT_MIN:
+            return False
+        ks, _ts = _relock_beats(onset, sr, P, s0 + float(grid[0]), s0, s1)
+        n_skel = max(1, int(round((s1 - s0) / P)) + 1)
+        if len(ks) < 0.6 * n_skel:
             return False
     return True
 
