@@ -1817,21 +1817,13 @@ def _layer_explains_all(onset, sr: int, L: float, spans):
     只有 0.5——塌缩过去节拍器就和那段音乐错频。真变拍必有至少一段不达标，
     层抖动与全曲翻倍则每段都能过。
 
-    2026-10-25 补充第二道「跟踪锁定率」：恒速命中率在密集织体下会饱和
-    （稀网格对什么都能命中六七成），但**逐拍跟踪**（±1/4 拍预测窗）在
-    「段内容真是另一个速度」时必然跟丢——预测窗容不下另一速度的拍列。
-    这区分的是段**内容**与段**层测值**：段测成 141 的恒速 110 段（live
-    织体让短段测错层）锁得住 110 网格，真变拍段锁不住——前者该放行、
-    后者该拦（「夏夜晚风」的乱层短段属前者）。
+    （2026-10-25 曾试过在此加「逐拍跟踪锁定率」第二道判据，实测会把前奏
+    自由节奏的恒速歌误判为变拍段——「夏夜晚风」（55 BPM 单速、前奏散板）
+    被误切两段，用户确认其为单速后已回滚。勿重试。）
     """
-    P = 60.0 / L
     for s0, s1 in spans:
         grid, hit = _phase_grid(onset, sr, L, s0, s1)
         if grid is None or hit < SEG_HIT_MIN:
-            return False
-        ks, _ts = _relock_beats(onset, sr, P, s0 + float(grid[0]), s0, s1)
-        n_skel = max(1, int(round((s1 - s0) / P)) + 1)
-        if len(ks) < 0.6 * n_skel:
             return False
     return True
 
