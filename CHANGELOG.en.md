@@ -43,9 +43,13 @@ off-beat in the second half — `01 - 乏善可陈_180bpm.mp3`).
   per-section hit-rate gate, otherwise the original layer is kept).
   Verification: on 乏善可陈, taking each third of the song independently and
   finding its own best phase, the offsets relative to the first third were
-  **+0.00/−85.75/−149.38 ms** before (monotonic drift) and
+  **+0.00/−86.80/−149.58 ms** before (monotonic drift) and
   **0.00/0.00/0.00 ms** after; click interval median 333.3322 ms =
-  180.0006/min. The same defect affected two other constant-tempo songs and
+  180.0006/min. On the **rendered files** themselves, a 20 s-window continuous
+  phase track over the low band (<120 Hz, away from the woodblock click) gives
+  first +2.24 → last −227.27 ms (slope −0.867 ms/s, −269 ms over the song) for
+  the old file and first +7.92 → last −2.62 ms (slope −0.050 ms/s, −16 ms) for
+  the new one. The same defect affected two other constant-tempo songs and
   is fixed along with it: 奢香夫人 47.03→2.77 ms, 红尘客栈 110.65→11.07 ms.
   Real-song sampling: YYZ still 2 sections, all three constant-tempo songs 1
   section, click density equal to the target BPM in every case.
