@@ -846,6 +846,96 @@ def test_output_beats_constant_interval_and_no_drift():
     assert abs(last - first) < 15.0, f"首末段相位差 {abs(last - first):.1f}ms，存在漂移"
 
 
+def _dense_onset_audio(bpm: float, dur: float, strong_frac: float,
+                       sr: int = 22050) -> np.ndarray:
+    """每 1/8 拍都放一个弱瞬态，其中 ``strong_frac`` 那个位置放强瞬态。
+
+    这是「真实混音上命中率饱和」的合成复现：任何相位上都有起音，命中率目标
+    函数对相位完全没有分辨力（实测真实曲 64 个相位里 64 个都在 0.98 以上），
+    只有能量目标函数才能分出强弱拍。
+    """
+    n = int(sr * dur)
+    y = np.zeros(n, dtype=np.float32)
+    rng = np.random.default_rng(11)
+    L = int(0.02 * sr)
+    weak = (0.12 * rng.standard_normal(L)).astype(np.float32)
+    strong = (0.90 * rng.standard_normal(L)).astype(np.float32)
+    P = 60.0 / bpm
+    off = strong_frac * P
+    k = 0
+    while True:
+        t = off + k * P
+        if t >= dur - 0.05:
+            break
+        for sub in range(8):
+            tt = t + sub / 8.0 * P
+            if tt >= dur - 0.05:
+                continue
+            i = int(round(tt * sr))
+            j = min(n, i + L)
+            if j > i:
+                y[i:j] += (strong if sub == 0 else weak)[:j - i]
+        k += 1
+    return y
+
+
+def test_best_output_phase_picks_energy_not_hit_rate():
+    """节拍器相位必须取**能量**最优，不能取命中率最优。
+
+    用户 2026-10-26 报「整首歌都没踩上拍」：v1.2.9 用 `_phase_grid`（目标函数
+    是命中率）选相位，而真实混音上几乎每个相位都能到 0.98+，等于在平台期里
+    按浮点顺序随便挑一个——成品点击列车整体偏 +150.7ms（≈半个点击格）。
+    合成的「每个相位都有起音」音频能稳定复现这个平台期。
+    """
+    import librosa
+
+    bpm, dur, sr = 90.0, 40.0, 22050
+    P = 60.0 / bpm
+    strong_frac = 0.35
+    y2 = _dense_onset_audio(bpm, dur, strong_frac, sr)
+    onset = np.asarray(librosa.onset.onset_strength(y=y2, sr=sr, hop_length=256),
+                       dtype=np.float64)
+
+    phase = tc._best_output_phase(onset, sr, P, dur)
+    assert phase is not None
+    # 相位应落在强瞬态上（±8ms 容差；细化后分辨率约 0.3ms）
+    d = (phase - strong_frac * P + P / 2.0) % P - P / 2.0
+    assert abs(d) < 0.008, f"相位偏离强拍 {d * 1000:+.1f}ms（应≈0）"
+
+    # 命中率判据在这段音频上一定饱和，用它选相位必然落不到强拍
+    def hit_frac(ph: float) -> float:
+        pos = onset[onset > 0]
+        thr = float(np.percentile(pos, 90)) * 0.30
+        half = max(1, int(0.045 * P * sr / 256))
+        g = ph + np.arange(int((dur - ph) / P) + 1) * P
+        g = g[g < dur]
+        idx = np.round(g * sr / 256).astype(int)
+        return float(np.mean([np.max(onset[max(0, i - half):i + half + 1]) >= thr
+                              for i in idx]))
+
+    assert hit_frac(phase) > 0.95
+    assert hit_frac(0.0) > 0.95, "命中率在错误相位上同样饱和（这正是旧实现的缺陷）"
+
+
+def test_best_output_phase_uses_click_period_for_half_beat():
+    """cpb=2 时相位要按**点击周期** P/2 择优，否则「掐拍」和「掐反拍」二义不决。"""
+    import librosa
+
+    bpm, dur, sr = 90.0, 40.0, 22050
+    P = 60.0 / bpm
+    y2 = _dense_onset_audio(bpm, dur, 0.30, sr)
+    onset = np.asarray(librosa.onset.onset_strength(y=y2, sr=sr, hop_length=256),
+                       dtype=np.float64)
+    ph1 = tc._best_output_phase(onset, sr, P, dur)
+    ph2 = tc._best_output_phase(onset, sr, P, dur, clicks_per_beat=2.0)
+    assert ph1 is not None and ph2 is not None
+    # 返回值一律归一化到 [0, P)
+    assert 0.0 <= ph2 < P
+    # 按点击周期择优时，点击列车（ph2 + k*P/2）应踩在强瞬态上
+    d = (ph2 - 0.30 * P + P / 2.0) % P - P / 2.0
+    assert abs(d) < 0.008, f"点击周期择优后偏离强拍 {d * 1000:+.1f}ms"
+
+
 # ---------------------------------------------------------------- mp3 码率
 
 def test_mp3_bitrate_default_is_auto():

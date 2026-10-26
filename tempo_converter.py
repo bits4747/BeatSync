@@ -2346,6 +2346,61 @@ def click_schedule(beat_times, rate: float, click_bpm: float, duration: float,
     return times
 
 
+def _best_output_phase(onset, sr: int, P: float, duration: float,
+                       clicks_per_beat: float | None = None,
+                       nphase: int = 144, hop: int = 256):
+    """输出节拍器格的相位：直接最大化**点击格**与 onset 包络的对齐能量。
+
+    这里不能用 `_phase_grid` 选相位。`_phase_grid` 的目标函数是**命中率**
+    （格点在阈值以上的比例），在真实混音上几乎每个相位都能到 0.98+（实测
+    乏善可陈整曲 64 个相位里最大命中率 0.9892、只差 0.02 的就有 64 个），
+    于是它等于在 0.98 的平台上随便挑一个——相位实际上由浮点顺序决定。
+    实测 v1.2.9 成品：点击列车整体比音乐起音**提前 150.7ms**（≈半格），
+    听感就是「整首歌都没踩上拍」。
+
+    改用能量目标（格点处 onset 幅值的均值）后，同一段音乐的最优相位稳定
+    落在起音上：v1.2.9 上 `_phase_grid` 给 531.25ms（能量 0.6951），能量最
+    优给 10.42ms（能量 1.1034，高出 59%），且 0/10.4/20.8ms 三个相邻点在
+    物理上就是同一个起音的抖动范围内，说明地形是单峰的、可复现的。
+
+    打分周期用**点击周期** P/cpb 而不是拍周期 P：cpb=2 时点击落在拍与反拍
+    上，若按拍周期择优，「掐在拍上」和「掐在反拍上」得分相同、二义不决；
+    按点击周期打分则两者的点击集合完全相同，天然没有二义。
+    """
+    env = np.asarray(onset, dtype=np.float64)
+    if env.size < 8 or P <= 0 or duration <= 0:
+        return None
+    fps = sr / hop
+    cpb = float(clicks_per_beat) if clicks_per_beat else 1.0
+    if cpb <= 0:
+        cpb = 1.0
+    Pc = P / cpb
+    if Pc < 0.05:
+        return None
+    omax = _dilate_max(env, 2)
+    best = (-1.0, 0.0)
+    for k in range(nphase):
+        ph = k / nphase * Pc
+        e = _grid_score(env, fps, Pc, ph, 0.0, duration, onset_max=omax)
+        if e > best[0]:
+            best = (e, ph)
+    if best[0] < 0:
+        return None
+    # 细搜：在粗搜最优点 ±1 个粗步长内再走两轮，分辨率到 Pc/2300
+    step = Pc / nphase
+    ph0 = best[1]
+    for _ in range(2):
+        cand = (-1.0, ph0)
+        for j in range(-12, 13):
+            ph = ph0 + j / 12.0 * step
+            e = _grid_score(env, fps, Pc, ph, 0.0, duration, onset_max=omax)
+            if e > cand[0]:
+                cand = (e, ph)
+        step /= 12.0
+        ph0 = cand[1]
+    return float(ph0 % P)
+
+
 def _output_beats(y2, sr: int, a2: float, duration: float,
                   clicks_per_beat: float | None = None):
     """**恒速**节拍器格在变速后音频上的相位对齐（用户 2026-10-25 口径：
@@ -2357,7 +2412,8 @@ def _output_beats(y2, sr: int, a2: float, duration: float,
     做法（恒速格 + 慢速相位跟随）：
       1. 拍格恒定间隔 P=60/a2（点击密度精确等于目标 BPM，间隔恒定，
          绝不出现附点/切分/多敲）；
-      2. 粗相位由梳状最优给出（奇数/分数 cpb 先过底鼓带半拍裁决）；
+      2. 粗相位由**点击格能量择优**给出（`_best_output_phase`；只有
+         「每拍 1 敲」才再过底鼓带半拍裁决）；
       3. 每隔 OUTBEATS_FIX_EVERY 拍，用该块拍位 ±0.15P 窗内的 onset
          加权质心校一次相位，修正量限幅 OUTBEATS_MAX_STEP、并在块间
          线性摊开——节拍器微观上仍是恒速（间隔偏差 <2ms），但格子的
@@ -2376,15 +2432,16 @@ def _output_beats(y2, sr: int, a2: float, duration: float,
     if n_beat < 8:
         return None
     P = 60.0 / a2
-    grid0, _hit = _phase_grid(onset, sr, a2, 0.0, duration)
-    if grid0 is None or len(grid0) < 4:
+    phase0 = _best_output_phase(onset, sr, P, duration,
+                                clicks_per_beat=clicks_per_beat)
+    if phase0 is None:
         return None
-    phase0 = float(grid0[0]) % P
-    frac_cpb = clicks_per_beat is not None and \
-        abs(clicks_per_beat - round(clicks_per_beat)) > 1e-9
-    odd_cpb = clicks_per_beat is not None and \
-        round(clicks_per_beat) % 2 == 1 and not frac_cpb
-    if frac_cpb or odd_cpb:
+    # 底鼓带半拍裁决只对「每拍 1 敲」有意义。cpb>=2 时点击集合恒为
+    # {phase + m*P/cpb}，真正的拍位已由上面的点击格能量择优定好；此时再
+    # 平移 P/2 等于把整串点击挪 cpb/2 个格：cpb 偶数时是整数格（等于没动），
+    # cpb 奇数/分数时是**半格**，会把每一敲都推到两个格点中间——正是
+    # 「夏夜晚风」（55→60、cpb=3）整首错半格的原因（实测 δ* = −Pc/2）。
+    if clicks_per_beat is None or abs(float(clicks_per_beat) - 1.0) < 1e-9:
         mel2 = np.abs(librosa.feature.melspectrogram(y=ym, sr=sr, hop_length=256,
                                                      fmax=0.5 * sr))
         phase0, _fl = _kick_phase_align(mel2, sr, P, phase0, 0.0, duration)

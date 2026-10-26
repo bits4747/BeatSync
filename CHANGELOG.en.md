@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.9**. Every release bumps the version
+**Versioning rules**: current version **1.2.10**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,50 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.2.10] — 2026-10-26
+
+Fixes the metronome being **offset as a whole**: after 1.2.9 removed the
+progressive drift ("increasingly off-beat in the second half"), the user
+reported the opposite symptom — "the whole song is off the beat now". It is not
+drift; the entire click train sits about half a click slot away.
+
+### Fixed
+
+- **Phase selection now maximises energy instead of hit rate**: the metronome
+  start phase used to come from `_phase_grid`, whose objective is the **hit
+  rate** (fraction of grid points above a threshold). On real mixes that metric
+  saturates — on 乏善可陈 the best of 64 candidate phases scores 0.9892, and
+  **all 64 phases** are within 0.02 of it. Every phase is "equally good", so the
+  actual choice is decided by float comparison order. A file shipped on
+  2026-10-25 was measured **+150.7 ms late** (0.452 of a click slot), which is
+  exactly what "never on the beat" sounds like. **New behaviour**: a new
+  `_best_output_phase` maximises click-slot energy directly on the onset
+  envelope (`_grid_score` + `_dilate_max`, a 144-point coarse sweep followed by
+  two refinement rounds, resolution down to 1/2300 of a slot). On the same
+  music `_phase_grid` returns 531.25 ms (energy 0.6951) while the energy
+  optimum is 10.42 ms (energy 1.1034, 59% higher).
+  Verification (reference-free: shift the real click train by δ and take the δ
+  that maximises onset energy at the clicks): 1.2.8 was −26.5 ms (with
+  thirds drifting +5.5/−31.5/−49.5), 1.2.9 was **+150.7 ms** (thirds
+  +150.7/+150.7/+147.6 — a constant offset, not drift), and this release is
+  **+2.5 ms** (thirds +2.5/+0.5/−1.5).
+- **No more half-beat kick adjudication when a beat has several clicks**:
+  `_output_beats` used to call `_kick_phase_align` only for odd or fractional
+  cpb (clicks per beat), and that function shifts the whole grid by P/2. The
+  click set is always `{φ + m·P/cpb}`, so shifting by P/2 moves it by cpb/2
+  slots: for even cpb that is a whole number of slots (no effect), while for
+  **odd cpb it is half a slot** — pushing every click into the gap between two
+  slots. That is why "夏夜晚风" (55→60 BPM, 3 clicks per beat) was a half slot
+  off for its entire length (measured δ* = −153.6 ms = −Pc/2). **New
+  behaviour**: the half-beat adjudication only runs when there is exactly one
+  click per beat; otherwise the energy-optimal phase is used as is.
+  Verification: 夏夜晚风 −153.6 ms → **+4.5 ms**; 艳红 −8.5 ms (unchanged);
+  乏善可陈 +2.5 ms (unchanged). Four real songs (including the genuinely
+  tempo-varying YYZ, scanned per section: +5.83/+6.11 ms) and the user's three
+  songs all land at |δ*| < 10 ms with a click rate of 180 ± 0.004/min.
 
 ---
 
