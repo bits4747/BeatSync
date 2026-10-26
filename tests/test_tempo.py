@@ -738,6 +738,114 @@ def test_collapse_touches_nothing_under_three_sections():
     assert len(out) == 2
 
 
+# ------------------------------------------------- 层速度精修（后半段错拍）
+
+def _sharp_spikes(levels, dur_total: float, sr: int = SR) -> np.ndarray:
+    """单帧脉冲的 onset 包络（hop=256）。
+
+    比 _beat_spikes 的 6 帧平台窄：层速度精修的判据是 0.1% 级的周期差，
+    6 帧平台会把 ±1 帧的容差糊掉、分辨不出来。
+    """
+    fps = sr / 256
+    env = np.zeros(int(dur_total * fps) + 8)
+    for bpm, t0, t1 in levels:
+        t = t0
+        while t < t1 - 0.01:
+            i = int(round(t * fps))
+            env[i] = 1.0
+            t += 60.0 / bpm
+    return env
+
+
+def test_refine_layer_speed_recovers_biased_layer():
+    """家族选层 = 一组带噪实测值的最小值，系统性偏低；必须精修回真周期。
+
+    实测「乏善可陈」真值 95.996，选中的层 95.9236（偏低 0.075%）。rate =
+    a2/L 因此把音乐送到 90.068，而节拍器周期恒为 60/a2 = 666.667ms，两者
+    每拍差 0.5ms、465 拍累计 240ms——听感就是「前半段凑合、后半段越来越
+    错拍」。精修只搜 ±0.5%（远小于家族层间距 4/3 倍），翻不了层。
+    """
+    true_bpm = 96.0
+    onset = _sharp_spikes([(true_bpm, 0.0, 200.0)], 200.0)
+    L_ref = tc._refine_layer_speed(onset, SR, 95.9236, 0.0, 200.0)
+    assert abs(L_ref - true_bpm) < 0.02, f"应精修回 {true_bpm}，实际 {L_ref:.4f}"
+    # 半径约束：结果必须落在 ±0.5% 内，否则就有翻层风险
+    assert abs(L_ref - 95.9236) / 95.9236 < tc.LAYER_REFINE_TOL * 1.5
+
+
+def test_refine_layer_speed_keeps_already_correct_layer():
+    """层值本来就准时不得被精修推走（否则「满月」62 层这类正确选层会回归）。"""
+    onset = _sharp_spikes([(62.0, 0.0, 200.0)], 200.0)
+    L_ref = tc._refine_layer_speed(onset, SR, 62.0, 0.0, 200.0)
+    assert abs(L_ref - 62.0) < 0.02, f"应保持 62.0，实际 {L_ref:.4f}"
+
+
+def test_collapse_refines_biased_layer_to_true_speed():
+    """端到端：实测层偏低时，塌缩出的 SegmentPlan.bpm 必须是精修真值。
+
+    rate = a2/bpm 只有在 bpm 是真周期时，才把音乐准确送到 a2；否则节拍器
+    周期 60/a2 与音乐拍距不一致，后半段累积错拍。
+    """
+    true_bpm = 96.0
+    onset = _sharp_spikes([(true_bpm, 0.0, 180.0)], 180.0)
+    merged = _merged_from([(95.9236, 0.0, 60.0), (95.9236, 60.0, 120.0),
+                           (95.9236, 120.0, 180.0)])
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP, onset=onset, sr=SR)
+    assert len(out) == 1, f"应塌缩成 1 段，实际 {len(out)} 段"
+    _t0, _t1, sp = out[0]
+    assert abs(sp.bpm - true_bpm) < 0.02, f"应精修到 {true_bpm}，实际 {sp.bpm:.4f}"
+    assert abs(sp.plan.rate - 90.0 / sp.bpm) < 1e-9, \
+        f"rate 必须跟着精修后的层走，实际 {sp.plan.rate:.8f}"
+    # 拍距与报告速度自洽（v1.1.1 的「bpm 与拍距不一致」事故判据）
+    assert abs(60.0 / sp.bpm - np.median(np.diff(sp.beats))) < 0.002
+
+
+def _pulse_audio(bpm: float, dur: float, sr: int = 22050) -> np.ndarray:
+    """合成带真实拍脉冲的音频（每个拍位一小段噪声瞬态），供 _output_beats 用。"""
+    n = int(sr * dur)
+    y = np.zeros(n, dtype=np.float32)
+    rng = np.random.default_rng(7)
+    L = int(0.02 * sr)
+    burst = (0.6 * rng.standard_normal(L)).astype(np.float32)
+    P = 60.0 / bpm
+    t = 0.0
+    while t < dur - 0.05:
+        i = int(round(t * sr))
+        j = min(n, i + L)
+        if j > i:
+            y[i:j] += burst[:j - i]
+        t += P
+    return y
+
+
+def test_output_beats_constant_interval_and_no_drift():
+    """输出轴节拍器格：间隔恒定（不抖、不漂），且踩在音乐拍上不随时间走开。
+
+    这是用户 2026-10-26 报的「后半部分明显错拍」的直接判据——格子的周期
+    必须与音乐拍距一致，否则每拍那点残差会一路累积。
+    """
+    bpm, dur = 90.0, 60.0
+    sr = 22050
+    y2 = _pulse_audio(bpm, dur, sr)
+    beats = tc._output_beats(y2, sr, bpm, dur)
+    assert beats is not None, "_output_beats 不应失败"
+    beats = np.asarray(beats)
+    assert len(beats) >= 8
+    gaps = np.diff(beats)
+    assert float(np.std(gaps)) < 0.002, f"间隔抖动 {np.std(gaps) * 1000:.2f}ms 过大"
+    P = 60.0 / bpm
+    assert abs(float(np.median(gaps)) - P) < 0.002, \
+        f"间隔中位 {np.median(gaps) * 1000:.2f}ms 应≈{P * 1000:.2f}ms"
+    # 每一拍相对最近的真实脉冲的偏移，首尾都不得跑开
+    res = (beats / P - np.round(beats / P)) * P * 1000.0
+    assert float(np.max(np.abs(res))) < 25.0, \
+        f"最大偏离真实拍 {np.max(np.abs(res)):.1f}ms（后半段错拍）"
+    first = float(np.median(res[:len(res) // 4]))
+    last = float(np.median(res[-len(res) // 4:]))
+    assert abs(last - first) < 15.0, f"首末段相位差 {abs(last - first):.1f}ms，存在漂移"
+
+
 # ---------------------------------------------------------------- mp3 码率
 
 def test_mp3_bitrate_default_is_auto():

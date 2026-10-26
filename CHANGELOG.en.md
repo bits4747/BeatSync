@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.8**. Every release bumps the version
+**Versioning rules**: current version **1.2.9**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,39 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.2.9] — 2026-10-26
+
+Fixes the metronome drifting progressively late on constant-tempo songs
+(user-reported: the time-stretch is fine, but the metronome is clearly
+off-beat in the second half — `01 - 乏善可陈_180bpm.mp3`).
+
+### Fixed
+
+- **Layer speed picked as "the minimum of the measured values", biasing the
+  stretch ratio**: once a constant-tempo song is split into several sections,
+  family collapse selects the layer with the lowest stretch cost — and since
+  candidate layers come from per-section measurements, "lowest" is equivalent
+  to taking the **minimum of a set of noisy measurements**, which is biased
+  low. Measured on 乏善可陈: true 95.996, selected layer 95.9236 (0.075% low);
+  `rate = a2/L` therefore stretched the music to 90.068 BPM, while the
+  metronome period is fixed at `60/a2` = 666.667 ms (exactly 90). The 0.5 ms
+  per beat accumulates to **240 ms over 465 beats** — audible as "tolerable
+  early on, increasingly off-beat later". **New behaviour**: after a layer is
+  selected, its speed is comb-refined on the onset envelope
+  (`_refine_layer_speed`, search radius ±0.5% — far below the 4/3 layer
+  spacing, so it cannot flip layers; the refined layer must still pass the
+  per-section hit-rate gate, otherwise the original layer is kept).
+  Verification: on 乏善可陈, taking each third of the song independently and
+  finding its own best phase, the offsets relative to the first third were
+  **+0.00/−85.75/−149.38 ms** before (monotonic drift) and
+  **0.00/0.00/0.00 ms** after; click interval median 333.3322 ms =
+  180.0006/min. The same defect affected two other constant-tempo songs and
+  is fixed along with it: 奢香夫人 47.03→2.77 ms, 红尘客栈 110.65→11.07 ms.
+  Real-song sampling: YYZ still 2 sections, all three constant-tempo songs 1
+  section, click density equal to the target BPM in every case.
 
 ---
 

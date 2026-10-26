@@ -1180,6 +1180,7 @@ OUTBEATS_FIX_EVERY = 8        # 输出轴节拍器：每隔几拍用音乐校一
 OUTBEATS_MAX_STEP = 0.060     # 单块相位修正量上限（秒）——比例控制 0.5×偏差的限幅
 SEG_SHAPE_MIN_S = 10.0       # 判「来回横跳」时只用不短于它的段（短段测速不可靠）
 SEG_SHAPE_FRAC = 0.06        # 同上，同时要求段长至少占全曲这个比例
+LAYER_REFINE_TOL = 0.005     # 家族选层后精修层速度的搜索半径（±0.5%）
 
 
 def _min_cost_layer(bpm: float, target: float, max_slowdown: float,
@@ -1830,6 +1831,43 @@ def _layer_explains_all(onset, sr: int, L: float, spans):
     return True
 
 
+def _refine_layer_speed(onset, sr: int, L: float, t0: float, t1: float,
+                        tol: float = LAYER_REFINE_TOL):
+    """把家族选出的层速度在 onset 包络上精修（相位自由，只定周期）。
+
+    家族候选层是从若干**带噪**实测段速里按「变速代价并列取最低」选出来的，
+    等价于取一组实测值的最小值——系统性偏低。实测「乏善可陈」：真值 95.996，
+    选出的层 95.9236（偏低 0.075%）。这一偏差会顺着 rate = a2/L 进入变速：
+    音乐实际落到 90.068 而非 90.000，而节拍器周期恒为 60/a2 = 666.667ms，
+    两者每拍差 0.5ms、465 拍累计 240ms——听感就是「前半段还凑合、后半段
+    越来越错拍」（用户 2026-10-26 报的就是这个）。
+
+    所以选定层后必须回到 onset 上把周期精修回来。搜索半径只有 ±0.5%，远
+    小于家族内相邻层的 4/3 倍距，不可能翻层，只修掉选层偏差；拟合不可靠时
+    原值返回。
+    """
+    P0 = 60.0 / L
+    if onset is None or len(onset) < 8 or not (0.2 <= P0 <= 2.5):
+        return float(L)
+    fps = sr / 256.0
+    omax = _dilate_max(onset, 2)
+    best = [P0, 0.0, _grid_score(onset, fps, P0, 0.0, t0, t1, onset_max=omax)]
+    for P in np.linspace(P0 * (1.0 - tol), P0 * (1.0 + tol), 121):
+        for ph in np.linspace(0.0, P, 49, endpoint=False):
+            sc = _grid_score(onset, fps, P, ph, t0, t1, onset_max=omax)
+            if sc > best[2]:
+                best = [P, ph, sc]
+    P1, ph1, _ = best
+    for P in np.linspace(P1 * 0.9996, P1 * 1.0004, 41):
+        for ph in np.linspace(ph1 - 0.02 * P1, ph1 + 0.02 * P1, 11):
+            sc = _grid_score(onset, fps, P, ph, t0, t1, onset_max=omax)
+            if sc > best[2]:
+                best = [P, ph, sc]
+    if best[2] <= 0:
+        return float(L)
+    return float(60.0 / best[0])
+
+
 def _collapse_same_family(merged, target: float, max_slowdown: float,
                           max_speedup: float, onset=None, sr: int = 0,
                           mel=None):
@@ -1898,6 +1936,18 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
             weights=[s1 - s0 for s0, s1, _sp in longs]):
         if not _layer_explains_all(onset, sr, L, spans):
             continue
+        # 候选层来自「代价并列取最低」，等价于取实测值的最小值——系统性偏低，
+        # 会以 rate=a2/L 的形式把音乐送到偏离目标的 BPM 上（节拍器周期恒为
+        # 60/a2，于是每拍累积固定偏差，后半段越来越错拍）。先精修层速度，
+        # 再按精修后的层重做闸门与网格；精修半径 ±0.5% 远小于层间距，翻不了层。
+        L_ref = _refine_layer_speed(onset, sr, L, t0, t1)
+        if abs(L_ref - L) > 1e-9:
+            if not _layer_explains_all(onset, sr, L_ref, spans):
+                L_ref = L                       # 精修后解释不了 → 退回原层
+            else:
+                mc_ref = _min_cost_layer(L_ref, target, max_slowdown, max_speedup)
+                if mc_ref is not None:
+                    L, mc = L_ref, mc_ref
         grid, _hit = _phase_grid(onset, sr, L, t0, t1)
         if grid is None or len(grid) < 4:
             continue
