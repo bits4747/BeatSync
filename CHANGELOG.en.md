@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.10**. Every release bumps the version
+**Versioning rules**: current version **1.2.11**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -18,6 +18,97 @@ The same version number must stay consistent in three places: this file,
 `_packaging/BeatSync.iss`.
 
 ---
+
+## [1.2.11] — 2026-10-27
+
+Fixes the last two sources of "the metronome never lands on the beat". The user
+reported that "艳红" was off for the **whole track**, and that "the instrumental
+passages, where the beat is hard to make out, are the worst" — which points
+straight at the root cause: the music was not actually stretched to the target
+tempo, and the error was most audible where the groove is densest.
+
+### Fixed
+
+- **The layer guard silently gave up when the dominant measured tempo was
+  infeasible** (the big one). `_dominant_measured_guard` only accepted a
+  candidate layer that was exactly the dominant measured tempo (`c[1] == 0`).
+  "艳红" measures ≈130.0 BPM in all 12 sections, with one outlying 13.6 s tail
+  section at 123.65. For 130 BPM at target 180 with −20%/+50% limits, the
+  cpb = 1/2/3/6 candidates all fall outside the rate window, so nothing matched,
+  the guard returned `None`, and layer selection fell back to "lowest cost" —
+  landing on 123.65/2 = **61.82** (refined to 62.02).
+  **Effect**: `rate = 60/62.02 = 0.9674`, so the music actually ran at
+  **62.89 BPM** while the metronome clicked at 60.0 — a constant **+4.81%**
+  error. That is exactly "off for the whole track, worst in instrumental
+  passages". **New behaviour**: any **octave-related layer** of the dominant
+  measured tempo counts as the same family (`c[2]/dom_v` compared against `2^j`
+  and its reciprocal, within 5%), ranked by octave error → cost → layer value.
+  艳红's layer goes 62.02 → **65.00** (the true value); the rendered audio
+  measures **62.8865 → 60.0000 BPM**. `detect_tempo` is bit-identical to 1.2.10
+  on all six real tracks (`95.996024 / 110.062963 / 129.992093 / 140.681273 /
+  83.005645 / 89.964539`) — only layer selection changed, not tempo detection.
+
+- **The phase follower in `_output_beats` was a biased integrator**, turning a
+  constant offset into −189 ms. The control loop
+  `cur += clip(0.5*dev, ±OUTBEATS_MAX_STEP)` assumes the block centroid offset
+  averages to zero over time. But onsets sit systematically **early** relative
+  to the beat grid (measured on 艳红: `dev` mean −7.56 ms, median −5.12 ms), and
+  the integrator treated that as ongoing drift: 50 blocks accumulated to
+  **−188.9 ms** (−0.386 ms/beat), i.e. half a click cell over the whole track.
+  **New behaviour**: a dead band `OUTBEATS_DEADBAND = 0.02` (2% of the beat
+  period); below it the loop does **not** integrate (block validity counting is
+  unaffected). Real section drift (loss of lock after an interlude) is above
+  0.1P, far beyond the dead band, so it is still corrected.
+  20 s-window δ*: 艳红 −166.0 → **+0.0 ms**; 奢香夫人 +10.8 → +0.0;
+  红尘客栈 +9.6 → −1.9. The accumulating variant was slightly better on
+  乏善可陈 (it needs accumulation to recover after its interlude), but the dead
+  band wins on three of the four tracks, so it is the chosen behaviour.
+
+- **`_best_output_phase` returned a click-cell phase that was used as a beat
+  phase** (when cpb ≥ 2). It optimises over the click period `Pc = P/cpb`, and
+  the cpb slots `ph0 + j*Pc` yield **identical click sets and identical
+  energy** — they are interchangeable. But `_output_beats` treated the result as
+  a beat phase, laying out `phase0 + k*P` and measuring onset centroids within
+  ±0.15P. Picking the wrong slot means no onsets fall in those windows,
+  `n_valid` hits zero, and the whole track falls back to grid interpolation
+  (right tempo, lost phase). **New behaviour**: when cpb is an integer ≥ 2, the
+  cpb equivalent slots are re-scored with the **beat period P** to pick the one
+  that actually lands on the beat.
+
+- **`_kick_phase_align` looked only at <120 Hz and could be fooled into a
+  half-beat flip** by double-kick or syncopation. A **full-band energy veto** was
+  added after the flip: if flipping lowers full-band click energy, don't flip.
+  Across 18 × 20 s windows of 艳红 the kick-band optimum wanders between −475 ms
+  and +434 ms (not a stable half-beat relationship at all), while the snare band
+  (1.5–5 kHz) and the full band stay within ±14 ms of each other. In YYZ
+  section 2 the kick ratio is 1.055 (wants a flip), but flipping drops full-band
+  energy by 29.9% and shifts the whole section by half a click cell
+  (δ* −164.8 → −0.9 ms). **Note**: this veto belongs at the output stage only.
+  The same ruling inside `detect_tempo` decides the bpm octave ("夏夜晚风"
+  reports 55 instead of 110 because of it), and adding the veto there doubles
+  the detected tempo.
+
+### Verification
+
+Reference-free δ* criterion (shift the real click train by δ and take the δ that
+maximises onset energy at the clicks; pass when |δ*| < 30 ms and the rate is
+180 ± 0.5/min). Tracks with genuine tempo changes are scanned per section:
+
+| Track | Detected BPM | Stretch | After | Clicks/beat | Length | Clicks | Median gap | δ* |
+|---|---|---|---|---|---|---|---|---|
+| 01 - 乏善可陈 | 96.00 | 0.9375 | 90.0 | 2 | 310.64 s | 931 | 333.3333 ms = 180.0000/min | +0.5 ms |
+| 01 - 夏夜晚风 | 55.01 | 1.0906 | 60.0 | 3 | 236.28 s | 709 | 333.3333 ms = 180.0000/min | +0.5 ms |
+| 01 - 艳红 | **65.00** | **0.9231** | 60.0 | 3 | **399.66 s** | 1198 | 333.3333 ms = 180.0000/min | +0.5 ms |
+| 03 - YYZ (real tempo change) | 102.80 / 140.71 | — | — | 2 / 1 | 220.56 s | 664 | 333.3333 ms | −5.1 / −0.6 ms |
+| 奢香夫人 | 83.01 | 1.0843 | 90.0 | 2 | — | 719 | 333.3333 ms = 180.0000/min | +7.5 ms |
+| 红尘客栈 | 90.00 | 1.0000 | 90.0 | 2 | 275.60 s | 825 | 333.3333 ms = 180.0000/min | +6.5 ms |
+
+- **60 unit tests pass** (4 new: octave-layer guard, dead band ignores constant
+  bias, dead band still tracks real drift, kick flip vetoed by full-band energy).
+- Core regression `_dev/run_checks.py` passes every check (section phase
+  max|Δ| = 0.000 ms).
+- Delivered mp3 round-trip check: codec delay **lag = 0 samples**,
+  δ* = −6.4 / −3.9 / −4.2 ms.
 
 ## [1.2.10] — 2026-10-26
 

@@ -936,6 +936,137 @@ def test_best_output_phase_uses_click_period_for_half_beat():
     assert abs(d) < 0.008, f"点击周期择优后偏离强拍 {d * 1000:+.1f}ms"
 
 
+def test_dominant_guard_matches_octave_layer_when_direct_layer_infeasible():
+    """主导实测层自己不可行时，必须靠**倍频层**兜住，不能退到无关的低层。
+
+    用户 2026-10-27 报「艳红」全程错拍：12 段全测 130.0，target=180 且
+    max_speedup=0.5 时 130 的任何 cpb 方案 rate 都超界 → `c[1] == 0` 一个
+    都匹配不上，主导实测层保护静默失效。最优代价于是落到末段离群值
+    123.65÷2 = 61.82（代价 0.0432，远小于真半速层 65.0 的 0.1154），
+    音乐被送到 62.9 BPM 而节拍器按 60 敲——整曲 4.6% 恒差。
+    """
+    target = 180.0
+    measured = [130.0] * 11 + [123.65]
+    weights = [20.0] * 11 + [13.6]
+    cands = tc._family_layer_candidates(measured, target,
+                                        tc.DEFAULT_MAX_SLOWDOWN,
+                                        tc.DEFAULT_MAX_SPEEDUP, weights=weights)
+    dom = tc._dominant_cluster(measured, weights)
+    assert dom is not None and abs(dom - 130.0) < 1e-6
+    # 真半速层（65.0 = 130/2）必须有可行候选
+    has_half = any(abs(c[2] - 65.0) < 0.1 for c in cands)
+    assert has_half, "65.0 应出现在候选里"
+    # `_family_layer_candidates` 内部已经跑过 guard 并按结果重排，所以首个
+    # 候选就是保护选出的层；不能被 123.65÷2 = 61.825（代价更低）抢走。
+    assert abs(cands[0][2] - 65.0) < 0.2, \
+        f"保护应把真半速层 65.0 排到首位，实际 {cands[0][2]:.4f}"
+    # 再直接验一次 guard 本体：用真实最小代价当 cmin
+    cmin = min(c[0] for c in cands)
+    guard = tc._dominant_measured_guard(cands, measured, weights, cmin)
+    assert guard is not None, "主导实测层不可行时，倍频层必须触发保护"
+    assert abs(guard[2] - 65.0) < 0.2, \
+        f"保护应选中真半速层 ≈65.0，实际 {guard[2]:.4f}"
+
+
+def test_output_beats_deadband_ignores_constant_bias():
+    """块质心的**常值偏置**不得被积分器累积成无界漂移。
+
+    用户 2026-10-27 报「艳红」全程错拍：层值修对后，`cur` 成了唯一的错源。
+    源曲 onset 质心相对网格系统性偏早（实测 dev 均值 −7.56ms），而
+    `cur += 0.5*dev` 是纯积分器，50 块一路积到 −189ms，整曲偏半个点击格。
+    死区（OUTBEATS_DEADBAND）让小偏置不积分，真实的段落失锁（≥0.1P）仍修。
+    """
+    bpm, dur, sr = 60.0, 300.0, 22050
+    P = 60.0 / bpm
+    # 脉冲整体比网格早 8ms（≈1.3%P，落在死区内），模拟 onset 质心的常值偏置
+    y2 = _pulse_audio(bpm, dur, sr)
+    shift = int(round(0.008 * sr))
+    y2 = np.concatenate([np.zeros(shift, dtype=np.float32), y2[:-shift]])
+    beats = tc._output_beats(y2, sr, bpm, dur, clicks_per_beat=3.0)
+    assert beats is not None, "_output_beats 不应失败"
+    beats = np.asarray(beats)
+    gaps = np.diff(beats)
+    assert abs(float(np.median(gaps)) - P) < 0.002, "间隔必须恒为目标周期"
+    # 首末段相位差必须很小（积分器不得把 8ms 常值偏置积成上百毫秒）
+    res = (beats / P - np.round(beats / P)) * P * 1000.0
+    first = float(np.median(res[:len(res) // 4]))
+    last = float(np.median(res[-len(res) // 4:]))
+    assert abs(last - first) < 12.0, \
+        f"首末相位差 {abs(last - first):.1f}ms，常值偏置被积分成漂移"
+
+
+def test_output_beats_deadband_still_tracks_real_drift():
+    """死区不能把「真实段落失锁」也一起屏蔽掉（否则间奏后拉不回来）。
+
+    幅度取 0.12P：必须 > 死区 2%P（否则本来就不该动），又要 < 0.15P
+    （块质心只在预测拍位 ±0.15P 窗内找 onset，超了就是「窗外无锚」，
+    那是另一回事，靠 `_best_output_phase` 全局择优管）。
+    """
+    bpm, dur, sr = 60.0, 300.0, 22050
+    P = 60.0 / bpm
+    drift = 0.12 * P
+    y2 = _pulse_audio(bpm, dur, sr)
+    # 后 1/3 整体错开 0.12P（模拟间奏里失锁）
+    cut = int(2.0 / 3.0 * len(y2))
+    off = int(round(drift * sr))
+    y2 = np.concatenate([y2[:cut], np.zeros(off, dtype=np.float32), y2[cut:]])
+    beats = tc._output_beats(y2, sr, bpm, dur, clicks_per_beat=3.0)
+    assert beats is not None, "死区不得让真实漂移段整块失效"
+    beats = np.asarray(beats)
+    tail = beats[beats > dur * 0.9]
+    assert len(tail) >= 6
+    # 后半段真实脉冲被挪到了 k*P + drift，格子必须跟过去
+    res = ((tail - drift) / P - np.round((tail - drift) / P)) * P * 1000.0
+    assert float(np.median(np.abs(res))) < 30.0, \
+        f"尾部相位仍偏离 {np.median(np.abs(res)):.1f}ms，死区把真实漂移也屏蔽了"
+
+
+def test_output_beats_ignores_kick_flip_when_energy_drops():
+    """底鼓带说要翻半拍、但翻转后全带能量更低时，必须**不翻**。
+
+    用户 2026-10-27 报「艳红」乐器段/反拍处尤其错：`_kick_phase_align` 只看
+    <120Hz，而双踩、切分、超低音合成器都会让反拍的低频更响。实测「艳红」
+    全曲 18 个 20s 窗里，底鼓带最优相位在 −475ms~+434ms 之间乱跳（根本不是
+    稳定半拍关系），军鼓带与全带每窗只差 ±14ms。YYZ 段2 更直接：底鼓比
+    1.055 要翻，但全带翻转后掉 29.9%（1.4844→1.0480），整段偏半个点击格。
+
+    合成：底鼓只在反拍位置响（骗过 <120Hz 裁决），但全带的强起音在正拍上。
+    """
+    import librosa
+
+    bpm, dur, sr = 90.0, 60.0, 22050
+    P = 60.0 / bpm
+    n = int(sr * dur)
+    y = np.zeros(n, dtype=np.float32)
+    rng = np.random.default_rng(23)
+    L = int(0.03 * sr)
+    t = 0.0
+    k = 0
+    while t < dur - 0.1:
+        # 正拍：强全带瞬态（宽带噪声，能量大）
+        i = int(round(t * sr))
+        j = min(n, i + L)
+        y[i:j] += (0.9 * rng.standard_normal(j - i)).astype(np.float32)
+        # 反拍：只放低频（55Hz 正弦，能量小但全在 <120Hz）
+        tb = t + P / 2
+        if tb < dur - 0.1:
+            ib = int(round(tb * sr))
+            lb = int(0.10 * sr)
+            jb = min(n, ib + lb)
+            tt = np.arange(jb - ib) / sr
+            y[ib:jb] += (0.25 * np.sin(2 * np.pi * 55.0 * tt)).astype(np.float32)
+        t += P
+        k += 1
+
+    beats = tc._output_beats(y, sr, bpm, dur)
+    assert beats is not None, "_output_beats 不应失败"
+    beats = np.asarray(beats)
+    # 节拍器必须踩在正拍（强全带瞬态）上，不能被低频反拍骗翻
+    res = (beats / P - np.round(beats / P)) * P * 1000.0
+    assert float(np.median(np.abs(res))) < 40.0, \
+        f"节拍器被底鼓带骗翻了半拍（中位偏差 {np.median(np.abs(res)):.1f}ms）"
+
+
 # ---------------------------------------------------------------- mp3 码率
 
 def test_mp3_bitrate_default_is_auto():

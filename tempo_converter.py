@@ -1178,6 +1178,7 @@ COLLAPSE_FAMILY_COVER = 0.98  # 塌缩要求：一个 base 吸附 ≥98% 的长�
 KICK_FLIP_RATIO = 1.02        # 底鼓带相位裁决：反拍 onset 超过正拍 2% 即判网格半拍反相
 OUTBEATS_FIX_EVERY = 8        # 输出轴节拍器：每隔几拍用音乐校一次相位
 OUTBEATS_MAX_STEP = 0.060     # 单块相位修正量上限（秒）——比例控制 0.5×偏差的限幅
+OUTBEATS_DEADBAND = 0.02      # 块质心偏差小于 2%P 视为常值偏置，不积分（见 _output_beats）
 SEG_SHAPE_MIN_S = 10.0       # 判「来回横跳」时只用不短于它的段（短段测速不可靠）
 SEG_SHAPE_FRAC = 0.06        # 同上，同时要求段长至少占全曲这个比例
 LAYER_REFINE_TOL = 0.005     # 家族选层后精修层速度的搜索半径（±0.5%）
@@ -1780,25 +1781,44 @@ def _dominant_cluster(measured_bpms, weights):
 
 
 def _dominant_measured_guard(cands, measured_bpms, weights, cmin, band=0.35):
-    """主导实测层保护：返回应提到最前的实测层候选，不适用时返回 None。
+    """主导实测层保护：返回应提到最前的同族候选，不适用时返回 None。
 
     主导实测层 = 时长加权后占时最多的实测速度簇（±5% 合并；无 weights 时
     不启用——平权会把「满月」少数段的 95.3 当主导而错误触发）。该层的
     候选代价与全局最优差在 (0.02, band] 八度时才保护：≤0.02 属于代价并列
     （已有并列带规则），> band 说明代价收益大到值得偏离实测层（满月 0.49）。
+
+    **同族含倍频层（2026-10-27 修）**：主导实测层自己常常**没有可行候选**——
+    「艳红」12 段全测 130.0，而 target=180、max_speedup 限制下 130 的
+    cpb=1/2/3/6 方案 rate 全部超界，于是 `c[1] == 0` 一个都匹配不上，保护
+    静默失效。此时最优代价落到末段离群值 123.65 ÷2 = 61.82（代价 0.0432，
+    远小于真半速层 65.0 的 0.1154），音乐被送到 62.9 BPM 而节拍器按 60
+    敲——整曲 4.6% 恒差，δ* 在 ±160ms 间乱跳，听感「全程没踩上拍」。
+    现在把主导实测值的**任一倍频层**都视为同族，并优先取倍频误差最小、
+    其次代价最小、再次层值最小的那个，保护才真正兜住。
     """
     dom_v = _dominant_cluster(measured_bpms, weights)
     if dom_v is None:
         return None
     best = None
     for c in cands:
-        if c[1] == 0 and abs(c[2] / dom_v - 1.0) <= 0.05:
-            if best is None or (c[0], c[2]) < (best[0], best[2]):
-                best = c
+        r = c[2] / dom_v
+        oct_err = None
+        for j in range(0, 4):
+            for ratio in (2.0 ** j, 1.0 / (2.0 ** j)):
+                e = abs(r / ratio - 1.0)
+                if e <= 0.05 and (oct_err is None or e < oct_err):
+                    oct_err = e
+        if oct_err is None:
+            continue
+        key = (oct_err, c[0], c[2])
+        if best is None or key < best[0]:
+            best = (key, c)
     if best is None:
         return None
-    if 0.02 < best[0] - cmin <= band:
-        return best
+    c = best[1]
+    if 0.02 < c[0] - cmin <= band:
+        return c
     return None
 
 
@@ -2058,6 +2078,11 @@ def _kick_phase_align(mel, sr: int, P: float, phase: float, t0: float, t1: float
     整体半拍反相、听感全程错拍。纯底鼓频段（<120Hz，吉他够不着）在真拍位上
     能量必然更高，用它裁决：反拍位（phase+P/2）的底鼓 onset 超过当前相位
     KICK_FLIP_RATIO 倍时，把相位平移半拍。
+
+    **注意**：本函数在 `detect_tempo` 里也用来在 bpm 与 bpm/2 之间定倍频
+    （「夏夜晚风」靠它才报 55 而不是 110），那里的半拍平移是**改变测速结论**，
+    不能用「全带能量」去否决（全带在八分位上的能量本来就更高，正是要修的病）。
+    输出端（`_output_beats`）的同类裁决另有能量否决，见该函数。
 
     phase 为**绝对时间**轴（整曲从 0 起）；验证窗口 [t0, t1]（整曲路径传
     0/duration，塌缩路径传段的绝对起止）。
@@ -2398,6 +2423,22 @@ def _best_output_phase(onset, sr: int, P: float, duration: float,
                 cand = (e, ph)
         step /= 12.0
         ph0 = cand[1]
+    # 槽位归一：点击格周期 Pc = P/cpb 上，ph0 与 ph0 + j*Pc (j=1..cpb-1) 给出
+    # **完全相同的点击集合**，能量也完全相同——对 cpb 个槽位彼此等价。但
+    # `_output_beats` 把返回值当作**拍**相位用（`phase0 + k*P` 铺格，再在
+    # ±0.15P 窗内量 onset 质心），槽位选错就会让量质心的窗口落在拍与拍之间。
+    # 合成脉冲曲上实测：cpb=3 时抽到 0.3293 而真拍在 0.008，窗内没有 onset
+    # → n_valid=0 → 整首退回网格插值路径（拍速对、相位丢）。所以还要在 cpb
+    # 个等价槽里按**拍周期 P** 的能量挑出「拍槽」。
+    if cpb >= 2.0 and abs(cpb - round(cpb)) < 1e-9:
+        nslot = int(round(cpb))
+        best_slot = (-1.0, ph0)
+        for j in range(nslot):
+            ph = ph0 + j * Pc
+            e = _grid_score(env, fps, P, ph, 0.0, duration, onset_max=omax)
+            if e > best_slot[0]:
+                best_slot = (e, ph)
+        ph0 = best_slot[1]
     return float(ph0 % P)
 
 
@@ -2418,6 +2459,12 @@ def _output_beats(y2, sr: int, a2: float, duration: float,
          加权质心校一次相位，修正量限幅 OUTBEATS_MAX_STEP、并在块间
          线性摊开——节拍器微观上仍是恒速（间隔偏差 <2ms），但格子的
          相位缓慢贴住音乐，层值残余误差（~0.1%）不会累积成漂移。
+         **死区（OUTBEATS_DEADBAND）**：|偏差| < 2%P 时**不积分**。块质心
+         相对网格有一个系统性常值偏置（起音重心比拍点略早，实测 −3~−8ms），
+         累积式积分器会把它一路积成无界漂移——「艳红」实测 dev 均值
+         −7.56ms、50 块积分到 **−189ms**，整曲偏半个点击格（用户听感
+         「全程没踩上拍」，20s 窗 δ* 在 ±160ms 间乱跳）。真实段落漂移
+         （间奏后失锁）幅度在 0.1P 以上，远大于死区，仍能正常拉回。
     （此前试过「逐拍跟踪音乐瞬态」的版本——节拍器跟着音乐的微观速度
     波动走，间隔不均、丢拍处补漏拆分会多敲，听感成附点/切分，已废弃。）
     """
@@ -2444,7 +2491,23 @@ def _output_beats(y2, sr: int, a2: float, duration: float,
     if clicks_per_beat is None or abs(float(clicks_per_beat) - 1.0) < 1e-9:
         mel2 = np.abs(librosa.feature.melspectrogram(y=ym, sr=sr, hop_length=256,
                                                      fmax=0.5 * sr))
-        phase0, _fl = _kick_phase_align(mel2, sr, P, phase0, 0.0, duration)
+        ph_flip, _fl = _kick_phase_align(mel2, sr, P, phase0, 0.0, duration)
+        if _fl:
+            # **全带能量否决（2026-10-27 修）**：底鼓带并不总是可信（双踩、
+            # 切分、超低音合成器都会让 <120Hz 在反拍更响）。这里的用途是让
+            # 点击贴住音乐，所以「翻转后全带能量反而更低」就是明确反证——
+            # 实测 YYZ 段2 翻转后全带掉 29.9%（1.4844→1.0480），整段偏半个
+            # 点击格（δ* = −164.81ms）。注意 `detect_tempo` 里不能用这条：
+            # 那里的半拍平移是在定 bpm 倍频（夏夜晚风靠它报 55 而非 110），
+            # 而全带在八分位能量更高正是要修的病。
+            omax2 = _dilate_max(onset, 2)
+            e_now = _grid_score(onset, fps, P, phase0, 0.0, duration,
+                                onset_max=omax2)
+            e_flip = _grid_score(onset, fps, P, ph_flip % P, 0.0, duration,
+                                 onset_max=omax2)
+            if e_flip < e_now:
+                ph_flip = phase0
+        phase0 = ph_flip
     # 块质心校准：块 b 覆盖拍号 [b*E, (b+1)*E)，质心 = 拍位（含当前曲线
     # 修正）±0.15P 窗内 onset 幅值加权位置的平均偏移。**比例控制**：每块
     # 只修残余偏差的一半、上限 OUTBEATS_MAX_STEP——固定小限速在「间奏段
@@ -2479,9 +2542,10 @@ def _output_beats(y2, sr: int, a2: float, duration: float,
             dev = float(np.average(offsets, weights=weights))
             var = float(np.average((np.asarray(offsets) - dev) ** 2, weights=weights))
             if abs(dev) <= 0.25 * P and math.sqrt(max(var, 0.0)) <= 0.08 * P:
-                cur += max(-OUTBEATS_MAX_STEP,
-                           min(OUTBEATS_MAX_STEP, 0.5 * dev))
-                n_valid += 1
+                n_valid += 1        # 块本身可信（与是否越过死区无关）
+                if abs(dev) >= OUTBEATS_DEADBAND * P:
+                    cur += max(-OUTBEATS_MAX_STEP,
+                               min(OUTBEATS_MAX_STEP, 0.5 * dev))
         ks_ctl.append(float(k0b))
         offs_ctl.append(cur)
     if n_valid < max(2, int(0.4 * n_blk)):
