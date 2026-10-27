@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.3.0**. Every release bumps the version
+**Versioning rules**: current version **1.3.1**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,17 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.3.1] — 2026-10-27
+
+### Fixed
+
+- **The tray icon is now the application's own icon.** It used to show a
+  placeholder blue dot, inconsistent with the window, taskbar and desktop
+  shortcut. It now uses the same `assets/icon.ico`, falling back to the dot only
+  when the icon file is missing.
 
 ---
 

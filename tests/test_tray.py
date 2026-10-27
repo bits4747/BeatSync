@@ -270,3 +270,63 @@ def test_cradle_lang_switch():
     assert tray.TrayCradle(lang="zh")._t("中", "EN") == "中"
     assert tray.TrayCradle(lang="en-US")._t("中", "EN") == "EN"
     assert tray.TrayCradle(lang="")._t("中", "EN") == "中"
+
+
+# --------------------------------------------------------------------- 托盘图标来源
+def test_find_icon_finds_bundled_icon(monkeypatch, tmp_path: Path):
+    """软件图标必须能被自动找到（打包版靠它拿到真图标，而不是兜底蓝点）。"""
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    ico = assets / "icon.ico"
+    ico.write_bytes(b"fake")
+    monkeypatch.setattr(tray, "_candidate_dirs", lambda: [tmp_path])
+    assert tray.find_icon() == str(ico)
+
+
+def test_find_icon_falls_back_to_png(monkeypatch, tmp_path: Path):
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    png = assets / "icon.png"
+    png.write_bytes(b"fake")
+    monkeypatch.setattr(tray, "_candidate_dirs", lambda: [tmp_path])
+    assert tray.find_icon() == str(png)
+
+
+def test_find_icon_returns_none_when_missing(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(tray, "_candidate_dirs", lambda: [tmp_path])
+    assert tray.find_icon() is None
+
+
+def test_cradle_uses_software_icon_when_no_explicit_path(monkeypatch, tmp_path: Path):
+    """没显式给 icon_path 时，托盘必须自己去拿软件图标（回归：桌面版曾传 None）。"""
+    assets = tmp_path / "assets"
+    assets.mkdir()
+    ico = assets / "icon.ico"
+    ico.write_bytes(b"fake")
+    monkeypatch.setattr(tray, "_candidate_dirs", lambda: [tmp_path])
+
+    opened: list[str] = []
+
+    def importer(name):
+        if name == "pystray":
+            class _Mod:
+                Icon = _FakeIcon
+                Menu = lambda *items: type("M", (), {"items": list(items)})()
+                MenuItem = _FakeMenuItem
+            return _Mod
+        mod = type("M", (), {})()
+        mod.new = staticmethod(lambda *a, **k: _FakeImage())
+
+        def _open(path):
+            opened.append(str(path))
+            return type("I", (), {"convert": lambda self, m: _FakeImage()})()
+
+        mod.open = staticmethod(_open)
+        return mod
+
+    _FakeIcon.instances = []
+    monkeypatch.setattr(tray, "_default_importer", importer)
+    cradle = tray.TrayCradle()
+    assert cradle.ensure(lambda: None, lambda: None) is True
+    assert opened == [str(ico)]
+

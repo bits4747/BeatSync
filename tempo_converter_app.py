@@ -708,6 +708,11 @@ def _ensure_tray(window) -> bool:
     def _quit(_icon=None, _item=None):
         _quit_now(window)
 
+    # 托盘图标用软件自己的 icon.ico（和窗口/任务栏图标同一个文件）。这里显式补一次：
+    # TRAY 是模块级常量，创建时 `_icon_path()` 还没定义，所以放在真正收托盘前设置。
+    if not TRAY.icon_path:
+        TRAY.icon_path = _icon_path()
+
     return TRAY.ensure(_show, _quit)
 
 

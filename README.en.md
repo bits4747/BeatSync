@@ -139,6 +139,8 @@ still in progress is not interrupted.
 - To get the window back: **left-click the tray icon**, or right-click and pick
   **Show window**.
 - To really terminate the program: right-click the tray icon and pick **Quit**.
+- The tray icon is the application's own icon — the same `assets/icon.ico` used by
+  the window, the taskbar and the desktop shortcut.
 - To turn the behaviour off: clear **Hide to the system tray on close** on the last
   row of *Conversion settings* (bottom of the parameter area in the compatibility
   UI). The × then quits immediately. The value is stored in `ui_prefs.json` next to

@@ -74,14 +74,47 @@ def _candidate_dirs() -> list[Path]:
     try:
         if getattr(sys, "frozen", False):
             out.append(Path(sys.executable).parent)
-        else:
-            out.append(Path(__file__).resolve().parent)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # 打包成 onedir 时资源在 _MEIPASS（= exe 同级 _internal），源码运行时
+        # _MEIPASS 不存在，退回本文件所在目录。
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            out.append(Path(meipass))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        out.append(Path(__file__).resolve().parent)
     except Exception:  # noqa: BLE001
         pass
     appdata = os.environ.get("APPDATA")
     if appdata:
         out.append(Path(appdata) / "BeatSync")
     return out
+
+
+def find_icon() -> str | None:
+    """找软件自己的图标文件（assets/icon.ico 或 icon.png），找不到返回 None。
+
+    为什么托盘要自己找、而不是只依赖上层传进来的 `icon_path`：托盘图标是用户
+    唯一能看到的「程序还在」的标识，用兜底画的蓝点等于凭空换掉软件外观。上层
+    漏传（桌面版最初就是这样）时这里仍能拿到真图标。
+    """
+    seen: set[str] = set()
+    for d in _candidate_dirs():
+        for name in ("icon.ico", "icon.png"):
+            p = d / "assets" / name
+            key = str(p).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                if p.is_file():
+                    return str(p)
+            except OSError:
+                continue
+    return None
 
 
 def prefs_path(app_dir=None) -> Path:
@@ -185,12 +218,17 @@ class TrayCradle:
         return self._icon is not None
 
     # ---------- 图标 ----------
+    def _image_source(self) -> str | None:
+        """实际要用的图片路径：上层给的优先，没给就自己找软件图标。"""
+        return self.icon_path or find_icon()
+
     def _load_image(self, modules):
         Image = modules["Image"]
         ImageDraw = modules["ImageDraw"]
-        if self.icon_path:
+        src = self._image_source()
+        if src:
             try:
-                return Image.open(self.icon_path).convert("RGBA")
+                return Image.open(src).convert("RGBA")
             except Exception:  # noqa: BLE001 - 图标坏了不该让托盘不可用
                 pass
         # 兜底画一个纯色圆点：总比没有图标好（Windows 会拒绝空图标）。
