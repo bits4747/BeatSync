@@ -27,3 +27,5 @@ Thumbs.db
 pytest-cache-files-*/
 .pytest_cache/
 tests/_tmp/
+ui_prefs.json
+ui_prefs.json.tmp

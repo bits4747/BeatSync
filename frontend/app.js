@@ -62,6 +62,9 @@ const ZH = {
   metronome: "添加节拍器",
   labelRelVol: "相对音量",
   hintEq: "0 = 与音乐等响",
+  closeToTray: "关闭窗口时收进系统托盘",
+  trayHint: "关窗口不退出程序，点击托盘图标可重新打开；托盘不可用时开关无效",
+  trayUnavailable: "托盘不可用：{why}",
   start: "开始处理",
   startSel: "开始处理（已选 {n}）",
   startAll: "开始处理（全部 {n}）",
@@ -165,6 +168,9 @@ const EN = {
   metronome: "Add metronome",
   labelRelVol: "Relative volume",
   hintEq: "0 = as loud as the music",
+  closeToTray: "Hide to the system tray on close",
+  trayHint: "Closing the window keeps the app running; click the tray icon to reopen. Ignored when no tray is available.",
+  trayUnavailable: "Tray unavailable: {why}",
   start: "Start",
   startSel: "Start ({n} selected)",
   startAll: "Start (all {n} files)",
@@ -296,6 +302,8 @@ function refreshDynamicText() {
   if (!state.running) {
     $("#progressLabel").textContent = t("ready");
   }
+  // 托盘那一行的说明是按语言拼的，切语言要重问一次后端再重绘。
+  if ($("#trayHint")) traySync();
 }
 
 function initLang() {
@@ -329,6 +337,9 @@ const realBridge = () => ({
   openFolder: (p) => window.pywebview.api.open_folder(p),
   // 启动 tkinter 兼容界面（功能一致、不依赖 .NET / WebView2）。
   launchTk: () => window.pywebview.api.launch_tk(),
+  // 关闭到托盘：读出当前偏好（含托盘是否可用），改动后写回后端 JSON。
+  getUiPrefs: () => window.pywebview.api.get_ui_prefs(curLang()),
+  setCloseToTray: (v) => window.pywebview.api.set_close_to_tray(v, curLang()),
 });
 
 function mockBridge() {
@@ -388,6 +399,10 @@ function mockBridge() {
     stop: async () => true,
     reveal: async () => true,
     openFolder: async () => true,
+    // 预览模式没有真托盘：照实报不可用，界面上那行会变灰并显示原因。
+    getUiPrefs: async () => ({ close_to_tray: true, tray_available: false,
+                               tray_reason: "preview mode" }),
+    setCloseToTray: async (v) => ({ ok: true, close_to_tray: !!v }),
   };
 }
 
@@ -652,6 +667,7 @@ function readOptions() {
     clickRelDb: parseFloat($("#clickRelDb").value),
     maxSlowdown: parseFloat($("#maxSlowdown").value),
     maxSpeedup: parseFloat($("#maxSpeedup").value),
+    closeToTray: $("#closeToTray").checked,
     lang: curLang(),
   };
 }
@@ -687,6 +703,42 @@ function loadSettings() {
   limitHintUpdate();
   metroPanelUpdate();
   bitrateGateUpdate();
+}
+
+/* 关闭到托盘：偏好存在后端（ui_prefs.json），因为 tkinter 兼容界面也会读写它。
+   所以这里**不从 localStorage 恢复**，而是启动时向桥问一次，以文件为准。 */
+const TRAY_FALLBACK = { close_to_tray: true, tray_available: true, tray_reason: "" };
+
+function trayRender(p) {
+  const prefs = Object.assign({}, TRAY_FALLBACK, p || {});
+  const box = $("#closeToTray");
+  if (box) box.checked = !!prefs.close_to_tray;
+  const wrap = $("#trayWrap");
+  if (wrap) wrap.classList.toggle("disabled", !prefs.tray_available);
+  const hint = $("#trayHint");
+  if (hint) {
+    hint.textContent = prefs.tray_available
+      ? t("trayHint")
+      : t("trayUnavailable", { why: prefs.tray_reason || "n/a" });
+    hint.classList.toggle("warn", !prefs.tray_available);
+  }
+  if (box) box.disabled = !prefs.tray_available;
+}
+
+async function traySync() {
+  if (!state.bridge || !state.bridge.getUiPrefs) { trayRender(TRAY_FALLBACK); return; }
+  try { trayRender(await state.bridge.getUiPrefs()); }
+  catch (e) { trayRender(TRAY_FALLBACK); }
+}
+
+async function traySave() {
+  const on = $("#closeToTray").checked;
+  saveSettings();
+  if (!state.bridge || !state.bridge.setCloseToTray) return;
+  try {
+    const r = await state.bridge.setCloseToTray(on);
+    if (r && r.ok === false) trayRender(TRAY_FALLBACK);
+  } catch (e) { }
 }
 
 /* 变速上限：输入框数值与说明文字实时联动（一行短文案，避免换行占高） */
@@ -984,6 +1036,8 @@ function bindUI() {
     toast(t("restoredDefault"));
   };
   $("#mirrorDirs").onchange = () => { showOutDir(); saveSettings(); };
+  // 关闭到托盘：偏好前后端各存一份（localStorage 给界面，JSON 给 tkinter 兼容界面）。
+  $("#closeToTray").onchange = traySave;
 
   // 开始/停止
   $("#btnStart").onclick = startRun;
@@ -1082,5 +1136,6 @@ document.addEventListener("DOMContentLoaded", async () => {
   loadSettings();
   logLine(t("readyLog"), "l-hl");
   await initBridge();
+  await traySync();
   logLine(state.mock ? t("mockLog") : t("liveLog"));
 });

@@ -130,6 +130,25 @@ python tempo_converter_gui.py        # run the tkinter version directly
 python tempo_converter_app.py --tk   # make the main program use tkinter
 ```
 
+### Hide to the system tray on close
+
+Clicking the window's **×** does **not** quit by default — it hides the window into
+the system tray and the app keeps running in the background. A conversion that is
+still in progress is not interrupted.
+
+- To get the window back: **left-click the tray icon**, or right-click and pick
+  **Show window**.
+- To really terminate the program: right-click the tray icon and pick **Quit**.
+- To turn the behaviour off: clear **Hide to the system tray on close** on the last
+  row of *Conversion settings* (bottom of the parameter area in the compatibility
+  UI). The × then quits immediately. The value is stored in `ui_prefs.json` next to
+  the executable and shared by both UIs.
+
+The tray is **optional**: Windows only, and only when `pystray` and `Pillow` are
+installed (bundled in the installer). Running from source without those two
+packages greys out the checkbox and explains why, so a checked box that does
+nothing can never happen.
+
 ---
 
 ## Command line (source runs only)
@@ -252,6 +271,7 @@ The installer does not unpack these `.py` files — it has `BeatSync.exe`, `Beat
 tempo_converter.py        core: detection / candidate choice / stretching / metronome / batch / report; CLI entry
 tempo_converter_app.py    desktop shell: pywebview window + JS bridge + drag and drop + smoke test
 tempo_converter_gui.py    tkinter fallback interface
+tray_icon.py              system tray (optional deps: pystray + Pillow; hide to tray on close)
 frontend/                 index.html + app.css + app.js (no external dependencies, no build step)
 tests/                    unit tests (pytest; click tracks are synthesised in memory, no audio files needed)
 assets/                   icons (icon.svg source plus the derived icon.png / icon.ico)
@@ -266,6 +286,7 @@ LICENSE                   MIT license
 ```
 
 Dependencies: librosa, soundfile, numpy, scipy, pywebview (**only needed when running from source**; the installer bundles them).
+Hiding to the tray additionally needs pystray + Pillow (also bundled in the installer; without them only the tray is missing, conversion is unaffected).
 
 ---
 

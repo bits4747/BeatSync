@@ -406,6 +406,8 @@ label.switch { display: flex; align-items: center; gap: 9px; cursor: pointer; pa
 
 .hint-line { font-size: 13.5px; color: var(--faint); margin-top: 6px; display: flex; align-items: center; gap: 4px; }
 .hint-line.strong { color: var(--accent-2); }
+/* 托盘不可用时的提示（此时关窗口就真退出了，要说清楚） */
+.hint-line.warn { color: var(--warn); }
 
 /* 节拍器 */
 .metro-panel { transition: opacity .2s; margin-top: 7px; }

@@ -131,6 +131,21 @@ python tempo_converter_gui.py        # 直接跑 tkinter 版
 python tempo_converter_app.py --tk   # 让主程序改走 tkinter
 ```
 
+### 关闭窗口时收进系统托盘
+
+点窗口右上角的 **×** 默认**不退出程序**，只是把窗口收进右下角的系统托盘区；
+程序继续在后台待命，转换任务不会被中断。
+
+- 想把窗口叫回来：**左键点托盘图标**，或右键选 **显示主窗口**。
+- 想彻底关掉程序：右键托盘图标选 **退出**。
+- 不想要这个行为：在「转换设置」最下面一行（兼容界面在参数区最后一行）取消勾选
+  **关闭窗口时收进系统托盘**，点 × 就直接退出。这个开关存在程序目录的
+  `ui_prefs.json` 里，两套界面共用同一份。
+
+托盘是**可选能力**：只在 Windows 上、且装了 `pystray` + `Pillow` 时可用（安装版
+已内置）。从源码运行而没装这两个包时，勾选框会置灰并注明「当前环境没有系统托盘，
+关闭窗口会直接退出」——不会出现勾了却没反应的情况。
+
 ---
 
 ## 命令行（仅源码运行）
@@ -252,6 +267,7 @@ OGG 是命令行才有的选项：单次可写出的采样点数有上限，**�
 tempo_converter.py        核心：测速 / 选方案 / 变速 / 节拍器 / 批量 / 报告；CLI 入口
 tempo_converter_app.py    桌面外壳：pywebview 窗口 + JS 桥 + 拖拽 + 冒烟测试
 tempo_converter_gui.py    tkinter 备选界面
+tray_icon.py              系统托盘（可选依赖：pystray + Pillow；关闭窗口时收进托盘）
 frontend/                 index.html + app.css + app.js（无外部依赖，无构建步骤）
 tests/                    单元测试（pytest；全部在内存里合成点击轨，不需要测试音频）
 assets/                   图标（icon.svg 源文件 + 由它派生的 icon.png / icon.ico）
@@ -266,6 +282,7 @@ LICENSE                   MIT 许可证
 ```
 
 依赖：librosa、soundfile、numpy、scipy、pywebview（**只有从源码运行才需要装**；安装版已把它们打包在内）。
+关闭窗口收进托盘另需 pystray + Pillow（同样已打包进安装版；缺了不影响转换，只是没有托盘）。
 
 ---
 

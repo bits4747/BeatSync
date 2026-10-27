@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.2.11**. Every release bumps the version
+**Versioning rules**: current version **1.3.0**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -18,6 +18,33 @@ The same version number must stay consistent in three places: this file,
 `_packaging/BeatSync.iss`.
 
 ---
+
+## [1.3.0] — 2026-10-27
+
+### Added
+
+- **Closing the window now hides the app to the system tray instead of quitting.**
+  Clicking the × only removes the window from the taskbar; the app keeps running
+  in the tray. Pick **Show window** from the tray menu to get it back. A
+  conversion that is still running is not interrupted.
+- The tray menu has two items: **Show window** and **Quit**. Use *Quit* to
+  actually terminate the program.
+- **It is a setting.** The web UI has a "Hide to the system tray on close"
+  checkbox on the last row of *Conversion settings*; the tkinter compatibility
+  UI has the same checkbox at the bottom of its parameter area. It defaults to
+  **on**. Turning it off restores the old behaviour (× quits immediately).
+- The value lives in `ui_prefs.json` next to the executable and is shared by
+  both UIs, so changing it once affects both.
+
+### Notes
+
+- The tray is **optional**: available on Windows only, and only when `pystray`
+  and `Pillow` are installed. When either is missing (or on other platforms) the
+  app falls back to quitting on close, and the checkbox is greyed out with
+  "No system tray here; closing the window quits" — a checked box that does
+  nothing can never happen.
+- The first time the window is hidden, a tray balloon says "BeatSync is still
+  running in the background" so it does not look like the app failed to exit.
 
 ## [1.2.11] — 2026-10-27
 

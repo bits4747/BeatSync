@@ -193,6 +193,7 @@ import soundfile as sf
 import webview
 
 import tempo_converter as tc
+import tray_icon
 
 
 def _resource_dir() -> Path:
@@ -219,6 +220,17 @@ if getattr(sys, "frozen", False):
 
 APP_DIR = _work_dir()
 FRONTEND = _resource_dir() / "frontend" / "index.html"
+
+# 关闭窗口时收进托盘（而不是退出）的偏好与托盘控制器。
+# 偏好落盘在 APP_DIR（打包版 = exe 同级，源码运行 = 脚本目录），tkinter 兼容界面
+# 读的是**同一份**文件，所以两边开关互相认。
+PREFS = tray_icon.load_prefs(APP_DIR)
+_TRAY_OK, _TRAY_WHY = tray_icon.probe_available()
+
+# 托盘控制器与「正在真退出」标记：closing 处理器要靠它区分「点 × 收托盘」
+# 与「从托盘菜单选的退出」——后者必须真的让窗口关掉，不能又被拦回来。
+TRAY = tray_icon.TrayCradle(icon_path=None, lang="zh")
+_QUITTING = False
 
 
 def _pct(value, fallback: float) -> float:
@@ -574,6 +586,30 @@ class Api:
         self.stop_event.set()
         return True
 
+    # ---------- 关闭到托盘 ----------
+    def get_ui_prefs(self, lang=None):
+        """前端启动时读一次当前偏好（含托盘能不能用），用来决定开关是否置灰。"""
+        L = lang or tc.get_lang()
+        return {
+            "close_to_tray": bool(PREFS.get("close_to_tray")),
+            "tray_available": bool(_TRAY_OK),
+            "tray_reason": "" if _TRAY_OK else _TRAY_WHY,
+            "note": tc.tr("关闭窗口时收进系统托盘", "Hide to the system tray on close", L),
+        }
+
+    def set_close_to_tray(self, value, lang=None):
+        """保存「关闭窗口时收进托盘」开关。返回落盘后的完整偏好。
+
+        同时同步托盘菜单的文案语言：托盘图标是按需创建的，创建时读 `TRAY.lang`，
+        所以要在用户切语言后再改一次，否则英文界面弹出中文菜单。
+        """
+        global PREFS
+        L = str(lang or "").strip().lower()
+        if L in ("zh", "en"):
+            TRAY.lang = L
+        PREFS = tray_icon.save_prefs({"close_to_tray": bool(value)}, APP_DIR)
+        return {"ok": True, "close_to_tray": bool(PREFS.get("close_to_tray"))}
+
     def _run(self, files, opt, base_of=None):
         rows, ok, fail, skipped = [], 0, 0, 0
         total = len(files)
@@ -656,6 +692,64 @@ def _icon_path() -> str | None:
     return None
 
 
+def _ensure_tray(window) -> bool:
+    """确保托盘图标在（收进托盘前调用）。成功返回 True。
+
+    托盘回调把它自己甩到独立线程里跑（见 tray_icon），所以这里可以直接调
+    pywebview 的 window 方法；`.show()` 带 `_shown_call`，会等 `events.shown`
+    最多 20 秒——窗口此时早就 shown 过了，不会阻塞。
+    """
+    def _show(_icon=None, _item=None):
+        try:
+            window.show()
+        except Exception:  # noqa: BLE001 - 显示失败时至少别把托盘线程带崩
+            pass
+
+    def _quit(_icon=None, _item=None):
+        _quit_now(window)
+
+    return TRAY.ensure(_show, _quit)
+
+
+def _quit_now(window) -> None:
+    """从托盘菜单「退出」或关闭时不需要收托盘时的统一退出路径。
+
+    顺序很关键：先置 `_QUITTING` 让 closing 处理器放行，再停托盘（它的消息循环
+    是非 daemon 线程，不停进程退不掉），最后销毁窗口让 `Application.Exit()` 生效。
+    """
+    global _QUITTING
+    _QUITTING = True
+    TRAY.stop()
+    try:
+        window.destroy()
+    except Exception:  # noqa: BLE001
+        # 窗口已经没了（重复点击「退出」）就走硬退出兜底，避免进程残留。
+        os._exit(0)
+
+
+def _on_window_closing(window) -> bool:
+    """窗口 × 的关闭处理器。返回 False = 取消关闭（收进托盘）。
+
+    注意 pywebview 的 `Event.set()` 只看**返回值是不是 False**：返回 False 会让
+    winforms 后端 `args.Cancel = True`。所以这里不能返回 None。
+    """
+    global _QUITTING
+    if _QUITTING:
+        return True                      # 已经在退出了，放行
+    if not tray_icon.should_hide_to_tray(PREFS.get("close_to_tray"), _TRAY_OK):
+        return True                      # 用户关掉了这个特性，或本机收不了托盘
+    if not _ensure_tray(window):
+        return True                      # 托盘起不来就别硬拦，老老实实退出
+    try:
+        window.hide()
+    except Exception:  # noqa: BLE001
+        return True                      # 藏不起来就别拦着关
+    TRAY.notify(tc.tr("BeatSync 仍在后台运行，点击托盘图标可重新打开。",
+                      "BeatSync is still running in the background. "
+                      "Click the tray icon to reopen it.", TRAY.lang))
+    return False
+
+
 def _tk_requested() -> bool:
     """是否要改走 tkinter 界面。
 
@@ -687,7 +781,12 @@ def main() -> int:
         background_color="#0a0a0b",
     )
     window.events.loaded += lambda: api.bind_dnd(window)
+    # 关闭到托盘：handler 返回 False 会让 winforms 后端 `args.Cancel = True`，
+    # 即窗口不真的关掉，只是 Hide()（见 _on_window_closing）。
+    window.events.closing += lambda: _on_window_closing(window)
     webview.start(icon=_icon_path())
+    # 主循环退出后清一下托盘，防止非 daemon 的 pystray 线程把进程挂住。
+    TRAY.stop()
     return 0
 
 

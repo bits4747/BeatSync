@@ -51,6 +51,7 @@ def _setup_numba_cache() -> None:
 _setup_numba_cache()
 
 import tempo_converter as tc
+import tray_icon
 
 
 def _trace_dir() -> Path:
@@ -269,9 +270,11 @@ class App:
         self.body.pack(fill="both", expand=True)
 
         trace(f"App: 开始构建界面（trace 文件={_TRACE_PATH}）")
+        self._load_tray_prefs()
         self._build_ui()
-        root.after(100, self._poll_log)
+        self._poll_after_id = root.after(100, self._poll_log)
         self._start_watchdog()
+        self._setup_tray()
         trace("App: 界面构建完成，进入事件循环")
 
     # ---------- 本地化辅助 ----------
@@ -279,6 +282,101 @@ class App:
     def T(zh: str, en: str) -> str:
         """按当前界面语言取文案（语言由 tc.set_lang 全局控制）。"""
         return tc.tr(zh, en)
+
+    # ---------- 关闭到托盘 ----------
+    def _prefs_dir(self) -> Path:
+        return _trace_dir()
+
+    def _setup_tray(self):
+        """接上「点 × 收进托盘」。
+
+        和桌面版共用同一份 `ui_prefs.json`（`tray_icon.load_prefs`），所以两套界面
+        的开关是同一个。托盘图标按需创建，这里只装钩子、不建图标。
+        """
+        self._tray = tray_icon.TrayCradle(icon_path=_icon_path(), lang=tc.get_lang())
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_close_clicked)
+        except Exception:  # noqa: BLE001 - 极少数 Tk 构建不支持，退回默认行为
+            pass
+
+    def _load_tray_prefs(self):
+        """读偏好 + 探活。必须在 `_build_ui()` 之前跑：界面要按偏好画复选框。"""
+        self._prefs = tray_icon.load_prefs(self._prefs_dir())
+        self._tray_ok, self._tray_why = tray_icon.probe_available()
+        self._quitting = False
+
+    def _on_tray_pref_changed(self):
+        """界面上的复选框：写回 `ui_prefs.json`，网页端下次启动会看到同一个值。"""
+        try:
+            self._prefs = tray_icon.save_prefs(
+                {"close_to_tray": bool(self.var_close_to_tray.get())},
+                self._prefs_dir())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_close_clicked(self):
+        """窗口 × 的处理：能收托盘就收，否则真退出。"""
+        if self._quitting:
+            self._really_quit()
+            return
+        if not tray_icon.should_hide_to_tray(self._prefs.get("close_to_tray"),
+                                             self._tray_ok):
+            self._really_quit()
+            return
+        if not self._tray.ensure(self._show_from_tray, self._really_quit):
+            self._really_quit()
+            return
+        try:
+            self.root.withdraw()
+        except Exception:  # noqa: BLE001
+            self._really_quit()
+            return
+        self._tray.notify(tc.tr("BeatSync 仍在后台运行，点击托盘图标可重新打开。",
+                                "BeatSync is still running in the background. "
+                                "Click the tray icon to reopen it."))
+
+    def _show_from_tray(self):
+        """托盘菜单「显示主窗口」。
+
+        `deiconify/lift/focus_force` 都是 Tk 调用，必须回主线程做——托盘回调跑在
+        pystray 的消息循环线程里，直接在那边调 Tk 会崩（Tcl 不是线程安全的）。
+        """
+        def _do():
+            try:
+                self.root.deiconify()
+                self.root.lift()
+                self.root.focus_force()
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            self.root.after(0, _do)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _really_quit(self):
+        """真退出：先取消挂起的轮询，再停托盘，最后销毁窗口。
+
+        顺序有讲究：`_poll_log` 用 `after(100)` 自循环，销毁窗口时如果还有一次
+        挂起的回调，Tcl 会报 `invalid command name "…_poll_log"`（关窗时刷在
+        stderr 上，用户看到会以为出错了）。先取回 id 再 `after_cancel` 就干净了。
+        """
+        self._quitting = True
+        aid = getattr(self, "_poll_after_id", None)
+        if aid is not None:
+            try:
+                self.root.after_cancel(aid)
+            except Exception:  # noqa: BLE001
+                pass
+            self._poll_after_id = None
+        try:
+            self._tray.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.root.destroy()
+        except Exception:  # noqa: BLE001
+            pass
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -524,6 +622,23 @@ class App:
                            "ignored when source BPM is set)"),
             variable=self.var_segments)
         self.chk_segments.grid(row=9, column=0, columnspan=4, sticky="w", padx=4, pady=(6, 0))
+
+        # 第 10 行：关闭窗口时收进系统托盘
+        self.var_close_to_tray = tk.BooleanVar(
+            value=bool(getattr(self, "_prefs", {}).get("close_to_tray", True)))
+        self.chk_tray = ttk.Checkbutton(
+            g, text=self.T("关闭窗口时收进系统托盘（不退出程序）",
+                           "Hide to the system tray on close"),
+            variable=self.var_close_to_tray,
+            command=self._on_tray_pref_changed)
+        self.chk_tray.grid(row=10, column=0, columnspan=4, sticky="w", padx=4, pady=(4, 0))
+        # 托盘不可用时（非 Windows / 缺 pystray+Pillow）说明为什么开了也没用
+        if not getattr(self, "_tray_ok", True):
+            self.chk_tray.config(state="disabled")
+            ttk.Label(g, text=self.T("（当前环境没有系统托盘，关闭窗口会直接退出）",
+                                     "(No system tray here; closing the window quits)"),
+                      foreground="#b45309")\
+                .grid(row=11, column=0, columnspan=4, sticky="w", padx=8)
 
     def _build_buttons(self):
         frame = ttk.Frame(self.body)
@@ -1016,7 +1131,10 @@ class App:
             pass
         except Exception as e:  # noqa: BLE001
             trace(f"主线程: _poll_log 异常 {type(e).__name__}: {e}")
-        self.root.after(100, self._poll_log)
+        # 真退出时窗口已销毁，再挂 after 会在 Tcl 里留下「invalid command name」
+        if getattr(self, "_quitting", False):
+            return
+        self._poll_after_id = self.root.after(100, self._poll_log)
 
     def _start_watchdog(self):
         """看门狗：主线程超过 15 秒没心跳就写日志。
