@@ -1067,6 +1067,100 @@ def test_output_beats_ignores_kick_flip_when_energy_drops():
         f"节拍器被底鼓带骗翻了半拍（中位偏差 {np.median(np.abs(res)):.1f}ms）"
 
 
+# ---------------------------------------------------------------- 减半闸门
+
+def _onset_env(y, sr: int = 22050, hop: int = 256) -> np.ndarray:
+    """与生产同口径的 onset 包络（hop=256）。"""
+    import librosa
+
+    return np.asarray(librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop),
+                      dtype=np.float64)
+
+
+def _accent_audio(bpm: float, dur: float, accent: float,
+                  sr: int = 22050) -> np.ndarray:
+    """每拍一个瞬态，accent 拍（0/1 交替重音）更强。
+
+    accent=1.0 → 每拍一样强（没有两拍分组）；accent=0.35 → 每两拍一个重音，
+    存在 2 拍分组。用来区分「bpm 就是真拍速」与「bpm 是真拍速的 2 倍」。
+    """
+    n = int(round(dur * sr))
+    y = np.zeros(n, dtype=np.float32)
+    rng = np.random.default_rng(23)
+    L = int(0.02 * sr)
+    P = 60.0 / bpm
+    k = 0
+    t = 0.0
+    while t < dur - 0.1:
+        amp = 0.9 if (k % 2 == 0 or accent >= 1.0) else 0.9 * accent
+        i = int(round(t * sr))
+        j = min(n, i + L)
+        y[i:j] += (amp * rng.standard_normal(j - i)).astype(np.float32)
+        t += P
+        k += 1
+    return y
+
+
+def test_parity_ratio_detects_accent_grouping():
+    """每两拍一个重音时奇偶比明显 < 1；每拍等强时 ≈ 1。"""
+    sr, bpm, dur = 22050, 120.0, 40.0
+    grouped = _accent_audio(bpm, dur, 0.25, sr)
+    flat = _accent_audio(bpm, dur, 1.0, sr)
+    r_grouped = tc._parity_ratio(_onset_env(grouped, sr), sr, bpm, 0.0, dur)
+    r_flat = tc._parity_ratio(_onset_env(flat, sr), sr, bpm, 0.0, dur)
+    assert r_grouped is not None and r_flat is not None
+    assert r_grouped < 0.90, f"有重音分组时奇偶比应低，实际 {r_grouped:.3f}"
+    assert r_flat > 0.95, f"每拍等强时奇偶比应接近 1，实际 {r_flat:.3f}"
+
+
+def test_may_halve_requires_accent_grouping():
+    """减半只在「音乐真有 2 拍分组」时放行。"""
+    sr, bpm, dur = 22050, 120.0, 40.0
+    env_g = _onset_env(_accent_audio(bpm, dur, 0.25, sr), sr)
+    env_f = _onset_env(_accent_audio(bpm, dur, 1.0, sr), sr)
+    # 候选层 = bpm/2（正是要减半的情形）
+    assert tc._may_halve(env_g, sr, bpm / 2.0, bpm, 0.0, dur) is True
+    assert tc._may_halve(env_f, sr, bpm / 2.0, bpm, 0.0, dur) is False
+    # 不是减半关系时永远放行
+    assert tc._may_halve(env_f, sr, bpm, bpm, 0.0, dur) is True
+    assert tc._may_halve(env_f, sr, bpm / 3.0, bpm, 0.0, dur) is True
+
+
+def test_collapse_rejects_halving_without_accent_grouping():
+    """单速曲（每拍等强、各段都测在 120）不得被塌缩到 60。
+
+    用户 2026-10-27 报「地图」：真值 122，检测 122，但塌缩后选到 61，
+    音乐被送到 120 而节拍器按 60 敲 3 下/拍——正好落在拍与拍之间。
+    半速网格是实测网格的子集，命中率闸门对它毫无分辨力，必须靠奇偶比拦。
+    """
+    bpm, dur, sr = 120.0, 60.0, 22050
+    y = _accent_audio(bpm, dur, 1.0, sr)
+    onset = _onset_env(y, sr)
+    merged = _merged_from([(bpm, 0.0, 15.0), (bpm, 15.0, 30.0),
+                           (bpm, 30.0, 45.0), (bpm, 45.0, dur)], target_bpm=180.0)
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP, onset=onset, sr=sr)
+    assert len(out) == 1, "单速曲应塌缩成 1 段"
+    sp = out[0][2]
+    assert abs(sp.bpm - bpm) < 1.0, \
+        f"每拍等强时不得减半，应保持 ≈{bpm}，实际 {sp.bpm:.3f}"
+
+
+def test_collapse_allows_halving_with_accent_grouping():
+    """真有每两拍一个重音时，减半是被允许的（保住「艳红」这类既有效果）。"""
+    bpm, dur, sr = 120.0, 60.0, 22050
+    y = _accent_audio(bpm, dur, 0.25, sr)
+    onset = _onset_env(y, sr)
+    merged = _merged_from([(bpm, 0.0, 15.0), (bpm, 15.0, 30.0),
+                           (bpm, 30.0, 45.0), (bpm, 45.0, dur)], target_bpm=180.0)
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP, onset=onset, sr=sr)
+    assert len(out) == 1
+    sp = out[0][2]
+    assert abs(sp.bpm - bpm / 2.0) < 1.0, \
+        f"有 2 拍分组时应减半到 ≈{bpm / 2:.1f}，实际 {sp.bpm:.3f}"
+
+
 # ---------------------------------------------------------------- mp3 码率
 
 def test_mp3_bitrate_default_is_auto():

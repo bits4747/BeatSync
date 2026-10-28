@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.3.1**. Every release bumps the version
+**Versioning rules**: current version **1.4.0**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,37 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `_packaging/BeatSync.iss`.
+
+---
+
+## [1.4.0] — 2026-10-27
+
+### Fixed
+
+- **A constant-tempo song is no longer mistaken for "half speed, three clicks per
+  beat".** For a track the detector already measured correctly (e.g. "地图" at
+  122.0 BPM), merging its same-tempo sections could pick a *half-speed layer*
+  (61.0), so the music was stretched by `rate = target / 61` and actually landed
+  at 120 BPM while the metronome clicked at 60 — three clicks per beat, sitting
+  exactly between beats. The result sounded like nothing was on the beat.
+
+  Halving a measured tempo now requires evidence that the music really has a
+  two-beat grouping (an accent every other beat). When every beat is equally
+  strong there is no such grouping, so halving is refused and the measured tempo
+  is used directly. "地图" now reports: detected 122.0 / stretch 1.4754 /
+  after-stretch 180.0 / **one click per beat**.
+
+  Three other tracks of the same shape benefit as well: their reported
+  "after-stretch BPM" previously differed from the actual output tempo by a
+  factor of two, and now the report matches the audio.
+
+### Notes
+
+- The check only decides whether to *halve*; it does not change tracks that were
+  already correct. Slow songs that genuinely have a two-beat grouping
+  ("艳红", "满月", "夏夜晚风") are still halved with three clicks per beat.
+- If a track has neither a reliable measured tempo nor a two-beat grouping, the
+  original lowest-cost layer selection still applies.
 
 ---
 

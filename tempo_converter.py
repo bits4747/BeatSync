@@ -1182,6 +1182,7 @@ OUTBEATS_DEADBAND = 0.02      # 块质心偏差小于 2%P 视为常值偏置，�
 SEG_SHAPE_MIN_S = 10.0       # 判「来回横跳」时只用不短于它的段（短段测速不可靠）
 SEG_SHAPE_FRAC = 0.06        # 同上，同时要求段长至少占全曲这个比例
 LAYER_REFINE_TOL = 0.005     # 家族选层后精修层速度的搜索半径（±0.5%）
+HALVE_MIN_PARITY = 0.93      # 把实测速度减半前，要求实测网格上奇偶拍能量比低于它
 
 
 def _min_cost_layer(bpm: float, target: float, max_slowdown: float,
@@ -1764,6 +1765,76 @@ def _family_layer_candidates(measured_bpms, target, max_slowdown, max_speedup,
     return uniq
 
 
+def _parity_ratio(onset, sr: int, bpm: float, t0: float, t1: float,
+                  nphase: int = 64, hop: int = 256):
+    """bpm 网格上「偶数拍 vs 奇数拍」的能量均值比（min/max，相位取总能量最大者）。
+
+    用途：判断 bpm 是不是**真实拍速的 2 倍**。若每两拍一个重音（强弱交替），
+    偶奇比明显小于 1，说明真拍只有一半、把 bpm 减半是有依据的；若每拍一样强
+    （比值 ≈1），网格上不存在 2 拍分组，减半等于凭空造出半拍。
+
+    实测（2026-10-27）：真拍速是 bpm 一半的曲子 0.54~0.90；「地图」实测 122.05
+    而每拍等强，比值 0.9978——它就是被漏掉、减半成 61 的。
+    """
+    if onset is None or len(onset) < 64 or bpm <= 0:
+        return None
+    fps = sr / hop
+    P = 60.0 / bpm
+    omax = _dilate_max(onset, 2)
+    dur = t1 - t0
+    if dur <= 4.0 * P:
+        return None
+    best = (-1.0, None)
+    for k in range(nphase):
+        ph = t0 + k / nphase * P
+        k0 = int(np.ceil((t0 - ph) / P - 1e-9))
+        k1 = int(np.floor((t1 - ph) / P + 1e-9))
+        ks = np.arange(k0, k1 + 1)
+        f = np.round((ph + ks * P) * fps).astype(int)
+        ok = (f >= 0) & (f < len(omax))
+        if int(ok.sum()) < 24:
+            continue
+        vals, kk = omax[f[ok]], ks[ok]
+        even, odd = vals[kk % 2 == 0], vals[kk % 2 == 1]
+        if len(even) < 8 or len(odd) < 8:
+            continue
+        tot = float(vals.mean())
+        if tot > best[0]:
+            hi = max(float(even.mean()), float(odd.mean()))
+            if hi <= 0:
+                continue
+            best = (tot, min(float(even.mean()), float(odd.mean())) / hi)
+    return best[1]
+
+
+def _octave_err(layer: float, dom: float) -> float:
+    """layer 与 dom 相差几个八度（取最近的整数八度，只算 -2..+2）的误差。
+
+    0 = 同层，1 = 高八度，-1 = 低八度。1/3、2/3、3/2 这类关系会给出很大的
+    误差——它们正是「点击与真拍错频」的来源（每真实拍敲 2/3 或 3/2 下）。
+    """
+    if not dom or dom <= 0 or layer <= 0:
+        return 0.0
+    v = math.log2(layer / dom)
+    return min(abs(v - k) for k in (-2, -1, 0, 1, 2))
+
+
+def _may_halve(onset, sr: int, L: float, dom: float, t0: float, t1: float):
+    """层 L 是不是「把实测速度 dom 减半」得来的；是的话要求有 2 拍分组的证据。
+
+    返回 True = 允许用这个层；False = 减半缺乏依据，应换下一个候选。
+    非减半层（L 与 dom 同量级或更高）一律允许。
+    """
+    if not dom or dom <= 0 or L <= 0:
+        return True
+    if abs(L / dom - 0.5) > 0.06:
+        return True                     # 不是减半，与本判据无关
+    par = _parity_ratio(onset, sr, dom, t0, t1)
+    if par is None:
+        return True                     # 测不出来就别拦
+    return par < HALVE_MIN_PARITY
+
+
 def _dominant_cluster(measured_bpms, weights):
     """时长加权占时最多的实测速度簇的代表速度（±5% 合并）。无权重返回 None。"""
     if weights is None or len(weights) != len(measured_bpms):
@@ -1950,10 +2021,40 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
 
     # ② + ③ 候选层逐个过命中率闸门，第一个能解释所有长段的获胜。
     spans = [(s0, s1) for s0, s1, _sp in longs]
-    for _cost, _mflag, L, mc in _family_layer_candidates(
-            [sp.bpm for _s0, _s1, sp in longs], target,
-            max_slowdown, max_speedup,
-            weights=[s1 - s0 for s0, s1, _sp in longs]):
+    long_bpms = [sp.bpm for _s0, _s1, sp in longs]
+    long_wts = [s1 - s0 for s0, s1, _sp in longs]
+    # 减半闸门用的参照速度取**最长长段**的实测值：_dominant_cluster 取的是簇内
+    # 最小值（簇按 ±5% 归并、代表值取簇首），实测「夏夜晚风」给 108.899，而真正
+    # 占满全曲的那段是 110.041——用前者算奇偶比会把 0.795 算成 0.970，误判成
+    # 「没有两拍分组」。最长段的实测速度没有这个偏差。
+    i_long = int(np.argmax(long_wts))
+    ref_v = float(long_bpms[i_long])
+    dom_v = _dominant_cluster(long_bpms, long_wts)
+    cands = _family_layer_candidates(long_bpms, target, max_slowdown, max_speedup,
+                                     weights=long_wts)
+    # 减半闸门：半速网格是实测网格的**子集**，命中率闸门对它毫无分辨力（两者
+    # 都能「解释」音乐），所以「把实测速度减半」必须另有证据——音乐里真有每两
+    # 拍一个重音的强弱交替。实测「地图」：全曲 9 段都测在 122.0，而 122 的网格
+    # 上每拍等强（奇偶比 0.96），减半到 61 之后音乐被送到 120、节拍器按 60 敲
+    # 3 下/拍，正好落在拍与拍之间（用户 2026-10-27 报的「一拍打 3 下」）。
+    # 只在**减半被拒**时收窄到八度同族：八度同族能保证「点击与真拍不错频」，
+    # 但会把本该减半的曲子抬回实测值（艳红 65→130 等），那些曲子已按奇偶比
+    # 判定「减半有依据」，不该被这条改掉。
+    if ref_v > 0:
+        kept = []
+        rejected_halve = False
+        for c in cands:
+            if abs(c[2] / ref_v - 0.5) <= 0.06 and not _may_halve(
+                    onset, sr, c[2], ref_v, t0, t1):
+                rejected_halve = True
+                continue
+            kept.append(c)
+        if rejected_halve:
+            same_oct = [c for c in kept if _octave_err(c[2], ref_v) <= 0.05]
+            if same_oct:
+                kept = same_oct
+        cands = kept
+    for _cost, _mflag, L, mc in cands:
         if not _layer_explains_all(onset, sr, L, spans):
             continue
         # 候选层来自「代价并列取最低」，等价于取实测值的最小值——系统性偏低，
