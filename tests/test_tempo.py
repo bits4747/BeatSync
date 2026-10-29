@@ -131,6 +131,67 @@ def test_dotted_fix_picks_in_range_neighbour():
     assert abs(60.0 / P - 90.0) < 1.0, f"修正到 {60.0 / P:.2f}，期望 90"
 
 
+def _even_spikes(bpm: float, weak: float, dur: float = 30.0,
+                 sr: int = SR) -> np.ndarray:
+    """按 bpm 网格每格一个脉冲，每第 3 格起头的格用强脉冲、其余用 weak 倍。
+
+    weak=1.0 是等强网格（每个格点都同等重要）；weak 很小时只有每 3 格一次
+    的强脉冲可听——即「真拍是 bpm×2/3、bpm 网格上多出来的格点只是弱细分」。
+    """
+    fps = sr / 256
+    env = np.zeros(int(dur * fps))
+    for k, t in enumerate(np.arange(0.0, dur - 1e-6, 60.0 / bpm)):
+        i = int(round(t * fps))
+        amp = 1.0 if k % 3 == 0 else weak
+        env[i:i + 3] = np.maximum(env[i:i + 3], amp)
+    return env
+
+
+def test_dotted_fix_keeps_level_when_thirds_survive():
+    """三度位上的能量来自配器切分而不是拍级分组时，不许改判。
+
+    「万有引力」96-124s 的实测形态：128 档的三度位显著度 0.888 刚过 0.85
+    门槛，但改到 96 档后三度位仍有 0.788——说明那不是拍级分组。旧规则只看
+    「三度位是否显著」会把它硬拽到 94（真值的一半）。
+    这里用每 9 格一次的密集细分构造同样的性质：P 与 4P/3 的三度位都有能量。
+    """
+    bpm = 128.0
+    P = 60.0 / bpm
+    env = _even_spikes(bpm=405.0, weak=1.0, dur=30.0)   # d = P/9 的密集细分
+    fps = SR / 256
+    assert tc._thirds_ratio(env, fps, P, 0.0) >= tc.DOTTED_FIRE
+    P2, _phase2 = tc._dotted_level_fix(env, SR, P, 0.0)
+    assert abs(60.0 / P2 - bpm) < 1.0, (
+        f"改判到 {60.0 / P2:.2f}，但三度位能量不是拍级分组，应保持 {bpm}")
+
+
+def test_third_level_fix_moves_triplet_level_down():
+    """检测档比真拍密 3/2 倍（三连音错拍）时必须改回真拍。
+
+    「在这里停一下」的实测形态：真拍 87，八分音符位置有拍级能量，beat_track
+    落到 130.5（每两拍三个格点），节拍器因此每 2 拍敲 3 下。网格分比值实测
+    1.364~1.608，阈值 1.30。
+    """
+    env = _even_spikes(bpm=130.5, weak=0.05, dur=30.0)
+    P, _phase = tc._third_level_fix(env, SR, 60.0 / 130.5, 0.0)
+    assert abs(60.0 / P - 87.0) < 1.5, f"修正到 {60.0 / P:.2f}，期望约 87"
+
+
+def test_third_level_fix_noop_when_grid_is_even():
+    """真拍确实是 130.5（每格等强）时不许改判。"""
+    env = _even_spikes(bpm=130.5, weak=1.0, dur=30.0)
+    P, phase = tc._third_level_fix(env, SR, 60.0 / 130.5, 0.0)
+    assert (P, phase) == (60.0 / 130.5, 0.0), (
+        f"等强网格被改到 {60.0 / P:.2f}，应原样返回")
+
+
+def test_third_level_fix_noop_when_candidate_is_out_of_range():
+    """候选档出界（低于下限）时不做任何事。"""
+    env = _even_spikes(bpm=60.0, weak=0.05, dur=30.0)
+    P, _phase = tc._third_level_fix(env, SR, 60.0 / 60.0, 0.0)
+    assert abs(60.0 / P - 60.0) < 0.5, f"改到 {60.0 / P:.2f}，应保持 60"
+
+
 # ---------------------------------------------------------------- 速度方案
 
 def test_exact_target_returns_rate_one():

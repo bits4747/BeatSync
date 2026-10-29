@@ -760,6 +760,47 @@ DOTTED_FIRE = 0.85
 DOTTED_ANCHOR_BPM = 120.0
 DOTTED_BPM_LO = 50.0
 DOTTED_BPM_HI = 240.0
+# 附点修正的判据：改判到邻档后，三度位上的能量**是否跟着消失**。
+#
+# 这是本模块唯一能把「真附点」与「编曲切分」分开的量（全库实测）：
+#   · 真附点（真拍确实在 3 倍档上）：改到 ×0.75 后，原来的 1/3、2/3 位置
+#     不再有拍级能量，三度位显著度从 0.979/0.983/0.997 掉到
+#     0.165/0.187/0.358（我不用问、失败的晚餐、漫长的人生）；
+#   · 编曲切分（伴奏有附点/切分音，但真拍不在 3 倍档）：改判后那些位置的
+#     能量还在，显著度只从 0.888/0.911 降到 0.788/0.834（万有引力 96-124s、
+#     在这里停一下 146-160s）——说明那里的能量是配器带来的，不是拍级分组。
+# 阈值 0.60：真阳性上限 0.358、假阳性下限 0.788，两侧都留出大余量。
+#
+# 为什么不能只看「收益」（候选档网格分 ÷ 当前档）：真附点段的收益是
+# 1.248/1.280/1.541，但同一个文件里的**短子段**收益会掉到 1.05~1.12
+# （分析窗短、伴奏稀疏），如果按收益卡阈值，同一首曲子里就会一半子段修正、
+# 一半不修正，实测速度里同时出现 94.98 与 126.68，下游按 4/3 层关系算家族
+# 反而塌缩到 63.3（「我不用问」就是这么从 95 退到 63.3 的）。
+# 改判后三度位消失这一条，在长段与短段上结果一致，所以拿它当主判据。
+DOTTED_AFTER_MAX = 0.60
+# 收益下限只作兜底：改判后至少不能比当前档更贴网格（实测合格段都 ≥1.05）。
+DOTTED_MIN_GAIN = 1.00
+
+# 三连音档修正的判据阈值。
+#
+# 与上面的附点关系（3/4、3/2）不同，这里处理的是**检测档比真拍密 3/2 倍**：
+# 真实拍是 87 时，八分音符位置有拍级能量，beat_track 会把「每两拍三个格点」
+# 的 130.5 当成 tactus。这时把周期乘 2/3 就回到真拍。
+#
+# 判据用「候选档与当前档的网格分比值」——这是本模块唯一能把 2/3 档分出来的量：
+# 全库 55 段实测，真正该修正的段比值 1.364~1.608（在这里停一下 4 段 1.364 /
+# 1.391 / 1.492 / 1.540，「绝对的平衡」末段 1.608），其余 50 段全部 ≤1.255
+# （次高是「坐过站」12 秒短段的 1.255，它前后段都是 124，属于测量噪声）。
+# 阈值取 1.30：离真阳性下限 1.364 与假阳性上限 1.255 都留出余量。
+#
+# 为什么不用三度位显著度（_thirds_ratio）：在这里停一下这 4 段的 thirds 只有
+# 0.602~0.787，达不到 DOTTED_FIRE=0.85——真拍是 3 格里的第 1 格而不是「附点
+# 关系」，三度位上没有拍级能量。方向不同，判据也不同。
+#
+# 为什么不用能量排序直接选：粗网格格点少、天然只挑最响点，全库候选档与当前档
+# 的比值里 1/2 档几乎总是 >1（p50=1.09、max=1.26），按能量择优会把每首歌都
+# 往下砍一半。2/3 档是唯一「往更密方向走」且实测有干净分离的候选。
+DOTTED_THIRD_RATIO = 1.30
 
 
 def _thirds_ratio(onset, fps, P, phase, omax=None):
@@ -800,9 +841,11 @@ def _thirds_ratio(onset, fps, P, phase, omax=None):
 def _dotted_level_fix(onset, sr, P, phase):
     """附点档修正：检测档的三度位上有拍级能量时，改判到 3/4 或 3/2 倍邻档。
 
-    返回修正后的 (P, phase)；不修正时原样返回。邻档重新做梳状拟合，并用
-    三度位显著度复核——若邻档仍显著（连环附点）再走一步；两步后仍显著就
-    按当前档返回（不猜第三步，连环三层以上的附点关系没有实例）。
+    返回修正后的 (P, phase)；不修正时原样返回。判据是「改判后三度位上的能量
+    是否跟着消失」——真附点会消失，编曲切分不会（见 DOTTED_AFTER_MAX 的注释）。
+    两个方向都试，挑改判后三度位更低、其次网格分更高的那个。
+    改判后再用三度位显著度复核，若邻档仍显著（连环附点）再走一步；两步后仍
+    显著就按当前档返回（不猜第三步，连环三层以上的附点关系没有实例）。
     """
     n_frames = len(onset)
     if n_frames < 8:
@@ -811,20 +854,89 @@ def _dotted_level_fix(onset, sr, P, phase):
     omax = _dilate_max(onset, 2)
     if _thirds_ratio(onset, fps, P, phase, omax) < DOTTED_FIRE:
         return P, phase
+    duration = n_frames / fps
+    t_a = min(0.05 * duration, 5.0)
+    t_b = max(duration - min(0.05 * duration, 5.0), t_a + 4 * P)
+    if t_b <= t_a + 4 * P:
+        t_a, t_b = 0.0, duration
     for _ in range(2):
         bpm0 = 60.0 / P
-        cands = [bpm0 * m for m in (0.75, 1.5)
-                 if DOTTED_BPM_LO <= bpm0 * m <= DOTTED_BPM_HI]
-        if not cands:
+        # 基准档也用相位自由拟合，两侧同一口径；否则相位没对准的段会被
+        # 低估，收益比值虚高（实测「在这里停一下」398-412s 曾因此被误改档）。
+        Pc, phc = _comb_fit_at(onset, sr, P)
+        if Pc is None:
             break
-        bc = min(cands, key=lambda b: abs(np.log2(b / DOTTED_ANCHOR_BPM)))
-        P2, phase2 = _comb_fit_at(onset, sr, 60.0 / bc)
-        if P2 is None:
+        base = _grid_score(onset, fps, Pc, phc, t_a, t_b, onset_max=omax)
+        if base <= 0:
             break
-        P, phase = P2, phase2
+        best = None
+        for m in (0.75, 1.5):
+            b = bpm0 * m
+            if not (DOTTED_BPM_LO <= b <= DOTTED_BPM_HI):
+                continue
+            P2, phase2 = _comb_fit_at(onset, sr, 60.0 / b)
+            if P2 is None:
+                continue
+            sc = _grid_score(onset, fps, P2, phase2, t_a, t_b, onset_max=omax)
+            if sc <= 0 or sc / base < DOTTED_MIN_GAIN:
+                continue
+            th2 = _thirds_ratio(onset, fps, P2, phase2, omax)
+            if th2 is None or th2 > DOTTED_AFTER_MAX:
+                continue
+            cand = (th2, -sc, abs(np.log2((60.0 / P2) / DOTTED_ANCHOR_BPM)),
+                    P2, phase2)
+            if best is None or cand < best:
+                best = cand
+        if best is None:
+            break
+        P, phase = best[3], best[4]
         if _thirds_ratio(onset, fps, P, phase, omax) < DOTTED_FIRE:
             break
     return P, phase
+
+
+def _third_level_fix(onset, sr, P, phase):
+    """三连音档修正：检测档比真拍密 3/2 倍时，把周期乘 2/3 回到真拍。
+
+    真拍是 87、八分音符上有拍级能量时，beat_track 会落到 130.5（每两拍三个
+    格点）。这时节拍器每 2 拍敲 3 下，听感上「一拍打 3 下」——俗称三连音错拍。
+
+    与 _dotted_level_fix 的分工：那个处理 ×3/4 与 ×3/2 的**附点**关系（真拍在
+    检测网格的 1/3、2/3 位上，三度位上有拍级能量）；这个处理 ×2/3（真拍在检测
+    网格的第 1 格，三度位上没有拍级能量，所以三度位判据不适用）。
+
+    返回修正后的 (P, phase)；不修正时原样返回。
+    """
+    n_frames = len(onset)
+    if n_frames < 8:
+        return P, phase
+    bpm0 = 60.0 / P
+    bpm1 = bpm0 * 2.0 / 3.0
+    if not (DOTTED_BPM_LO <= bpm1 <= DOTTED_BPM_HI):
+        return P, phase
+    fps = sr / 256
+    duration = n_frames / fps
+    omax = _dilate_max(onset, 2)
+    t_a = min(0.05 * duration, 5.0)
+    t_b = max(duration - min(0.05 * duration, 5.0), t_a + 4 * P)
+    if t_b <= t_a + 4 * P:
+        t_a, t_b = 0.0, duration
+    # 两侧都用「相位自由最优」的分数再比：当前档若只是相位没对准，固定相位的
+    # 分数会偏低，比值被抬高而误触发（实测「在这里停一下」398-412 段就是这样把
+    # 110 误改到 71）。阈值 1.30 也是对相位自由口径标定的。
+    P0b, ph0b = _comb_fit_at(onset, sr, P)
+    if P0b is None:
+        return P, phase
+    base = _grid_score(onset, fps, P0b, ph0b, t_a, t_b, onset_max=omax)
+    if base <= 0:
+        return P, phase
+    P2, phase2 = _comb_fit_at(onset, sr, 60.0 / bpm1)
+    if P2 is None:
+        return P, phase
+    sc2 = _grid_score(onset, fps, P2, phase2, t_a, t_b, onset_max=omax)
+    if sc2 <= 0 or sc2 / base < DOTTED_THIRD_RATIO:
+        return P, phase
+    return P2, phase2
 
 
 def _smooth_beat_grid(beat_times, P: float, phase: float, duration: float):
@@ -2363,6 +2475,19 @@ def detect_tempo(y_mono, sr: int, lang: str | None = None, mel=None):
             P, phase = P2, phase2
             # 改档后旧拍编号失效。优先 onset 重锁 + 拟合重建贴合网格
             # （恒速网格不跟真实拍，速度起伏会让点击累积漂移）；失败退恒速。
+            grid2 = _refit_grid(onset_fine, sr, P, phase, 0.0, duration)
+            if grid2 is not None:
+                beat_times = grid2
+            else:
+                k_end = int(np.floor((duration - phase) / P + 1e-9))
+                beat_times = phase + np.arange(0, k_end + 1) * P
+        # 三连音档修正：检测档比真拍密 3/2 倍（真拍 87 被八分音符能量带到
+        # 130.5）时，节拍器会每 2 拍敲 3 下——听感是「一拍打 3 下」。判据见
+        # DOTTED_THIRD_RATIO 的注释。放在附点修正之后：附点先处理 3/4、3/2，
+        # 两者改动的方向相反，不会连环触发（实测全库无一段同时满足两者）。
+        P3, phase3 = _third_level_fix(onset_fine, sr, P, phase)
+        if (P3, phase3) != (P, phase):
+            P, phase = P3, phase3
             grid2 = _refit_grid(onset_fine, sr, P, phase, 0.0, duration)
             if grid2 is not None:
                 beat_times = grid2

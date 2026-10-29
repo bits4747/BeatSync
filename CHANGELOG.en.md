@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.4.1**. Every release bumps the version
+**Versioning rules**: current version **1.4.2**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -18,6 +18,47 @@ The same version number must stay consistent in three places: this file,
 `_packaging/BeatSync.iss`.
 
 ---
+
+## [1.4.2] — 2026-10-28
+
+### Fixed
+
+- **The dotted-level correction could move to the wrong neighbour** (reported as
+  "Map of Attraction is 128 191 184 138 100, but one section came out at 94 BPM",
+  i.e. half the true value): the old rule fired whenever the 1/3 and 2/3 beat
+  positions carried beat-level energy, then picked between x3/4 and x3/2 by a
+  120 BPM perceptual anchor. But energy on those positions can also come from a
+  syncopated arrangement rather than from beat grouping — which is exactly the
+  case in 96-124s of Map of Attraction (thirds ratio 0.911, just over the 0.85
+  threshold), so it was dragged down to 94. The new criterion asks whether the
+  energy on those positions **disappears after the move**: a real dotted level
+  loses it (I Don't Need to Ask 0.979 -> 0.165, Late Dinner 0.983 -> 0.187, Long
+  Life 0.997 -> 0.358), a syncopated arrangement keeps it (Map of Attraction
+  0.888 -> 0.834, Stop Here for a While 0.888 -> 0.853). The 0.60 threshold
+  leaves ample margin on both sides, and 128 is now kept as the correct level.
+
+- **A section counted as a "triplet level" was never corrected** (reported as
+  "Stop Here for a While is a constant 86 BPM", yet the app split it into 5
+  sections with the first half measured at 130.5): when the true beat is 87 and
+  the eighth-note positions carry beat-level energy, `beat_track` locks onto
+  130.5 — three grid points per two beats — so the metronome clicks 3 times per
+  2 beats, which is heard as "three clicks per beat". A new triplet-level
+  correction moves the period by x2/3 when the candidate grid scores at least
+  1.30x the current one. Across 55 sections the ones that genuinely need it score
+  1.364~1.608 while the other 50 stay at or below 1.255, a clean separation. The
+  first 262 seconds of Stop Here for a While now measure 86.3 instead of 130.5.
+
+### Notes
+
+- Both fixes live inside `detect_tempo`: they only affect beat period/phase
+  estimation, not the output format, CLI flags or report columns.
+- Both criteria compare like with like — candidate and current levels are scored
+  with phase-free fitting. Using the incoming phase as the baseline
+  underestimates sections whose phase is off, inflating the ratio and firing by
+  mistake (398-412s of Stop Here for a While was once pushed from 110 to 71).
+- Library-wide check over 44 sections: only Stop Here for a While, Absolute
+  Balance, I Don't Need to Ask and Map of Attraction change; everything else is
+  bit-identical.
 
 ## [1.4.1] — 2026-10-28
 
