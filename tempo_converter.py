@@ -64,9 +64,17 @@ def _setup_numba_cache() -> str:
 
     这里放在公共模块顶层，保证**任何**入口（CLI / 桌面壳 / tkinter 界面）
     都一定先经过它，不依赖各入口自己记得设置。
+
+    另有一个只有打包版才会踩的坑：PyInstaller 冻结进去的 py 模块，
+    `co_filename` 是**相对路径**（`librosa\\core\\notation.py`），numba 四个内置
+    定位器都用 `os.path.exists(py_file)` 判断可用性，于是全部落空并抛
+    `cannot cache function '__o_fold': no locator available`——整个程序失去转换
+    能力，而源码运行永远复现不了。所以这里同时把定位器换成 `numba_locator.py`
+    里那个不依赖 `co_filename` 的实现（详见该模块 docstring）。
     """
     existing = os.environ.get("NUMBA_CACHE_DIR")
     if existing:
+        _register_cache_locator()
         return existing
     candidates = []
     if getattr(sys, "frozen", False):
@@ -81,10 +89,33 @@ def _setup_numba_cache() -> str:
             probe.write_text("ok", encoding="utf-8")
             probe.unlink(missing_ok=True)
             os.environ["NUMBA_CACHE_DIR"] = str(cache)
-            return str(cache)
+            break
         except Exception:  # noqa: BLE001
             continue
-    return ""
+    _register_cache_locator()
+    return os.environ.get("NUMBA_CACHE_DIR", "")
+
+
+def _register_cache_locator() -> None:
+    """把 numba 的缓存定位器换成 `numba_locator.BeatSyncCacheLocator`。
+
+    必须在 **import numba 之前**调用：numba 在 `numba.core.config` 里一次性
+    把 `NUMBA_CACHE_LOCATOR_CLASSES` 读进 `config.CACHE_LOCATOR_CLASSES`。
+
+    值为「带点的完整模块路径」——不带点的写法会被 numba 当成它自己模块内的
+    全局名，找不到就直接 RuntimeError。所以这里必须是 `numba_locator.BeatSyncCacheLocator`，
+    而这个模块本身也要能被导入（打包版靠 spec 的 hiddenimports 收进去）。
+
+    只有在真的能导入时才设置：万一某个环境里模块缺失，退回 numba 原生行为，
+    比让整个程序起不来好。
+    """
+    if os.environ.get("NUMBA_CACHE_LOCATOR_CLASSES"):
+        return
+    try:
+        import numba_locator  # noqa: F401  确认可导入，顺便给 PyInstaller 一个静态线索
+    except Exception:  # noqa: BLE001
+        return
+    os.environ["NUMBA_CACHE_LOCATOR_CLASSES"] = "numba_locator.BeatSyncCacheLocator"
 
 
 NUMBA_CACHE_DIR = _setup_numba_cache()

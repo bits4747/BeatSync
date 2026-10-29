@@ -26,6 +26,11 @@ hiddenimports = []
 # tkinter 兜底界面（tempo_converter_gui）在 app 里是函数内动态 import，
 # 静态分析抓不到；显式加入，保证冻结版设 TMC_FORCE_TK=1 时也能走 tkinter。
 hiddenimports += ['tempo_converter_gui', 'tkinter', 'tkinter.ttk', 'tkinter.messagebox', 'tkinter.scrolledtext', 'tkinter.filedialog']
+# numba 的自定义缓存定位器：tempo_converter 通过环境变量
+# NUMBA_CACHE_LOCATOR_CLASSES=numba_locator.BeatSyncCacheLocator 注册它，numba 在
+# import 期按字符串**动态导入**，静态分析抓不到。漏了它，打包版会在 import librosa
+# 阶段抛「cannot cache function '__o_fold': no locator available」而失去转换能力。
+hiddenimports += ['numba_locator']
 tmp_ret = collect_all('librosa')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('numba')

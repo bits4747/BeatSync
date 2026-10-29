@@ -42,6 +42,19 @@
 
 ### 修复
 
+- **打包版无法转换任何文件（v1.4.2 及更早的 exe 一直存在）**。PyInstaller 冻结
+  进去的 py 模块 `co_filename` 是**相对路径**（`librosa\core\notation.py`），
+  numba 的四个内置缓存定位器都用 `os.path.exists(py_file)` 判断可用性，于是全部
+  落空并抛 `cannot cache function '__o_fold': no locator available for file
+  'librosa\core\notation.py'`——异常发生在 `import librosa` 阶段，程序直接失去
+  转换能力，报告里只留一行「失败: cannot cache function ...」，而**源码运行永远
+  复现不了**（那里 `co_filename` 是绝对路径）。新增 `numba_locator.py`：一个不看
+  `co_filename` 是否存在的定位器，缓存目录用 `NUMBA_CACHE_DIR`、子目录名用
+  `py_file` 字符串本身的哈希（不用 `abspath`，否则同一次安装会在每个启动目录下
+  建一份缓存）、冻结版用 exe 的 mtime/size 当源码戳。通过
+  `NUMBA_CACHE_LOCATOR_CLASSES=numba_locator.BeatSyncCacheLocator` 注册（numba
+  只认「带点」的完整模块路径）。
+
 - **偏好文件读不出来时不再被默认值覆盖**。原来的行为是：`ui_prefs.json` 一旦
   损坏或被占用，程序静默回退到默认值，然后你在界面上随便点一下，默认值就被
   写回磁盘——你原来的全部设置就没了。现在读失败时本次会话不保存，并把那份读不

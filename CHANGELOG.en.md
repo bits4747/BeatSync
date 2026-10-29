@@ -52,6 +52,22 @@ The same version number must stay consistent in three places: this file,
 
 ### Fixed
 
+- **Packaged builds could not convert anything (present in every exe up to and
+  including v1.4.2)**. In a PyInstaller build the frozen py modules carry a
+  **relative** `co_filename` (`librosa\core\notation.py`), and all four of numba's
+  built-in cache locators gate on `os.path.exists(py_file)`, so every one of them
+  declines and numba raises `cannot cache function '__o_fold': no locator
+  available for file 'librosa\core\notation.py'`. That happens during
+  `import librosa`, so the program loses all conversion ability and the report
+  shows only "failed: cannot cache function ...", while **running from source can
+  never reproduce it** (there `co_filename` is absolute). Added
+  `numba_locator.py`: a locator that does not check whether `co_filename` exists —
+  it caches under `NUMBA_CACHE_DIR`, names subdirectories from a hash of the
+  `py_file` string itself (not `abspath`, which would create one cache per launch
+  directory), and uses the exe's mtime/size as the source stamp when frozen.
+  Registered via `NUMBA_CACHE_LOCATOR_CLASSES=numba_locator.BeatSyncCacheLocator`
+  (numba only accepts the dotted full-module form).
+
 - **An unreadable settings file is no longer overwritten with defaults**. The old
   behaviour: once `ui_prefs.json` was corrupt or locked, the program silently fell
   back to defaults, and the next click in the UI wrote those defaults back to
