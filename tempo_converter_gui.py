@@ -263,6 +263,10 @@ class App:
         self._scan_cancel = False
         self._stopped = False
         self._heartbeat = time.time()
+        # 用户本次会话导入的自定义节拍器音色：{显示标签: "import:完整路径"}。
+        # 不落盘——路径写进 ui_prefs 也就够用了（见 _on_tray_pref_changed），
+        # 而这里的表只是让下拉框在本会话里能显示与反查。
+        self._custom_timbres: dict = {}
 
         # body 是一个可重建容器：切换中/EN 语言时销毁并重建它，
         # 从而让所有按当前语言读取的文案（tc.tr / labels()）即时刷新。
@@ -302,15 +306,27 @@ class App:
     def _load_tray_prefs(self):
         """读偏好 + 探活。必须在 `_build_ui()` 之前跑：界面要按偏好画复选框。"""
         self._prefs = tray_icon.load_prefs(self._prefs_dir())
+        # 记下「这次有没有真的读到文件」：读不出来（损坏/被占用）时，界面上的
+        # 复选框显示的是默认值，用户一旦碰它就会把磁盘上那份真设置覆盖掉。
+        self._prefs_health = tray_icon.prefs_health()
         self._tray_ok, self._tray_why = tray_icon.probe_available()
         self._quitting = False
 
     def _on_tray_pref_changed(self):
         """界面上的复选框：写回 `ui_prefs.json`，网页端下次启动会看到同一个值。"""
+        h = getattr(self, "_prefs_health", None) or {}
+        if not h.get("ok", True) and h.get("exists"):
+            # 磁盘上那份读不出来 → 本次不写盘，避免用界面默认值覆盖用户设置
+            self._set_status_text(self.T(
+                "偏好文件这次读不出来，为免覆盖你的设置，本次不保存",
+                "Settings file unreadable; not saving to avoid overwriting it"))
+            self.var_close_to_tray.set(bool(self._prefs.get("close_to_tray")))
+            return
         try:
             self._prefs = tray_icon.save_prefs(
                 {"close_to_tray": bool(self.var_close_to_tray.get())},
                 self._prefs_dir())
+            self._prefs_health = tray_icon.prefs_health()
         except Exception:  # noqa: BLE001
             pass
 
@@ -410,8 +426,7 @@ class App:
 
     def _snapshot_state(self) -> dict:
         """记录当前用户输入，供 _rebuild 后原样恢复。"""
-        timbre_key = TIMBRE_LABELS.get(self.var_timbre.get(),
-                                       TIMBRE_LABELS_EN.get(self.var_timbre.get()))
+        timbre_key = self._cur_timbre_key()
         engine_key = ENGINE_LABELS.get(self.var_engine.get(),
                                        ENGINE_LABELS_EN.get(self.var_engine.get()))
         return {
@@ -421,6 +436,7 @@ class App:
             "detect_only": self.var_detect_only.get(),
             "metronome": self.var_metronome.get(),
             "timbre_key": timbre_key,
+            "custom_timbres": dict(self._custom_timbres),
             "gain": self.var_gain.get(),
             "engine_key": engine_key,
             "fmt": self.var_format.get(),
@@ -439,7 +455,10 @@ class App:
         self.var_bpm.set(s["bpm"])
         self.var_detect_only.set(s["detect_only"])
         self.var_metronome.set(s["metronome"])
-        self.var_timbre.set(_label_for_key(timbre_labels(), s["timbre_key"]))
+        # 自定义音色要先把表恢复回去，否则下拉框里没有那个标签、选不中
+        self._custom_timbres = dict(s.get("custom_timbres") or {})
+        self._refresh_timbre_values()
+        self.var_timbre.set(self._label_for_timbre_key(s["timbre_key"]))
         self.var_gain.set(s["gain"])
         self.var_engine.set(_label_for_key(engine_labels(), s["engine_key"]))
         self.var_format.set(s["fmt"])
@@ -452,6 +471,56 @@ class App:
         self._sync_mirror_state()
         self._limit_hint_update()
         self._set_status_text(s["status"])
+
+    # ---------- 自定义节拍器音色 ----------
+    @staticmethod
+    def _custom_label(key: str) -> str:
+        """自定义音色键 → 下拉框显示标签。用「♪ 文件名」，一眼认出不是内置的。"""
+        p = tc.custom_timbre_path(key)
+        return f"♪ {p.name if p is not None else key}"
+
+    def _refresh_timbre_values(self):
+        """把下拉框的可选项重算一遍（内置标签 + 本会话导入的自定义项）。"""
+        cmb = getattr(self, "cmb_timbre", None)
+        if cmb is None:
+            return
+        cmb["values"] = list(timbre_labels()) + list(self._custom_timbres)
+
+    def _cur_timbre_key(self):
+        """下拉框当前文字 → 音色 key（内置或自定义）。"""
+        lab = self.var_timbre.get()
+        if lab in self._custom_timbres:
+            return self._custom_timbres[lab]
+        return (timbre_labels().get(lab)
+                or TIMBRE_LABELS.get(lab) or TIMBRE_LABELS_EN.get(lab))
+
+    def _label_for_timbre_key(self, key):
+        """音色 key → 当前语言的下拉框标签（切换语言/重建时保持选择）。"""
+        if key and tc.is_custom_timbre(key):
+            lab = self._custom_label(key)
+            self._custom_timbres[lab] = key
+            self._refresh_timbre_values()
+            return lab
+        return _label_for_key(timbre_labels(), key)
+
+    def _pick_custom_timbre(self):
+        """选一个音频文件当节拍器音色。只记路径，读取与裁剪留到生成时做。"""
+        from tkinter import filedialog
+        p = filedialog.askopenfilename(
+            title=self.T("选择节拍器音色（一段短音频）",
+                         "Pick a click sound (a short audio file)"),
+            filetypes=[(self.T("音频文件", "Audio files"),
+                        "*.wav *.mp3 *.flac *.ogg *.aif *.aiff"), ("*", "*.*")])
+        if not p:
+            return
+        key = tc.custom_timbre(p)
+        lab = self._custom_label(key)
+        self._custom_timbres[lab] = key
+        self._refresh_timbre_values()
+        self.var_timbre.set(lab)
+        self.var_metronome.set(True)
+        self._set_status_text(self.T(f"已载入节拍器音色：{Path(p).name}",
+                                     f"Loaded click sound: {Path(p).name}"))
 
     def _set_status_text(self, text: str):
         """把状态文字按当前语言重新呈现。中文是基准态，逐字保留；
@@ -538,8 +607,17 @@ class App:
         tl = timbre_labels()
         default_timbre = _label_for_key(tl, "woodblock")
         self.var_timbre = tk.StringVar(value=default_timbre)
-        ttk.Combobox(g, textvariable=self.var_timbre, state="readonly",
-                     values=list(tl), width=22).grid(row=2, column=1, sticky="w", padx=4)
+        # 音色 = 下拉框 + 「载入自定义…」：内置只有 6 种，用户常想用自己的采样。
+        # 自定义项的显示标签用「♪ 文件名」，中英一致（就是文件名），所以在
+        # 切换语言重建界面时不会丢失（见 _snapshot_state / _restore_state）。
+        timbre_cell = ttk.Frame(g)
+        timbre_cell.grid(row=2, column=1, sticky="w", padx=4)
+        self.cmb_timbre = ttk.Combobox(timbre_cell, textvariable=self.var_timbre,
+                                       state="readonly", width=18,
+                                       values=list(tl) + list(self._custom_timbres))
+        self.cmb_timbre.pack(side="left")
+        ttk.Button(timbre_cell, text=self.T("载入…", "Load…"), width=6,
+                   command=self._pick_custom_timbre).pack(side="left", padx=(4, 0))
         ttk.Label(g, text=self.T("变速引擎:", "Time-stretch engine:")).grid(row=2, column=2, sticky="e", padx=4)
         el = engine_labels()
         self.var_engine = tk.StringVar(value=list(el)[0])
@@ -988,8 +1066,7 @@ class App:
                 return None
         out_dir = Path(self.var_out_dir.get()) if self.var_out_dir.get().strip() else None
         # 语言一致性兜底：下拉框当前文字在两张表里都查一遍（正常切换时已对齐）。
-        tlabel = self.var_timbre.get()
-        tkey = timbre_labels().get(tlabel, TIMBRE_LABELS.get(tlabel, TIMBRE_LABELS_EN.get(tlabel)))
+        tkey = self._cur_timbre_key()
         elabel = self.var_engine.get()
         ekey = engine_labels().get(elabel, ENGINE_LABELS.get(elabel, ENGINE_LABELS_EN.get(elabel)))
         return tc.ConvertOptions(

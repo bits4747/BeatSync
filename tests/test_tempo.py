@@ -262,6 +262,224 @@ def test_limit_still_rejects_clearly_out_of_range():
     assert tc.choose_stretched_tempo(105.0, 90.0, max_slowdown=0.05) is None
 
 
+def test_slowdown_penalty_only_breaks_ties():
+    """0.06 的减速惩罚只该影响「幅度等价」的平手，不能改写明显更优的方案。
+
+    相位声码器 rate<1 是拼接更多分析帧，瞬态被摊平的痕迹比删帧更明显；
+    CadenceBeat 也记录了同一经验（挑出 <0.8 的档位会整档 ×2 跳到另一侧）。
+    这里守住两条「本来就不该变」的正常结论：60→180 与 180→60 都应当不变速。
+    """
+    p = tc.choose_stretched_tempo(60.0, 180.0)
+    assert p is not None and abs(p.rate - 1.0) < 1e-6
+    p = tc.choose_stretched_tempo(180.0, 60.0)
+    assert p is not None and abs(p.rate - 1.0) < 1e-6
+
+
+def test_penalty_does_not_reject_legal_slowdown():
+    """惩罚只改排序，不参与越限判定：可行的放慢方案仍必须被选中。"""
+    p = tc.choose_stretched_tempo(150.0, 100.0, max_slowdown=0.60, max_speedup=0.01)
+    assert p is not None, "只有放慢方向可行时必须选中它，不能被罚到 None"
+    assert p.rate < 1.0
+
+
+# ---------------------------------------------------------------- 手动分段
+
+def _perc(bpm: float, dur: float, acc: int = 4) -> np.ndarray:
+    return click_track(bpm, dur, SR, accent_every=acc)
+
+
+def test_parse_manual_segments_basic():
+    """每段只填结束时间；第一段起点恒 0，后段起点接前段终点。"""
+    segs, err = tc.parse_manual_segments(
+        [{"t1": 30.0, "bpm": 90}, {"t1": 60.0, "bpm": 120}], 100.0)
+    assert err == ""
+    assert len(segs) == 2
+    assert segs[0].t0 == 0.0
+    assert abs(segs[0].t1 - 30.0) < 1e-9 and abs(segs[0].bpm - 90.0) < 1e-9
+    assert abs(segs[1].t0 - 30.0) < 1e-9 and abs(segs[1].t1 - 60.0) < 1e-9
+
+
+def test_parse_manual_segments_last_end_optional():
+    """只有最后一段的结束时间可以留空，表示一直到结尾。"""
+    segs, err = tc.parse_manual_segments(
+        [{"t1": 20.0, "bpm": 100}, {"t1": None, "bpm": 140}], 55.0)
+    assert err == ""
+    assert len(segs) == 2
+    assert abs(segs[1].t1 - 55.0) < 1e-9
+
+
+def test_parse_manual_segments_rejects_missing_mid_end():
+    """中间段留空结束时间必须报错，不能猜。"""
+    segs, err = tc.parse_manual_segments(
+        [{"t1": None, "bpm": 100}, {"t1": 60.0, "bpm": 140}], 100.0)
+    assert err, "中间段缺结束时间应报错"
+    assert "第 1 段" in err
+    assert segs == []
+
+
+def test_parse_manual_segments_rejects_unordered():
+    """结束时间必须严格递增。"""
+    segs, err = tc.parse_manual_segments(
+        [{"t1": 40.0, "bpm": 100}, {"t1": 30.0, "bpm": 140}, {"t1": 90.0, "bpm": 120}],
+        100.0)
+    assert err and "第 2 段" in err
+    assert segs == []
+
+
+def test_parse_manual_segments_rejects_bad_bpm():
+    for bad in (0, -10, 1001, "abc"):
+        _segs, err = tc.parse_manual_segments([{"t1": 30.0, "bpm": bad}], 100.0)
+        assert err, f"bpm={bad!r} 应报错"
+
+
+def test_parse_manual_segments_clamps_beyond_duration():
+    """结束时间超过歌曲长度时裁到结尾，不报错（用户不知道确切时长很常见）。"""
+    segs, err = tc.parse_manual_segments([{"t1": 999.0, "bpm": 120}], 42.5)
+    assert err == ""
+    assert abs(segs[0].t1 - 42.5) < 1e-6
+
+
+def test_parse_manual_segments_accepts_pairs():
+    """也接受 [[结束秒, bpm], ...] 这种紧凑写法（CLI / 脚本用）。"""
+    segs, err = tc.parse_manual_segments([[30.0, 90], [60.0, 120]], 60.0)
+    assert err == "" and len(segs) == 2
+    assert abs(segs[0].bpm - 90.0) < 1e-9
+
+
+def test_parse_manual_segments_empty_means_off():
+    """没填任何段 → 视为没启用分段，不是错误。"""
+    for raw in (None, [], ""):
+        segs, err = tc.parse_manual_segments(raw, 60.0)
+        assert segs == [] and err == ""
+
+
+def test_manual_segment_plans_uses_user_tempo():
+    """用户填的速度必须被原样采用，不能被自动测速改写。"""
+    y = np.concatenate([_perc(90.0, 10.0), _perc(150.0, 10.0)])
+    segs = [tc.ManualSegment(0.0, 10.0, 90.0), tc.ManualSegment(10.0, 20.0, 150.0)]
+    plans, infeasible, weak = tc._manual_segment_plans(y, SR, segs, 180.0, lang="zh")
+    assert infeasible is None
+    assert len(plans) == 2
+    assert abs(plans[0][2].bpm - 90.0) < 1e-9
+    assert abs(plans[1][2].bpm - 150.0) < 1e-9
+    assert all(p[2].plan is not None for p in plans), "两段都应算得出方案"
+    assert weak == [], f"填对了不该有 weak 段，实际 {weak}"
+
+
+def test_manual_segment_plans_flags_mismatched_tempo():
+    """填的 BPM 与该段实际起音对不上时只提示（weak），不拒绝执行。"""
+    y = _perc(120.0, 20.0)
+    segs = [tc.ManualSegment(0.0, 20.0, 47.0)]
+    plans, infeasible, weak = tc._manual_segment_plans(y, SR, segs, 180.0, lang="zh")
+    assert infeasible is None and len(plans) == 1, "用户显式指定的速度必须被执行"
+    assert weak == [1], f"应提示第 1 段对不上，实际 {weak}"
+
+
+def test_manual_segment_plans_reports_infeasible():
+    """某段超出加减速上限 → 返回 infeasible，调用方整首跳过（不悄悄退回整曲）。"""
+    y = _perc(120.0, 12.0)
+    segs = [tc.ManualSegment(0.0, 12.0, 120.0)]
+    plans, infeasible, _weak = tc._manual_segment_plans(
+        y, SR, segs, 180.0, max_slowdown=0.01, max_speedup=0.01, lang="zh")
+    assert infeasible is not None
+    assert plans == []
+    assert infeasible[2] > 0 and infeasible[3]
+
+
+def test_manual_segment_grid_is_constant_interval():
+    """手动段生成的拍网格必须等距（否则节拍器会变机关枪）。"""
+    y = _perc(100.0, 15.0)
+    segs = [tc.ManualSegment(0.0, 15.0, 100.0)]
+    plans, _inf, _weak = tc._manual_segment_plans(y, SR, segs, 100.0, lang="zh")
+    beats = np.asarray(plans[0][2].beats, dtype=float)
+    assert len(beats) > 5
+    gaps = np.diff(beats)
+    period = 60.0 / 100.0
+    dev = float(np.max(np.abs(gaps - period))) / period
+    assert dev < 0.02, f"网格间距偏离名义拍长 {dev * 100:.1f}%"
+
+
+def test_manual_segments_option_default_none():
+    """默认不开手动分段，老行为一字不变。"""
+    assert tc.ConvertOptions().manual_segments is None
+
+
+# ---------------------------------------------------------------- 自定义节拍音
+
+def test_custom_timbre_key_roundtrip(tmp_path: Path):
+    p = tmp_path / "mine.wav"
+    p.write_bytes(b"RIFF")
+    key = tc.custom_timbre(p)
+    assert tc.is_custom_timbre(key)
+    assert tc.custom_timbre_path(key) == p
+    # 报告表格里显示文件名，不显示整个绝对路径（会把列撑坏）
+    assert tc.timbre_name(key) == "mine.wav"
+    assert tc.is_custom_timbre("woodblock") is False
+    assert tc.custom_timbre_path("woodblock") is None
+
+
+def test_custom_timbre_click_trimmed_and_resampled(tmp_path: Path):
+    """自定义样本必须裁掉前后静音、限长，并重采样到目标采样率。"""
+    import soundfile as sf
+
+    src = 48000
+    n = int(0.4 * src)
+    x = np.zeros(n, dtype=np.float32)
+    # 前面留 0.06 秒静音：用户裁不准很常见，不裁就会让每次点击整体偏后
+    start = int(0.06 * src)
+    L = int(0.02 * src)
+    t = np.arange(L) / src
+    env = np.exp(-t / 0.01)
+    x[start:start + L] = (0.9 * np.sin(2 * np.pi * 900 * t) * env).astype(np.float32)
+    p = tmp_path / "click.wav"
+    sf.write(str(p), x, src)
+
+    y = tc.synth_click(tc.custom_timbre(p), SR, np.random.default_rng(1))
+    assert len(y) / SR <= tc.CUSTOM_MAX_SEC + 1e-6, "应当被限长"
+    assert float(np.abs(y).max()) > 0.9, "应当归一化到接近满幅"
+    head = float(np.abs(y[:int(0.005 * SR)]).max())
+    assert head > 0.2, f"音头被预卷静音推后了（前 5ms 峰值仅 {head:.3f}）"
+
+
+def test_custom_timbre_too_short_raises(tmp_path: Path):
+    import soundfile as sf
+
+    p = tmp_path / "tiny.wav"
+    sf.write(str(p), np.full(int(0.004 * SR), 0.3, dtype=np.float32), SR)
+    try:
+        tc.synth_click(tc.custom_timbre(p), SR, np.random.default_rng(1))
+    except RuntimeError as e:
+        assert "太短" in str(e) or "short" in str(e).lower()
+    else:
+        raise AssertionError("过短的样本应当报错而不是静默当节拍音")
+
+
+def test_custom_timbre_missing_file_raises(tmp_path: Path):
+    try:
+        tc.synth_click(tc.custom_timbre(tmp_path / "nope.wav"), SR,
+                       np.random.default_rng(1))
+    except RuntimeError as e:
+        msg = str(e).lower()
+        assert "找不到" in str(e) or "not found" in msg or "no such" in msg
+    else:
+        raise AssertionError("文件不存在应当报错")
+
+
+def test_custom_timbre_in_click_track(tmp_path: Path):
+    """自定义音色必须能一路走到铺轨。"""
+    import soundfile as sf
+
+    p = tmp_path / "c.wav"
+    t = np.arange(int(0.05 * SR)) / SR
+    env = np.exp(-t / 0.01)
+    sf.write(str(p), (0.8 * np.sin(2 * np.pi * 1200 * t) * env).astype(np.float32), SR)
+    key = tc.custom_timbre(p)
+    out = tc.build_click_track(int(2 * SR), SR, [0.0, 0.5, 1.0, 1.5], key,
+                               np.random.default_rng(2))
+    assert out.shape == (2 * SR,)
+    assert float(np.abs(out).max()) > 0
+
+
 # ---------------------------------------------------------------- 节拍网格
 
 def test_beat_grid_no_phase_drift():

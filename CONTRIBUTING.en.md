@@ -84,7 +84,7 @@ three places must agree:
 
 1. `version` in `pyproject.toml`
 2. the title of the newly added top section in `CHANGELOG.md`
-3. `MyAppVersion` in `_packaging/BeatSync.iss` (installer version; that script lives outside this repository)
+3. `MyAppVersion` in `packaging/BeatSync.iss` (installer version)
 
 How the version number should move (bug fix / new feature / breaking change) is documented at the top of
 `CHANGELOG.md`. `CHANGELOG.md` only records **user-visible behaviour**; internal refactors don't need an entry.

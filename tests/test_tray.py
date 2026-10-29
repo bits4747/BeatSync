@@ -63,6 +63,65 @@ def test_prefs_path_prefers_app_dir_when_writable(tmp_path: Path):
     assert tray.prefs_path(tmp_path) == tmp_path / tray.PREFS_FILE
 
 
+# ------------------------------------------- 读不出来时不许覆盖用户的设置
+def test_prefs_health_ok_when_missing(tmp_path: Path):
+    """没写过 ≠ 读不出来：缺文件是正常状态，不该阻止保存。"""
+    tray.load_prefs(tmp_path)
+    h = tray.prefs_health(tmp_path)
+    assert h["exists"] is False, "文件不存在，exists 必须是 False"
+    assert h["reason"] == "missing"
+    # 调用方的判定是「ok 为假 且 文件存在」才拦保存，missing 不会挡住首次保存
+    assert not (h["ok"] is False and h["exists"] is True)
+
+
+def test_prefs_health_reports_corrupt_file(tmp_path: Path):
+    """损坏的偏好文件必须被标记出来（桌面版靠它决定「这次不保存」）。"""
+    (tmp_path / tray.PREFS_FILE).write_text("{ broken", encoding="utf-8")
+    tray.load_prefs(tmp_path)
+    h = tray.prefs_health(tmp_path)
+    assert h["ok"] is False
+    assert h["exists"] is True
+    assert "corrupt" in h["reason"]
+
+
+def test_prefs_health_recovers_after_good_load(tmp_path: Path):
+    tray.save_prefs({"close_to_tray": False}, tmp_path)
+    tray.load_prefs(tmp_path)
+    assert tray.prefs_health(tmp_path)["ok"] is True
+
+
+def test_save_prefs_keeps_broken_file_as_backup(tmp_path: Path):
+    """回归：损坏的偏好文件不能被无声覆盖，必须先改名留档。
+
+    旧行为是 load 失败静默返回默认值，save 再拿这份默认值写盘——用户手改
+    坏一个字符，界面上点一下「关闭时最小化」，他原来的全部设置就没了。
+    """
+    bad = tmp_path / tray.PREFS_FILE
+    bad.write_text("{ broken", encoding="utf-8")
+    tray.save_prefs({"close_to_tray": False}, tmp_path)
+
+    backups = list(tmp_path.glob(tray.PREFS_FILE + ".bad-*"))
+    assert len(backups) == 1, f"坏文件应被改名留档，实际 {[p.name for p in backups]}"
+    assert backups[0].read_text(encoding="utf-8") == "{ broken", "留档内容必须是原样"
+    # 新文件正常写出来了
+    assert json.loads(bad.read_text(encoding="utf-8"))["close_to_tray"] is False
+    # 留档之后健康状态恢复
+    assert tray.prefs_health(tmp_path)["ok"] is True
+
+
+def test_save_prefs_no_backup_when_file_missing(tmp_path: Path):
+    """首次保存不该凭空造出 .bad-* 文件。"""
+    tray.save_prefs({"close_to_tray": True}, tmp_path)
+    assert not list(tmp_path.glob(tray.PREFS_FILE + ".bad-*"))
+
+
+def test_save_prefs_no_backup_for_healthy_file(tmp_path: Path):
+    """正常文件覆盖保存时不留档，否则每次保存都堆一个备份。"""
+    tray.save_prefs({"close_to_tray": True}, tmp_path)
+    tray.save_prefs({"close_to_tray": False}, tmp_path)
+    assert not list(tmp_path.glob(tray.PREFS_FILE + ".bad-*"))
+
+
 # --------------------------------------------------------------------- 可用性探测
 def test_probe_unavailable_when_pystray_missing():
     def importer(name):

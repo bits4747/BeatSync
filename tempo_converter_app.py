@@ -197,10 +197,25 @@ import tray_icon
 
 
 def _resource_dir() -> Path:
-    """只读资源目录（frontend 等）：打包后为 _MEIPASS，源码运行时为脚本目录。"""
+    """只读资源目录（frontend / assets）的落点。
+
+    三种形态：
+      1. 打包版（frozen）→ `_MEIPASS`（PyInstaller 解压目录）；
+      2. 源码运行 → 脚本所在目录（仓库根，frontend/ 与 assets/ 就在旁边）；
+      3. `pip install` 版 → 脚本在 site-packages 里，界面与图标被 data-files
+         装到了 `<prefix>/frontend`、`<prefix>/assets`，所以回落到 sys.prefix。
+    判断依据是「候选目录下真的有 frontend/index.html」，而不是看装没装成包——
+    顶层 py-module 无法用 `__file__` 的目录结构区分这两种情况。
+    """
     if getattr(sys, "frozen", False):
         return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
-    return Path(__file__).parent
+    here = Path(__file__).parent
+    if (here / "frontend" / "index.html").is_file():
+        return here
+    prefix = Path(sys.prefix)
+    if (prefix / "frontend" / "index.html").is_file():
+        return prefix
+    return here
 
 
 def _work_dir() -> Path:
@@ -225,6 +240,9 @@ FRONTEND = _resource_dir() / "frontend" / "index.html"
 # 偏好落盘在 APP_DIR（打包版 = exe 同级，源码运行 = 脚本目录），tkinter 兼容界面
 # 读的是**同一份**文件，所以两边开关互相认。
 PREFS = tray_icon.load_prefs(APP_DIR)
+# 读盘结果快照：ok=False 表示这次没读到真文件（不存在 / 损坏 / 被占用）。
+# 之后 set_close_to_tray 写盘前先问一次——不拿界面上的默认值覆盖磁盘上的真设置。
+PREFS_HEALTH = tray_icon.prefs_health()
 _TRAY_OK, _TRAY_WHY = tray_icon.probe_available()
 
 # 托盘控制器与「正在真退出」标记：closing 处理器要靠它区分「点 × 收托盘」
@@ -487,22 +505,64 @@ class Api:
 
     # ---------- 音色试听 ----------
     def preview_timbre(self, timbre: str):
-        """合成一小段节拍器样本，返回 WAV data URL 供前端播放。"""
-        if timbre not in tc.TIMBRES:
+        """合成一小段节拍器样本，返回 WAV data URL 供前端播放。
+
+        `timbre` 可以是内置音色，也可以是自定义音色键（`import:路径`）。
+        自定义采样读不出来时返回空串——前端会当成"没声音"，同时在日志里
+        留一行说明，不至于让用户对着静音猜。
+        """
+        if not timbre:
+            return ""
+        if timbre not in tc.TIMBRES and not tc.is_custom_timbre(timbre):
             return ""
         sr = 44100
         bpm = 120.0
         n = int((4 * 60.0 / bpm + 0.5) * sr)
         rng = np.random.default_rng(7)
         times = [k * 60.0 / bpm for k in range(4)]
-        track = tc.build_click_track(n, sr, times, timbre, rng,
-                                     music_rms_db=-18.0, rel_db=-6.0)
+        try:
+            track = tc.build_click_track(n, sr, times, timbre, rng,
+                                         music_rms_db=-18.0, rel_db=-6.0)
+        except Exception as exc:  # noqa: BLE001
+            self._emit({"type": "log", "text": str(exc)})
+            return ""
         buf = io.BytesIO()
         sf.write(buf, track, sr, format="WAV", subtype="PCM_16")
         return "data:audio/wav;base64," + base64.b64encode(buf.getvalue()).decode()
 
+    def pick_timbre_file(self, lang=None):
+        """选一个音频文件当节拍器音色，返回 `import:` 键（取消返回空串）。
+
+        只做选择与存在性检查，**不在这里读音频**：读与裁剪在真正生成时做
+        （`synth_click`），这样用户即使选的是一首 5 分钟的歌也不会有卡顿，
+        而且写进 ui 偏好的只是一个路径字符串。
+        """
+        _l = lang or tc.get_lang()
+        types = (tc.tr("音频文件 (*.wav;*.mp3;*.flac;*.ogg;*.aif;*.aiff)",
+                       "Audio files (*.wav;*.mp3;*.flac;*.ogg;*.aif;*.aiff)", _l),
+                 tc.tr("所有文件 (*.*)", "All files (*.*)", _l))
+        try:
+            res = webview.windows[0].create_file_dialog(
+                webview.OPEN_DIALOG, allow_multiple=False, file_types=types)
+        except Exception:  # noqa: BLE001
+            return ""
+        if not res:
+            return ""
+        p = str(res[0] if isinstance(res, (list, tuple)) else res)
+        if not Path(p).is_file():
+            return ""
+        return tc.custom_timbre(p)
+
     # ---------- 批量处理 ----------
-    def start(self, paths, opts, roots=None):
+    def start(self, paths, opts, roots=None, per_file=None):
+        """开始批量处理。
+
+        per_file：可选的逐曲覆盖表，与 paths 平行（`[{...}|null, ...]`），每项可含
+            `bpm`   这一首的原速（覆盖全局 manualBpm）
+            `segments`  手写分段 `[{"t1": 结束秒, "bpm": 原速}, ...]`，最后一段
+                        t1 可留空=到结尾；给了它就按用户填的速度分段处理
+        逐曲覆盖只作用于**该文件本身**（文件夹展开出来的子文件没有覆盖项）。
+        """
         opts = opts or {}
         _l = str(opts.get("lang") or "").strip().lower()
         lang = _l if _l in ("zh", "en") else tc.get_lang()
@@ -577,10 +637,53 @@ class Api:
             segments=(opts.get("segments") if opts.get("segments") not in (None, "") else "auto"),
             lang=lang,
         )
+        # 逐曲覆盖：与 paths 平行对齐（前端按输入项逐个回传）。先在这里把数据
+        # 校验一遍——填错的分段要在点「开始」时立刻报错，而不是跑到那首歌才失败。
+        overrides = {}
+        pf = list(per_file or [])
+        if len(pf) == len(paths):
+            for p, item in zip(paths, pf):
+                if not isinstance(item, dict):
+                    continue
+                ov, err = self._parse_override(item)
+                if err:
+                    return {"ok": False,
+                            "error": tc.tr(f"{Path(p).name}：", f"{Path(p).name}: ", lang) + err}
+                if ov:
+                    overrides[str(p)] = ov
         self.stop_event.clear()
-        self.worker = threading.Thread(target=self._run, args=(files, opt, base_of), daemon=True)
+        self.worker = threading.Thread(target=self._run,
+                                       args=(files, opt, base_of, overrides), daemon=True)
         self.worker.start()
         return {"ok": True, "count": len(files)}
+
+    @staticmethod
+    def _parse_override(item: dict):
+        """校验一条逐曲覆盖，返回 (override|None, 错误文案)。
+
+        只挑出真正填了东西的项：全空的覆盖表等价于「这一首用全局设置」，
+        不该在 overrides 里留一条空记录（否则 process_file 会以为有手动值）。
+        """
+        ov = {}
+        raw_bpm = item.get("bpm")
+        if raw_bpm is not None and str(raw_bpm).strip() != "":
+            try:
+                v = float(str(raw_bpm).strip())
+            except (TypeError, ValueError):
+                return None, tc.tr("原速 BPM 必须是正数", "Original BPM must be a positive number",
+                                   item.get("_lang"))
+            if not (v > 0) or v > 1000.0:
+                return None, tc.tr("原速 BPM 必须是 1–1000 之间的正数",
+                                   "Original BPM must be a positive number below 1000",
+                                   item.get("_lang"))
+            ov["bpm"] = v
+        raw_segs = item.get("segments")
+        if raw_segs:
+            if not isinstance(raw_segs, (list, tuple)):
+                return None, tc.tr("分段数据格式不对", "Malformed segment data",
+                                   item.get("_lang"))
+            ov["segments"] = raw_segs
+        return (ov or None), ""
 
     def stop(self):
         self.stop_event.set()
@@ -595,7 +698,36 @@ class Api:
             "tray_available": bool(_TRAY_OK),
             "tray_reason": "" if _TRAY_OK else _TRAY_WHY,
             "note": tc.tr("关闭窗口时收进系统托盘", "Hide to the system tray on close", L),
+            # 自定义节拍器音色：只回传仍然存在的文件（换机器/移动/删除后
+            # 那条就该消失，而不是留在列表里点了没声音）。
+            "custom_timbres": [
+                {"key": tc.custom_timbre(p), "name": Path(p).name}
+                for p in (PREFS.get("custom_timbres") or [])
+                if isinstance(p, str) and Path(p).is_file()
+            ],
         }
+
+    def remember_timbre(self, key, lang=None):
+        """把用户导入的自定义音色记进 ui_prefs（下次启动还在下拉框里）。
+
+        只存路径列表，最多留最近 8 个——再堆下去下拉框就没法用了。
+        """
+        global PREFS, PREFS_HEALTH
+        p = tc.custom_timbre_path(key)
+        if p is None or not p.is_file():
+            return {"ok": False}
+        old = [x for x in (PREFS.get("custom_timbres") or []) if isinstance(x, str)]
+        s = str(p)
+        old = [x for x in old if x.lower() != s.lower()]
+        old.insert(0, s)
+        old = old[:8]
+        if PREFS_HEALTH["ok"] or not PREFS_HEALTH["exists"]:
+            PREFS = tray_icon.save_prefs({"custom_timbres": old}, APP_DIR)
+            PREFS_HEALTH = tray_icon.prefs_health()
+        return {"ok": True, "custom_timbres": [
+            {"key": tc.custom_timbre(x), "name": Path(x).name}
+            for x in old if Path(x).is_file()
+        ]}
 
     def set_close_to_tray(self, value, lang=None):
         """保存「关闭窗口时收进托盘」开关。返回落盘后的完整偏好。
@@ -603,26 +735,52 @@ class Api:
         同时同步托盘菜单的文案语言：托盘图标是按需创建的，创建时读 `TRAY.lang`，
         所以要在用户切语言后再改一次，否则英文界面弹出中文菜单。
         """
-        global PREFS
+        global PREFS, PREFS_HEALTH
         L = str(lang or "").strip().lower()
         if L in ("zh", "en"):
             TRAY.lang = L
+        # 磁盘上的偏好在启动时没读出来（损坏/被占用/权限）→ 本次会话不写盘，
+        # 否则会拿界面上的默认值把用户原来的设置冲掉。只回报「未保存」。
+        if not PREFS_HEALTH["ok"] and PREFS_HEALTH["exists"]:
+            return {"ok": False, "close_to_tray": bool(PREFS.get("close_to_tray")),
+                    "warning": tc.tr(
+                        "偏好文件这次读不出来，为避免覆盖你原来的设置，本次不保存",
+                        "The settings file could not be read this time; "
+                        "not saving, to avoid overwriting your existing settings", L)}
         PREFS = tray_icon.save_prefs({"close_to_tray": bool(value)}, APP_DIR)
+        PREFS_HEALTH = tray_icon.prefs_health()
         return {"ok": True, "close_to_tray": bool(PREFS.get("close_to_tray"))}
 
-    def _run(self, files, opt, base_of=None):
+    def _run(self, files, opt, base_of=None, overrides=None):
         rows, ok, fail, skipped = [], 0, 0, 0
         total = len(files)
         L = getattr(opt, "lang", None) or tc.get_lang()
         # 每个文件所属的「用户添加的根」，用于在指定输出目录时镜像原目录层级
         base_of = base_of or {}
+        overrides = overrides or {}
         self._emit({"type": "started", "total": total})
         for i, p in enumerate(files):
             if self.stop_event.is_set():
                 self._emit({"type": "log", "text": tc.tr("已停止。", "Stopped.", L)})
                 break
             self._emit({"type": "file-status", "path": str(p), "status": "running", "index": i + 1})
-            row = tc.process_file(p, opt, rel_base=base_of.get(str(p)),
+            # 逐曲覆盖：用 dataclasses.replace 派生一份临时 opt，不动批量共用的那份
+            # （后面的文件还要用全局设置）。字段语义见 ConvertOptions.manual_segments。
+            file_opt = opt
+            ov = overrides.get(str(p))
+            if ov:
+                import dataclasses
+                patch = {}
+                if "bpm" in ov:
+                    patch["bpm"] = float(ov["bpm"])
+                if "segments" in ov:
+                    patch["manual_segments"] = ov["segments"]
+                    patch["bpm"] = None      # 分段自带每段速度，全局原速让位
+                file_opt = dataclasses.replace(opt, **patch)
+                self._emit({"type": "log", "text": tc.tr(
+                    f"  {Path(p).name}：使用逐曲手动设置",
+                    f"  {Path(p).name}: using per-file manual settings", L)})
+            row = tc.process_file(p, file_opt, rel_base=base_of.get(str(p)),
                                   log_fn=lambda m: self._emit({"type": "log", "text": str(m)}))
             rows.append(row)
             status = tc.row_status(str(row.get("备注") or ""))

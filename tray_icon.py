@@ -25,6 +25,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 
 # 偏好文件名：和转换报告、app_error.log 放在同一处（可写的工作目录）。
 PREFS_FILE = "ui_prefs.json"
@@ -32,6 +33,11 @@ PREFS_FILE = "ui_prefs.json"
 # 默认值刻意是 True：用户提这个需求的原话是「关闭软件后收到系统托盘，不完全退出」，
 # 也就是他期望的默认行为。仍然给开关，方便想「点 × 就退出」的人关掉。
 DEFAULT_PREFS = {"close_to_tray": True}
+
+# 上一次 load_prefs 是否真的从磁盘读到了内容（而不是退回默认值）。
+# 见 prefs_health() 与 save_prefs 的注释：读不出来时不能拿默认值覆盖磁盘。
+LAST_LOAD_OK: bool = True
+LAST_LOAD_REASON: str = ""
 
 
 def _default_importer(name: str):
@@ -94,6 +100,24 @@ def _candidate_dirs() -> list[Path]:
     return out
 
 
+def _icon_dirs() -> list[Path]:
+    """找图标时额外要看的目录（不影响偏好文件落点）。
+
+    `pip install` 版把 assets/ 装在 `<prefix>/assets`（data-files），模块本身在
+    site-packages 里、旁边没有 assets/，所以这里补一个 sys.prefix。刻意不塞进
+    `_candidate_dirs()`：那个列表同时决定 ui_prefs.json 写哪，把解释器目录列进去
+    会让偏好写进 anaconda3 根目录。
+    """
+    out = _candidate_dirs()
+    try:
+        prefix = Path(sys.prefix)
+        if prefix not in out:
+            out.append(prefix)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def find_icon() -> str | None:
     """找软件自己的图标文件（assets/icon.ico 或 icon.png），找不到返回 None。
 
@@ -102,7 +126,7 @@ def find_icon() -> str | None:
     漏传（桌面版最初就是这样）时这里仍能拿到真图标。
     """
     seen: set[str] = set()
-    for d in _candidate_dirs():
+    for d in _icon_dirs():
         for name in ("icon.ico", "icon.png"):
             p = d / "assets" / name
             key = str(p).lower()
@@ -140,14 +164,30 @@ def load_prefs(app_dir=None) -> dict:
 
     文件内容是用户可编辑的 JSON，写坏了是常态（手动改、断电写一半、同步盘冲突），
     这里一律当作「没设置过」，而不是让程序启动失败。
+
+    **但「没设置过」和「读不出来」必须能区分**：调用方要是把返回的默认值当成
+    用户的真实设置再写回去，就会把磁盘上那份（可能只是暂时读不出来的）偏好
+    覆盖掉。所以这里同时更新模块级 `LAST_LOAD_OK` / `LAST_LOAD_REASON`，
+    `save_prefs` 也据此决定要不要先备份坏文件。见 `prefs_health()`。
     """
+    global LAST_LOAD_OK, LAST_LOAD_REASON
     out = dict(DEFAULT_PREFS)
+    path = prefs_path(app_dir)
     try:
-        raw = json.loads(prefs_path(app_dir).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        LAST_LOAD_OK, LAST_LOAD_REASON = False, "missing"
+        return out
+    except OSError as exc:
+        LAST_LOAD_OK, LAST_LOAD_REASON = False, f"unreadable: {exc}"
+        return out
+    except ValueError as exc:
+        LAST_LOAD_OK, LAST_LOAD_REASON = False, f"corrupt: {exc}"
         return out
     if not isinstance(raw, dict):
+        LAST_LOAD_OK, LAST_LOAD_REASON = False, "not-an-object"
         return out
+    LAST_LOAD_OK, LAST_LOAD_REASON = True, ""
     for key, default in DEFAULT_PREFS.items():
         if key not in raw:
             continue
@@ -161,13 +201,50 @@ def load_prefs(app_dir=None) -> dict:
     return out
 
 
+def prefs_health(app_dir=None) -> dict:
+    """上一次 `load_prefs` 的健康状况。
+
+    ok=False 且有文件存在，说明磁盘上的偏好这次没读出来（损坏/被占用/权限），
+    此时调用方**不应**把界面上的默认值写回去——那等于用默认值覆盖用户设置。
+    返回 {"ok": bool, "reason": str, "exists": bool, "path": str}。
+    """
+    path = prefs_path(app_dir)
+    try:
+        exists = path.is_file()
+    except OSError:
+        exists = False
+    return {"ok": LAST_LOAD_OK, "reason": LAST_LOAD_REASON,
+            "exists": exists, "path": str(path)}
+
+
 def save_prefs(patch: dict, app_dir=None) -> dict:
     """把 patch 里的已知键并进偏好文件，返回合并后的完整偏好。
 
     先写临时文件再 `os.replace`：直接覆盖时如果程序在这一刻被杀掉，留下的是半个
     JSON，下次启动就成了「设置丢了」。replace 在 Windows 上也是原子的。
+
+    **读不出磁盘内容时不硬写**：`load_prefs` 拿不到真文件时返回的是默认值，
+    直接合并写回就等于用默认值覆盖了磁盘上那份（可能只是暂时读不出来）。
+    这里的做法是先把坏文件改名留档（`ui_prefs.json.bad-<时间>`），再写新文件，
+    用户改坏了东西至少还能从备份里捞回来。
     """
+    global LAST_LOAD_OK, LAST_LOAD_REASON
+    target = prefs_path(app_dir)
     cur = load_prefs(app_dir)
+    if not LAST_LOAD_OK:                      # 上一次读没读到真文件
+        try:
+            exists = target.is_file()
+        except OSError:
+            exists = False
+        if exists:
+            # 磁盘上有文件但读不出来（损坏/被占用/权限）：先改名留档再写，
+            # 用户改坏了东西至少还能从备份里捞回来。
+            try:
+                bad = target.with_name(
+                    PREFS_FILE + ".bad-" + time.strftime("%Y%m%d-%H%M%S"))
+                os.replace(target, bad)
+            except OSError:
+                pass
     for key in DEFAULT_PREFS:
         if key in (patch or {}):
             default = DEFAULT_PREFS[key]
@@ -177,12 +254,12 @@ def save_prefs(patch: dict, app_dir=None) -> dict:
                     cur[key] = bool(val)
             elif isinstance(val, type(default)):
                 cur[key] = val
-    target = prefs_path(app_dir)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         tmp = target.with_name(target.name + ".tmp")
         tmp.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, target)
+        LAST_LOAD_OK, LAST_LOAD_REASON = True, ""
     except OSError:
         pass
     return cur

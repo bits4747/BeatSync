@@ -205,6 +205,8 @@ html[data-lang="en"] .timbre .t-en { display: inline; flex: 1; }
 
 .btn.ghost { background: transparent; }
 .btn.sm { padding: 6px 11px; font-size: 15px; }
+.btn.xs { padding: 3px 9px; font-size: 14px; border-radius: 7px; }
+.btn.ghost.on { border-color: var(--sel-border); background: var(--sel-bg); color: var(--accent); }
 
 .btn.primary {
   background: linear-gradient(135deg, #5f7ef2, #38b6dd);
@@ -292,6 +294,52 @@ html[data-lang="en"] .timbre .t-en { display: inline; flex: 1; }
   width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center;
 }
 .fi-btn:hover { color: var(--text); background: var(--hover-soft); }
+
+/* ---------- 逐曲手动设置 ---------- */
+/* 每个文件行底下一条：原速 BPM + tap 按钮 + 多段开关。
+   刻意做得很轻（细边框、小号字），因为大多数人不用它——它只在测错时才登场。 */
+.fi-per {
+  margin-top: 6px; padding-top: 6px;
+  border-top: 1px dashed var(--border-soft);
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+  font-size: 14.5px; color: var(--muted);
+}
+.per-label { color: var(--faint); }
+.fi-per .per-bpm { width: 88px; padding: 3px 8px; font-size: 14.5px; text-align: center; }
+.per-tap.tapping { color: var(--accent); background: var(--sel-bg); }
+.per-badge {
+  font-size: 13.5px; padding: 2px 8px; border-radius: 999px;
+  color: var(--accent); border: 1px solid var(--sel-border); background: var(--sel-bg);
+}
+
+.fi-segs {
+  margin-top: 6px; padding: 8px 10px 6px;
+  border: 1px solid var(--border-soft); border-radius: 9px;
+  background: var(--panel);
+  display: flex; flex-direction: column; gap: 6px;
+}
+.seg-head { display: flex; align-items: center; gap: 8px; font-size: 14.5px; color: var(--muted); }
+.seg-head > span:first-child { flex: 1; }
+.seg-rows { display: flex; flex-direction: column; gap: 5px; }
+.seg-row { display: flex; align-items: center; gap: 6px; }
+.seg-idx {
+  flex: none; width: 20px; text-align: center;
+  font-size: 13.5px; color: var(--faint);
+}
+.seg-t1, .seg-bpm { width: 96px; padding: 3px 8px; font-size: 14.5px; text-align: center; }
+.seg-row .fi-btn { flex: none; width: 22px; height: 22px; }
+
+/* 自定义节拍器音色：与内置音色卡片同尺寸，视觉上略轻，表示「不是内置的」 */
+.timbre.custom { border-style: dashed; }
+.timbre.timbre-load { opacity: .72; border-style: dashed; }
+.timbre.timbre-load:hover { opacity: 1; }
+.timbre.custom .t-cn, .timbre.custom .t-en,
+.timbre.timbre-load .t-cn, .timbre.timbre-load .t-en {
+  font-size: 14.5px; font-weight: 400;
+}
+.timbre.custom .t-cn, .timbre.timbre-load .t-cn {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 
 /* ---------- 设置 ---------- */
 /* 目标：窗口缩放时不用上下滚动就能看到全部设置 —— 所以行距收紧、字段两两并排、

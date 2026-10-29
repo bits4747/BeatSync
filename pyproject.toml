@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beatsync"
-version = "1.4.2"
+version = "1.5.0"
 description = "把音乐变速到目标 BPM，并叠加精确对齐的节拍器"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -44,10 +44,17 @@ Issues = "https://github.com/bits4747/BeatSync/issues"
 beatsync = "tempo_converter:main"
 
 [tool.setuptools]
+# 四个顶层模块（不是 package）。正因如此，下面的 package-data 对它们**不生效**：
+# package-data 只作用于真正的 package 目录，顶层 py-module 没有自己的目录树。
+# 界面与图标资源改走 data-files（见下），否则 pip 装出来的 wheel 里没有 frontend/，
+# 桌面版找不到 index.html 直接起不来。
 py-modules = ["tempo_converter", "tempo_converter_app", "tempo_converter_gui", "tray_icon"]
 
-[tool.setuptools.package-data]
-"*" = ["*.html", "*.js", "*.css"]
+[tool.setuptools.data-files]
+# 装到 <prefix>/frontend 与 <prefix>/assets。tempo_converter_app._resource_dir()
+# 在源码目录找不到时会回落到 sys.prefix，所以 pip 安装后界面图标同样可用。
+"frontend" = ["frontend/index.html", "frontend/app.js", "frontend/app.css"]
+"assets" = ["assets/icon.ico", "assets/icon.png", "assets/icon.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

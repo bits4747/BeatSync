@@ -171,7 +171,14 @@ TIMBRE_NAMES_EN = {
 
 
 def timbre_name(key: str, lang=None) -> str:
-    """音色键 → 当前语言显示名（未知键原样返回）。"""
+    """音色键 → 当前语言显示名（未知键原样返回）。
+
+    自定义音色（`import:...`）显示成文件名，不显示完整路径——报告表格里
+    一长串绝对路径会把列撑坏，而文件名足够用户认出是哪一段。
+    """
+    if is_custom_timbre(key):
+        p = custom_timbre_path(key)
+        return p.name if p is not None else key
     if (lang or _LANG) == "en":
         return TIMBRE_NAMES_EN.get(key, key)
     return TIMBRE_NAMES.get(key, key)
@@ -410,8 +417,15 @@ def choose_stretched_tempo(detected: float, target: float, strict: bool = False,
         rate = a2 / detected
         if rate < lo - eps or rate > hi + eps:
             continue                      # 超出用户设定的变速上限，不采用
-        # 平手时优先「每拍整数下」，其次让音乐更接近原速
-        key = (abs(math.log2(rate)), 0 if float(cpb).is_integer() else 1, cpb)
+        # 平手时优先「每拍整数下」，其次让音乐更接近原速。
+        # 减速方向加一点惩罚：同样幅度的变速，放慢比加快更容易听出「涂抹感」
+        # （相位声码器在 rate<1 时每个输出帧要拼更多分析帧，瞬态被摊平；
+        # 加快反而是丢帧，痕迹更轻）。所以两边幅度接近时优先选加快那一侧。
+        # 0.06 相当于「宁可多加快约 4%，也不多放慢约 4%」——大于测速抖动
+        # （0.5%），小于人耳对速率变化的敏感阈值（1%~2% 的几倍），只在真正
+        # 平手（差 < 0.06 个 log2 单位）时才会翻转选择。
+        penalty = 0.06 if rate < 1.0 else 0.0
+        key = (abs(math.log2(rate)) + penalty, 0 if float(cpb).is_integer() else 1, cpb)
         if best is None or key < best[0]:
             best = (key, a2, cpb)
     if best is None:
@@ -455,6 +469,97 @@ def stretch_limits_text(detected: float, target: float,
     if L == "en":
         return " and ".join(parts) + ", both beyond limits"
     return "、".join(parts) + "，均超出"
+
+
+class ManualSegment(NamedTuple):
+    """用户手写的一段：从 t0 到 t1 秒之间按 bpm（原速）处理。"""
+    t0: float
+    t1: float
+    bpm: float
+
+
+def parse_manual_segments(raw, duration: float, lang=None) -> tuple[list, str]:
+    """把界面传来的「每段结束时间 + 原速 BPM」解析成规整的段列表。
+
+    入参 raw 的形状（都接受）：
+        [{"t1": 32.5, "bpm": 128}, {"t1": None, "bpm": 96}]
+        [[32.5, 128], [None, 96]]
+        [{"end": 32.5, "bpm": 128}, ...]        # end/t1/time 同义
+
+    约定：
+        · 每项只给**结束**时间；第一段起点恒为 0，后一段起点 = 前一段终点。
+        · 最后一段可以不给结束时间（None/""/缺省），表示「一直到歌曲结束」。
+        · BPM 是**原速**（这首歌这一段本来就是这么快），不是目标速度。
+
+    返回 (segs, err)。err 非空表示整份数据不可用，调用方应跳过该文件并回报
+    原因；segs 为 [] 且 err 为空表示「用户没启用分段」。
+
+    宁可明确报错也不猜：分段错一段，整首歌的节拍器都会错位，比不生成更糟。
+    """
+    L = lang or _LANG
+    if not raw:
+        return [], ""
+    if not isinstance(raw, (list, tuple)):
+        return [], tr("分段数据格式不对", "Malformed segment data", L)
+
+    rows = []
+    for i, item in enumerate(raw, 1):
+        bpm = None
+        end = None
+        if isinstance(item, dict):
+            for k in ("bpm", "BPM", "tempo"):
+                if k in item:
+                    bpm = item[k]
+                    break
+            for k in ("t1", "end", "time", "t"):
+                if k in item:
+                    end = item[k]
+                    break
+        elif isinstance(item, (list, tuple)) and len(item) >= 2:
+            end, bpm = item[0], item[1]
+        else:
+            return [], tr(f"第 {i} 段格式不对", f"segment {i} is malformed", L)
+        try:
+            bpm = float(str(bpm).strip())
+        except (TypeError, ValueError):
+            return [], tr(f"第 {i} 段没有填 BPM", f"segment {i} has no BPM", L)
+        if not (bpm > 0) or bpm > 1000.0:
+            return [], tr(f"第 {i} 段的 BPM 必须是 1–1000 之间的正数",
+                          f"segment {i} BPM must be a positive number below 1000", L)
+        if end is None or (isinstance(end, str) and not end.strip()):
+            end = None                      # 只在最后一段有意义，下面统一处理
+        else:
+            try:
+                end = float(str(end).strip())
+            except (TypeError, ValueError):
+                return [], tr(f"第 {i} 段的结束时间不是数字",
+                              f"segment {i} end time is not a number", L)
+        rows.append([end, bpm])
+
+    segs = []
+    t0 = 0.0
+    # 计数从 1 开始：这是给人看的段号，报错里说「第 0 段」用户会一脸问号
+    for i, (end, bpm) in enumerate(rows, 1):
+        last = i == len(rows)
+        if end is None:
+            if not last:
+                return [], tr(f"第 {i} 段缺少结束时间（只有最后一段可以留空）",
+                              f"segment {i} has no end time "
+                              "(only the last one may be blank)", L)
+            end = float(duration)
+        if end <= t0 + 1e-6:
+            return [], tr(f"第 {i} 段的结束时间必须比上一段更靠后",
+                          f"segment {i} must end after the previous segment", L)
+        if end > duration + 0.5:
+            end = float(duration)           # 略微超出（浮点/手误）就裁到结尾
+        if end <= t0 + 1e-6:
+            return [], tr(f"第 {i} 段超出了歌曲长度",
+                          f"segment {i} lies beyond the end of the track", L)
+        segs.append(ManualSegment(t0, float(end), bpm))
+        t0 = float(end)
+        if t0 >= duration:
+            break                           # 后面的段落在歌外，直接忽略
+    return segs, ""
 
 
 def relation_text(clicks_per_beat: float, j: int = 0, lang=None) -> str:
@@ -1560,6 +1665,54 @@ def _segments_worthwhile(plans) -> bool:
     return lo > 0 and (hi / lo) >= SEG_MIN_SPREAD
 
 
+def _manual_segment_plans(y_mono, sr: int, segs, target: float, strict: bool = False,
+                          max_slowdown: float = DEFAULT_MAX_SLOWDOWN,
+                          max_speedup: float = DEFAULT_MAX_SPEEDUP, lang=None,
+                          mel=None):
+    """按用户手写的段表出方案（用户说「这一段是这么多拍」）。
+
+    与 `_segment_plans` 的分工：那边是程序自己找变拍点、自己测每段速度；这边
+    **速度以用户填的为准**，程序只负责两件事——
+        1. 在这个速度下找相位最优的恒速拍网格（`_phase_grid`），让节拍器踩在
+           真正的鼓点上，而不是从段首 0 秒机械起算；
+        2. 每段各按「最小变速」规则出 StretchPlan。
+
+    返回 (plans, infeasible, weak)，语义与 `_segment_plans` 一致；额外的 weak
+    是「这段填的 BPM 与实际起音对不上」的段号列表，仅用于提示，不阻断。
+
+    速度填错时（这段音乐根本不是这个拍速）`_phase_grid` 的命中率会很低，
+    但**不因此拒掉**——用户显式指定就该被执行，只在备注里提示「这段不像
+    这个拍速」，让人自己回听决定。
+    """
+    L = lang or _LANG
+    if not segs:
+        return [], None, []
+    import librosa
+    if mel is None:
+        mel = np.abs(librosa.feature.melspectrogram(
+            y=y_mono, sr=sr, hop_length=256, fmax=0.5 * sr))
+    onset = librosa.onset.onset_strength(S=librosa.power_to_db(mel), sr=sr, hop_length=256)
+
+    plans, weak = [], []
+    for i, seg in enumerate(segs):
+        bpm = float(seg.bpm)
+        plan = choose_stretched_tempo(bpm, target, strict, max_slowdown, max_speedup)
+        if plan is None:
+            return [], (seg.t0, seg.t1, bpm,
+                        stretch_limits_text(bpm, target, max_slowdown, max_speedup, lang=L)), []
+        grid, hit = _phase_grid(onset, sr, bpm, seg.t0, seg.t1)
+        if grid is None or len(grid) < 2:
+            # 段太短（<1 秒）或几乎没有起音：按 bpm 从头均匀铺，节拍器不会变机关枪
+            n = int(math.floor((seg.t1 - seg.t0) * bpm / 60.0)) + 1
+            grid = np.arange(max(1, n), dtype=np.float64) * (60.0 / bpm)
+        elif hit < 0.5:
+            weak.append(i + 1)
+        plans.append((float(seg.t0), float(seg.t1),
+                      SegmentPlan(float(seg.t0), float(seg.t1), bpm,
+                                  np.asarray(grid, dtype=np.float64), plan)))
+    return plans, None, weak
+
+
 def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
                    max_slowdown: float = DEFAULT_MAX_SLOWDOWN,
                    max_speedup: float = DEFAULT_MAX_SPEEDUP, lang=None,
@@ -2576,8 +2729,99 @@ def _mix(*parts):
     return out
 
 
+# -------------------------------------------------------- 自定义节拍器音色
+# 键形如 "import:C:\path\to\click.wav"。用前缀而不是把路径直接当键，是为了
+# 一眼区分内置音色与导入音色，也让 CLI 能直接接受同一个字符串。
+CUSTOM_PREFIX = "import:"
+# 自定义样本的最大时长。节拍器一声必须短于最快拍距（300 BPM ≈ 200ms），
+# 否则慢曲上两声会叠起来变成连续音，听感不再是「一下一下」。
+CUSTOM_MAX_SEC = 0.20
+# 太短的样本（<15ms）几乎没有音头，在缩混里听不出来，也测不准 RMS。
+CUSTOM_MIN_SEC = 0.015
+
+
+def custom_timbre(path) -> str:
+    """文件路径 → 自定义音色键。"""
+    return CUSTOM_PREFIX + str(path)
+
+
+def is_custom_timbre(timbre) -> bool:
+    return isinstance(timbre, str) and timbre.startswith(CUSTOM_PREFIX)
+
+
+def custom_timbre_path(timbre):
+    """自定义音色键 → 文件路径（内置音色返回 None）。"""
+    if not is_custom_timbre(timbre):
+        return None
+    return Path(timbre[len(CUSTOM_PREFIX):])
+
+
+def _load_custom_click(timbre: str, sr: int) -> np.ndarray:
+    """把用户导入的音频截成一声节拍器点击。
+
+    两步处理，都是为了让它能当节拍器用：
+      1. **裁掉尾部静音**（阈值取峰值 −45dB）：很多采样末尾带几十毫秒残响，
+         不裁的话慢曲上两声会接在一起。裁完仍超过 CUSTOM_MAX_SEC 就截断。
+      2. **按 sr 重采样**：样本可能是 48k，而节拍器在源文件的采样率上铺，
+         不重采样会变调变速。
+    读失败抛中文 RuntimeError（用户能看到是哪一首/哪个文件出了问题）。
+    """
+    import librosa
+
+    path = custom_timbre_path(timbre)
+    L = get_lang()
+    if path is None or not path.is_file():
+        raise RuntimeError(tr(
+            "自定义节拍器音色找不到文件：{p}",
+            "Custom metronome sound not found: {p}", L).format(p=path))
+    try:
+        y, sr0 = librosa.load(str(path), sr=None, mono=True)
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(tr(
+            "无法读取自定义节拍器音色：{p}（{e}）",
+            "Cannot read the custom metronome sound: {p} ({e})", L
+        ).format(p=path.name, e=exc)) from exc
+    y = np.asarray(y, dtype=np.float64)
+    if y.size == 0:
+        raise RuntimeError(tr("自定义节拍器音色是空文件：{p}",
+                              "The custom metronome sound is empty: {p}", L
+                              ).format(p=path.name))
+
+    # 1) 裁尾部静音（相对峰值，避免素材整体偏轻时裁不掉）
+    peak = float(np.max(np.abs(y)))
+    if peak > 1e-9:
+        thr = peak * 10.0 ** (-45.0 / 20.0)
+        loud = np.flatnonzero(np.abs(y) > thr)
+        if loud.size:
+            y = y[: loud[-1] + 1]
+    # 起点也补一下：有些采样前面留了预卷静音，不裁的话节拍器会晚几十毫秒，
+    # 而这一段延迟会原样出现在每一次点击上（整体偏后，相位全错）。
+    lead = np.flatnonzero(np.abs(y) > (float(np.max(np.abs(y))) or 1.0) * 10.0 ** (-45.0 / 20.0))
+    if lead.size and lead[0] > 0:
+        y = y[lead[0]:]
+
+    # 2) 限长
+    n_max = int(CUSTOM_MAX_SEC * sr0)
+    if y.size > n_max:
+        y = y[:n_max]
+    if y.size < int(CUSTOM_MIN_SEC * sr0):
+        raise RuntimeError(tr(
+            "这段样本太短（不足 {ms:.0f} 毫秒），当节拍器听不出音头：{p}",
+            "This sample is too short (under {ms:.0f} ms) to work as a click: {p}", L
+        ).format(ms=CUSTOM_MIN_SEC * 1000, p=path.name))
+
+    # 3) 重采样到输出的采样率（否则音高与长度都会错）
+    if int(sr0) != int(sr):
+        y = librosa.resample(y, orig_sr=int(sr0), target_sr=int(sr), res_type="soxr_hq")
+    return y
+
+
 def synth_click(timbre: str, sr: int, rng, lang=None) -> np.ndarray:
-    """合成单声部节拍器音，峰值归一到 1。"""
+    """合成单声部节拍器音，峰值归一到 1。
+
+    `timbre` 可以是 TIMBRES 里的内置键，也可以是 `import:` 开头的自定义音色
+    （见 `CUSTOM_PREFIX` / `custom_timbre`）——后者从用户选的音频文件里截一段。
+    """
     if timbre == "beep":
         x = _sine(1000, 0.06, sr, 0.015)
     elif timbre == "woodblock":
@@ -2604,6 +2848,8 @@ def synth_click(timbre: str, sr: int, rng, lang=None) -> np.ndarray:
             e = min(n, s + len(ns))
             x[s:e] += ns[: e - s]
         x = np.diff(x, prepend=0.0)
+    elif timbre.startswith(CUSTOM_PREFIX):
+        x = _load_custom_click(timbre, sr)
     else:
         raise ValueError(tr(f"未知节拍器音色: {timbre}",
                             f"unknown metronome timbre: {timbre}", lang))
@@ -2917,6 +3163,11 @@ class ConvertOptions:
     # "on"（强制分段，任一段越限则整首跳过）/ "off"（一律整曲单速）。
     # 也接受 True/False（True→on，False→off），兼容旧调用方。
     segments: object = "auto"
+    # 手动分段（逐曲覆盖用）：[{"t1": 结束秒, "bpm": 这段原速}, ...]，最后一段的
+    # t1 可留空表示到结尾。给了它就**以用户填的速度为准**，不再自己找变拍点，
+    # 也不再跑自动测速（见 _manual_segment_plans）。raw 形式在此，process_file
+    # 里用 parse_manual_segments 规整。
+    manual_segments: object = None
 
 
 def _unique_output_path(out_dir: Path, stem: str, target_bpm: float, ext: str) -> Path:
@@ -2974,7 +3225,9 @@ def _process_segmented(path, opt, y, sr, y_mono, seg_plans, row, notes,
     rates = [sp.plan.rate for (_t0, _t1, sp) in seg_plans]
     cpbs = [float(sp.plan.clicks_per_beat) for (_t0, _t1, sp) in seg_plans]
     row["检测BPM"] = join(bpms)
-    row["检测方式"] = tr("自动检测·分段", "Auto · segmented", L)
+    # 检测方式由调用方预先写好（自动分段 / 手动分段），这里不再覆盖。
+    if not row.get("检测方式"):
+        row["检测方式"] = tr("自动检测·分段", "Auto · segmented", L)
     row["拉伸后BPM"] = join(a2s)
     row["拉伸比"] = join(rates, "{:.4f}")
     row["速度变化"] = " / ".join(f"{(r - 1.0) * 100:+.1f}%" for r in rates)
@@ -3107,6 +3360,25 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
         beat_times = None
         how = tr("手动指定", "Manual", L) if manual else tr("自动检测", "Auto", L)
 
+        # 0) 手动分段（逐曲覆盖）：用户手写了「每段到几分几秒、这段是多少拍」。
+        #    语义与自动分段相反——速度以**用户填的**为准，程序只负责找相位，
+        #    不自己测速、也不因为「这段不像这个拍速」而拒。手写段表一旦给了
+        #    就优先于全局的原速 BPM（全局那个是「所有歌都按这个速度」，这里的
+        #    是「这一首的这几段各是多少速度」）。
+        manual_segs = []
+        if getattr(opt, "manual_segments", None) and not opt.detect_only:
+            dur_in = y.shape[1] / sr
+            manual_segs, _merr = parse_manual_segments(opt.manual_segments, dur_in, L)
+            if _merr:
+                row["备注"] = tr("跳过：", "Skipped: ", L) + _merr
+                log_fn("  " + tr("跳过：", "Skipped: ", L) + _merr)
+                return row
+            if manual_segs:
+                row["检测方式"] = tr("手动指定·分段", "Manual · segmented", L)
+                how = row["检测方式"]
+                detected = None                # 交给下面按段填，不再用全局 BPM
+        manual = bool(detected and detected > 0)
+
         if opt.detect_only:
             if detected is None:
                 detected, beat_times = detect_tempo(y_mono, sr, L)
@@ -3126,7 +3398,41 @@ def process_file(path: Path, opt: ConvertOptions, log_fn=log,
         seg_infeasible = None
         single_layer = None
         mel_all = None
-        if seg_mode != "off" and not manual:
+        if manual_segs:
+            # 手动分段：速度按用户填的，程序只找相位。越限时的处理与 on 模式
+            # 一致——整首跳过，绝不悄悄退回整曲（那样用户手写的分段就白填了）。
+            try:
+                import librosa
+                mel_all = np.abs(librosa.feature.melspectrogram(
+                    y=y_mono, sr=sr, hop_length=256, fmax=0.5 * sr))
+                seg_plans, seg_infeasible, _weak = _manual_segment_plans(
+                    y_mono, sr, manual_segs, opt.target_bpm, opt.strict,
+                    opt.max_slowdown, opt.max_speedup, lang=L, mel=mel_all)
+                if _weak:
+                    notes.append(tr(
+                        "第 " + "、".join(str(w) for w in _weak)
+                        + " 段填的 BPM 与该段起音对不太上（可能是填错了，或这一段有切分/散拍），"
+                        "节拍器仍按你填的速度敲，建议回听这段",
+                        "segment(s) " + ", ".join(str(w) for w in _weak)
+                        + ": the BPM you entered does not line up well with the onsets "
+                        "(possibly mistyped, or that part is syncopated); the metronome "
+                        "still follows your value — please listen-check it", L))
+            except RuntimeError as re:
+                notes.append(tr("手动分段不可用（",
+                                "manual segmentation unavailable (", L) + str(re)
+                             + tr("），已改按整曲处理", "); processed as one piece", L))
+            if seg_infeasible is not None:
+                _t0, _t1, _bpm, _why = seg_infeasible
+                row["检测BPM"] = f"{_bpm:.2f}"
+                row["备注"] = (tr("跳过：", "Skipped: ", L)
+                               + tr("手写分段里有段落超出加减速上限",
+                                   "a hand-written section exceeds the stretch limits", L)
+                               + tr("（第 ", " (", L)
+                               + f"{_t0:g}–{_t1:g}s，{_bpm:g} BPM" + tr("）：", "): ", L)
+                               + _why)
+                log_fn("  " + row["备注"])
+                return row
+        elif seg_mode != "off" and not manual:
             try:
                 # 全曲 mel 算一次：分段路径与回退整曲测速共用（约 3.6 秒/首，
                 # 占分段路径总耗时四分之一，重复算就是纯浪费）。
@@ -3437,7 +3743,10 @@ Metronome timbres: beep  woodblock  cowbell  click  sidestick  clap
     ap.add_argument("--bpm", type=float, default=None, help=H["bpm"])
     ap.add_argument("--detect-only", action="store_true", help=H["detect_only"])
     ap.add_argument("--strict", action="store_true", help=H["strict"])
-    ap.add_argument("--metronome", choices=TIMBRES, default=None, help=H["metronome"])
+    ap.add_argument("--metronome", default=None,
+                    help=H["metronome"] + "  "
+                         + tr("也可给一个音频文件路径，用那一段当节拍器音",
+                              "(or a path to an audio file to use as the click sound)"))
     ap.add_argument("--click-rel-db", type=float, default=-6.0, help=H["click_rel_db"])
     ap.add_argument("--engine", choices=["phasevocoder", "resample"], default="phasevocoder",
                     help=H["engine"])
@@ -3488,13 +3797,26 @@ def main(argv=None) -> int:
         print(e("提示：--detect-only 模式不生成音频，已忽略节拍器选项",
                "Note: --detect-only produces no audio; the metronome option is ignored"))
 
+    # --metronome 既接受内置音色名，也接受一个音频文件路径（自定义音色）。
+    # 路径要尽早转成 import: 键：后面的 opt 只认这一个形式，写错的文件名
+    # 在这里就报出来，不会等到处理到一半才炸。
+    metro = args.metronome
+    if metro and metro not in TIMBRES:
+        cand = Path(metro)
+        if not cand.is_file():
+            print(e(f"错误：--metronome 既不是内置音色（{'/'.join(TIMBRES)}），也找不到这个文件：{metro}",
+                    f"Error: --metronome is neither a built-in timbre ({'/'.join(TIMBRES)}) "
+                    f"nor an existing file: {metro}"))
+            return 2
+        metro = custom_timbre(cand)
+
     opt = ConvertOptions(
         target_bpm=float(args.target or 0.0),
         bpm=args.bpm,
         detect_only=args.detect_only,
         strict=args.strict,
         engine=args.engine,
-        metronome=args.metronome,
+        metronome=metro,
         click_rel_db=args.click_rel_db,
         output_format=args.output_format,
         mp3_bitrate=args.mp3_bitrate,

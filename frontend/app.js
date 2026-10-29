@@ -113,6 +113,29 @@ const ZH = {
   revealTip: "在资源管理器中显示",
   removeTip: "移除",
   previewTip: "试听",
+
+  // 逐曲手动设置
+  perLabel: "原速",
+  perAuto: "自动",
+  perTip: "只对这一首生效；留空则自动检测",
+  tapTip: "跟着音乐点这个按钮（至少 3 下），按你点击的间隔算 BPM",
+  tapNeed: "至少要连点 3 下才算得出 BPM",
+  tapDone: "按你的点击算出 {n} BPM",
+  segOpen: "多段",
+  segClose: "收起分段",
+  segTitle: "手动分段：每段填「结束时间」和这一段的速度",
+  segEnd: "结束时间",
+  segBpm: "BPM",
+  segAdd: "＋ 加一段",
+  segHint: "只有最后一段的结束时间可以留空（表示一直到结尾）",
+  segBad: "第 {n} 段的时间或 BPM 填得不对",
+  segOrder: "第 {n} 段的结束时间要比上一段更靠后",
+  segOn: "分段变速生效中",
+  resetPer: "恢复自动",
+  perBad: "这一首的原速 BPM 要在 1–1000 之间",
+  timbreLoad: "载入…",
+  timbreLoadTip: "用一段自己的音频当节拍器音（会截取音头）",
+  timbreUnavailable: "这个自定义音色找不到了（可能被移动或删除）",
   themeDark: "主题：夜间（点击切换到日间）",
   themeLight: "主题：日间（点击切换到夜间）",
   themeToggle: "切换日间 / 夜间模式",
@@ -218,6 +241,28 @@ const EN = {
   revealTip: "Show in File Explorer",
   removeTip: "Remove",
   previewTip: "Preview",
+
+  perLabel: "Original tempo",
+  perAuto: "Auto",
+  perTip: "Applies to this file only; leave blank to auto-detect",
+  tapTip: "Tap along with the music (at least 3 times); the BPM comes from your tap intervals",
+  tapNeed: "Tap at least 3 times to get a BPM",
+  tapDone: "{n} BPM from your taps",
+  segOpen: "Sections",
+  segClose: "Hide sections",
+  segTitle: "Manual sections: give each one an end time and its tempo",
+  segEnd: "End time",
+  segBpm: "BPM",
+  segAdd: "＋ Add section",
+  segHint: "Only the last section may leave the end time blank (meaning: to the end)",
+  segBad: "Section {n}: the time or BPM is not valid",
+  segOrder: "Section {n} must end after the previous one",
+  segOn: "Manual sections active",
+  resetPer: "Back to auto",
+  perBad: "The original tempo for this file must be between 1 and 1000",
+  timbreLoad: "Load…",
+  timbreLoadTip: "Use your own audio as the click sound (only the attack is kept)",
+  timbreUnavailable: "This custom sound is gone (moved or deleted)",
   themeDark: "Theme: dark (click for light)",
   themeLight: "Theme: light (click for dark)",
   themeToggle: "Toggle light / dark mode",
@@ -232,12 +277,16 @@ const EN = {
 const DICTS = { zh: ZH, en: EN };
 
 const state = {
-  files: new Map(),   // path -> {path, root, status, info, checked}
+  files: new Map(),   // path -> {path, root, status, info, checked, bpm, segs, segOpen}
   running: false,
   bridge: null,
   mock: false,
   previewAudio: null,
   lang: "zh",         // 当前界面语言；默认中文
+  // 用户导入的自定义节拍器音色：{ "import:完整路径": "显示名" }
+  // 与 ui_prefs 里的 customTimbres 对应（换机器/换路径时那条就失效了，
+  // 加载时用 exists 过滤一次）。
+  customTimbres: {},
 };
 
 function curLang() {
@@ -331,7 +380,8 @@ const realBridge = () => ({
   preview: (t) => window.pywebview.api.preview_timbre(t),
   // 第三个参数 roots（每个文件所属的根）**必须透传**：后端靠它在指定输出目录时
   // 重建原文件夹层级。少了它，后端会把每个文件当成单独添加（根=各自父目录）→ 全平铺。
-  start: (paths, opts, roots) => window.pywebview.api.start(paths, opts, roots),
+  // 第四个参数 perFile（逐曲覆盖）同理必须透传，且与 paths 一一对应。
+  start: (paths, opts, roots, perFile) => window.pywebview.api.start(paths, opts, roots, perFile),
   stop: () => window.pywebview.api.stop(),
   reveal: (p) => window.pywebview.api.reveal_file(p),
   openFolder: (p) => window.pywebview.api.open_folder(p),
@@ -340,6 +390,9 @@ const realBridge = () => ({
   // 关闭到托盘：读出当前偏好（含托盘是否可用），改动后写回后端 JSON。
   getUiPrefs: () => window.pywebview.api.get_ui_prefs(curLang()),
   setCloseToTray: (v) => window.pywebview.api.set_close_to_tray(v, curLang()),
+  // 自定义节拍器音色
+  pickTimbre: (lang) => window.pywebview.api.pick_timbre_file(lang),
+  rememberTimbre: (key, lang) => window.pywebview.api.remember_timbre(key, lang),
 });
 
 function mockBridge() {
@@ -360,8 +413,9 @@ function mockBridge() {
     preview: async (t) => { beep(t === "beep" ? 1000 : 900, 0.18); return ""; },
     // 与真实桥接签名一致（第三个参数 roots 也要收下），预览模式下存到
     // window.__lastRoots，便于在浏览器里核对"根是否真的传到了后端"。
-    start: (paths, opts, roots) => {
+    start: (paths, opts, roots, perFile) => {
       window.__lastRoots = roots || [];
+      window.__lastPerFile = perFile || [];
       const files = paths.slice(0, 5);
       // 预览模式的假数据：与真实方案保持一致（目标 180；每拍点击数取整数 1~20
       // 或 1/2…1/20，受默认变速上限 20%/50% 约束）。文案只用两种说法：
@@ -403,6 +457,8 @@ function mockBridge() {
     getUiPrefs: async () => ({ close_to_tray: true, tray_available: false,
                                tray_reason: "preview mode" }),
     setCloseToTray: async (v) => ({ ok: true, close_to_tray: !!v }),
+    pickTimbre: async () => "",
+    rememberTimbre: async () => ({ ok: false }),
   };
 }
 
@@ -490,7 +546,11 @@ function addPaths(paths, root) {
     const key = String(p).toLowerCase();
     const r = root || parentOf(p);
     if (!state.files.has(key)) {
-      state.files.set(key, { path: p, root: r, status: "pending", info: null, checked: false });
+      // bpm = 这一首的手动原速（留空 = 自动检测）；segs = 手写分段 [{t1, bpm}]
+      state.files.set(key, {
+        path: p, root: r, status: "pending", info: null, checked: false,
+        bpm: "", segs: null, segOpen: false,
+      });
       added++;
     } else {
       // 已存在的文件：若这次带来了更精确（更深）的根，用更深的那个
@@ -601,6 +661,10 @@ function fileRow(item) {
 
   li.appendChild(top);
 
+  // 逐曲手动设置：原速 BPM（只对这一首生效）+ 跟着音乐点出来的 tap tempo + 多段
+  li.appendChild(perEditor(item));
+  if (item.segOpen) li.appendChild(segEditor(item));
+
   // 只保留必要信息：检测速度、拉伸后速度（变速比）、节拍关系。
   // 失败/跳过原因例外——那是必须让用户看到的信息。其余备注（峰值限制等）不再显示，
   // 完整细节在 CSV 报告的「备注」列里。
@@ -629,6 +693,230 @@ function fileRow(item) {
     li.appendChild(sub);
   }
   return li;
+}
+
+/* ---------------- 逐曲手动设置（原速 / tap / 多段） ---------------- */
+/* 为什么挂在每一行上而不是设置区：
+   批量处理时总有一两首测错，或者一首歌本身就是变拍的。全局只有一个「原速」框，
+   改一次要整批重跑；这里让每一首自带一份覆盖，互不影响。
+   数据存在 item.bpm（字符串）与 item.segs（[{t1, bpm}]，字符串）上，
+   发给后端时再转成数字（见 perFilePayload）。 */
+
+/* tap tempo：记点击时刻，取间隔中位数。
+   TAP_RESET：超过这个时长没点就当新的一轮（否则上一轮残留会把这次算错）。
+   TAP_MIN_GAP：间隔比这还短必然是同一下手抖成两次点击，不算拍（200ms ≈ 300 BPM）。 */
+const TAP_RESET = 3000;
+const TAP_MIN_GAP = 200;
+
+function tapTempo(item, chip) {
+  const now = performance.now();
+  const st = item._tap || (item._tap = { ts: [], last: 0 });
+  if (!st.ts.length || now - st.last > TAP_RESET) {
+    st.ts = [now];
+    st.last = now;
+    chip.classList.add("tapping");
+    setTimeout(() => chip.classList.remove("tapping"), 400);
+    toast(t("tapTip"));
+    return;
+  }
+  st.ts.push(now);
+  st.last = now;
+  chip.classList.add("tapping");
+  setTimeout(() => chip.classList.remove("tapping"), 400);
+  if (st.ts.length < 3) return;
+  // 取相邻间隔的中位数：比平均更抗「有一下点晚了」
+  const gaps = [];
+  for (let i = 1; i < st.ts.length; i++) gaps.push(st.ts[i] - st.ts[i - 1]);
+  gaps.sort((a, b) => a - b);
+  const med = gaps[Math.floor(gaps.length / 2)];
+  if (med < TAP_MIN_GAP) return;            // 手抖：这么短的间隔不可能是拍
+  const bpm = Math.round(60000 / med * 10) / 10;
+  st.ts = [];
+  item.bpm = String(bpm);
+  const input = document.querySelector(`.file-item[data-path="${CSS.escape(item.path)}"] .per-bpm`);
+  if (input) input.value = item.bpm;
+  saveSettings();
+  toast(t("tapDone", { n: bpm }));
+}
+
+function perEditor(item) {
+  const box = document.createElement("div");
+  box.className = "fi-per";
+
+  const label = document.createElement("span");
+  label.className = "per-label";
+  label.textContent = t("perLabel");
+  label.title = t("perTip");
+
+  const input = document.createElement("input");
+  input.className = "text-in num per-bpm";
+  input.type = "number";
+  input.min = "1";
+  input.max = "1000";
+  input.step = "0.1";
+  input.value = item.bpm || "";
+  input.placeholder = t("perAuto");
+  input.title = t("perTip");
+  input.onchange = () => {
+    const v = String(input.value || "").trim();
+    if (v !== "" && !(parseFloat(v) > 0 && parseFloat(v) <= 1000)) {
+      toast(t("perBad"), true);
+      input.value = item.bpm || "";
+      return;
+    }
+    item.bpm = v;
+    saveSettings();
+  };
+
+  const tap = document.createElement("button");
+  tap.type = "button";
+  tap.className = "fi-btn per-tap";
+  tap.title = t("tapTip");
+  tap.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
+  tap.onclick = (ev) => { ev.stopPropagation(); tapTempo(item, tap); };
+
+  const segBtn = document.createElement("button");
+  segBtn.type = "button";
+  segBtn.className = "btn ghost xs per-seg" + (item.segs ? " on" : "");
+  segBtn.textContent = item.segOpen ? t("segClose") : t("segOpen");
+  segBtn.title = t("segTitle");
+  segBtn.onclick = (ev) => {
+    ev.stopPropagation();
+    item.segOpen = !item.segOpen;
+    if (item.segOpen && !item.segs) item.segs = [{ t1: "", bpm: "" }];
+    renderFiles();
+  };
+
+  box.append(label, input, tap, segBtn);
+  if (item.segs) {
+    const badge = document.createElement("span");
+    badge.className = "per-badge";
+    badge.textContent = t("segOn");
+    box.appendChild(badge);
+  }
+  return box;
+}
+
+function segEditor(item) {
+  const box = document.createElement("div");
+  box.className = "fi-segs";
+
+  const head = document.createElement("div");
+  head.className = "seg-head";
+  const title = document.createElement("span");
+  title.textContent = t("segTitle");
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "btn ghost xs";
+  add.textContent = t("segAdd");
+  add.onclick = (ev) => {
+    ev.stopPropagation();
+    item.segs.push({ t1: "", bpm: "" });
+    renderFiles();
+  };
+  const reset = document.createElement("button");
+  reset.type = "button";
+  reset.className = "btn ghost xs";
+  reset.textContent = t("resetPer");
+  reset.onclick = (ev) => {
+    ev.stopPropagation();
+    item.segs = null;
+    item.segOpen = false;
+    renderFiles();
+  };
+  head.append(title, add, reset);
+  box.appendChild(head);
+
+  const rows = document.createElement("div");
+  rows.className = "seg-rows";
+  (item.segs || []).forEach((s, i) => {
+    const row = document.createElement("div");
+    row.className = "seg-row";
+
+    const idx = document.createElement("span");
+    idx.className = "seg-idx";
+    idx.textContent = String(i + 1);
+
+    const t1 = document.createElement("input");
+    t1.className = "text-in num seg-t1";
+    t1.type = "number";
+    t1.min = "0";
+    t1.step = "0.1";
+    t1.value = s.t1 == null ? "" : String(s.t1);
+    t1.placeholder = t("segEnd");
+    t1.title = i === item.segs.length - 1 ? t("segHint") : t("segEnd");
+    t1.onchange = () => { s.t1 = t1.value.trim(); saveSettings(); };
+
+    const bpm = document.createElement("input");
+    bpm.className = "text-in num seg-bpm";
+    bpm.type = "number";
+    bpm.min = "1";
+    bpm.max = "1000";
+    bpm.step = "0.1";
+    bpm.value = s.bpm == null ? "" : String(s.bpm);
+    bpm.placeholder = t("segBpm");
+    bpm.onchange = () => { s.bpm = bpm.value.trim(); saveSettings(); };
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "fi-btn";
+    del.title = t("removeTip");
+    del.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+    del.onclick = (ev) => {
+      ev.stopPropagation();
+      item.segs.splice(i, 1);
+      if (!item.segs.length) { item.segs = null; item.segOpen = false; }
+      renderFiles();
+    };
+
+    row.append(idx, t1, bpm, del);
+    rows.appendChild(row);
+  });
+  box.appendChild(rows);
+
+  const hint = document.createElement("p");
+  hint.className = "hint-line";
+  hint.textContent = t("segHint");
+  box.appendChild(hint);
+  return box;
+}
+
+/* 把 item.bpm / item.segs 转成后端要的形状；有问题返回 {error}。
+   结束时间只校验「能变成数字且比上一段大」——具体到结尾的裁剪交给 Python
+   （它才知道这首歌有多长）。 */
+function perFilePayload(item) {
+  const out = {};
+  const bpm = String(item.bpm == null ? "" : item.bpm).trim();
+  if (bpm !== "") {
+    const v = parseFloat(bpm);
+    if (!(v > 0) || v > 1000) return { error: t("perBad") };
+    out.bpm = v;
+  }
+  if (item.segs && item.segs.length) {
+    const segs = [];
+    let prev = 0;
+    for (let i = 0; i < item.segs.length; i++) {
+      const s = item.segs[i];
+      const n = i + 1;
+      const rawEnd = String(s.t1 == null ? "" : s.t1).trim();
+      const rawBpm = String(s.bpm == null ? "" : s.bpm).trim();
+      const bv = parseFloat(rawBpm);
+      if (!(bv > 0) || bv > 1000) return { error: t("segBad", { n }) };
+      if (rawEnd === "") {
+        // 只有最后一段可以不填结束时间（= 一直到结尾）
+        if (i !== item.segs.length - 1) return { error: t("segBad", { n }) };
+        segs.push({ t1: null, bpm: bv });
+        break;
+      }
+      const ev = parseFloat(rawEnd);
+      if (!isFinite(ev) || ev <= 0) return { error: t("segBad", { n }) };
+      if (ev <= prev) return { error: t("segOrder", { n }) };
+      prev = ev;
+      segs.push({ t1: ev, bpm: bv });
+    }
+    if (segs.length) out.segments = segs;
+  }
+  return out;
 }
 
 function updateFileStatus(payload) {
@@ -696,8 +984,7 @@ function loadSettings() {
   if (s.metronome) {
     $("#metronome").checked = true;
     timbreSelect(s.metronome);
-  }
-  if (s.clickRelDb !== undefined) $("#clickRelDb").value = s.clickRelDb;
+  }  if (s.clickRelDb !== undefined) $("#clickRelDb").value = s.clickRelDb;
   if (s.maxSlowdown !== undefined) $("#maxSlowdown").value = s.maxSlowdown;
   if (s.maxSpeedup !== undefined) $("#maxSpeedup").value = s.maxSpeedup;
   limitHintUpdate();
@@ -727,7 +1014,18 @@ function trayRender(p) {
 
 async function traySync() {
   if (!state.bridge || !state.bridge.getUiPrefs) { trayRender(TRAY_FALLBACK); return; }
-  try { trayRender(await state.bridge.getUiPrefs()); }
+  try {
+    const p = await state.bridge.getUiPrefs();
+    trayRender(p);
+    // 自定义音色跟着同一份 ui_prefs 走，顺手一起刷新
+    if (p && Array.isArray(p.custom_timbres)) {
+      applyCustomTimbres(p.custom_timbres);
+      renderTimbres();
+      // 上一次用的音色如果已经不在了，退回木鱼，别留一个选不中的状态
+      const on = document.querySelector(".timbre.on");
+      if (!on) timbreSelect("woodblock");
+    }
+  }
   catch (e) { trayRender(TRAY_FALLBACK); }
 }
 
@@ -765,6 +1063,7 @@ function segSelect(sel, v) {
 }
 
 function timbreSelect(k) {
+  state.wantTimbre = k;      // 记住选择：自定义音色是异步加载的，重绘后要还原
   document.querySelectorAll(".timbre").forEach(b => b.classList.toggle("on", b.dataset.v === k));
 }
 
@@ -791,14 +1090,24 @@ function bitrateGateUpdate() {
    切换语言时整块重建，这样 title（试听）也是当前语言。 */
 function renderTimbres() {
   const box = $("#timbres");
-  const cur = (document.querySelector(".timbre.on") || {}).dataset?.v || "woodblock";
+  // 当前选中：优先用户这次选的那个（state.wantTimbre），否则沿用 DOM 上的
+  const cur = state.wantTimbre
+    || (document.querySelector(".timbre.on") || {}).dataset?.v || "woodblock";
   box.innerHTML = "";
-  for (const tb of TIMBRES) {
+  // 内置 6 种 + 用户导入的（键是 import:路径，显示名用文件名短形式）
+  const all = TIMBRES.map(tb => ({ k: tb.k, cn: tb.cn, en: tb.en }));
+  for (const [key, name] of Object.entries(state.customTimbres || {})) {
+    all.push({ k: key, cn: name, en: name, custom: true });
+  }
+  for (const tb of all) {
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "timbre" + (tb.k === cur ? " on" : "");
+    b.className = "timbre" + (tb.k === cur ? " on" : "") + (tb.custom ? " custom" : "");
     b.dataset.v = tb.k;
-    b.innerHTML = `<span class="t-cn">${tb.cn}</span><span class="t-en">${tb.en}</span>` +
+    const nameHtml = tb.custom
+      ? `<span class="t-cn">♪ ${escapeHtml(tb.cn)}</span><span class="t-en">♪ ${escapeHtml(tb.en)}</span>`
+      : `<span class="t-cn">${tb.cn}</span><span class="t-en">${tb.en}</span>`;
+    b.innerHTML = nameHtml +
       `<i class="play" title="${t("previewTip")}"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor"><polygon points="6 3 20 12 6 21"/></svg></i>`;
     b.onclick = () => { timbreSelect(tb.k); saveSettings(); playPreview(b, tb.k); };
     b.querySelector(".play").onclick = (e) => {
@@ -808,7 +1117,57 @@ function renderTimbres() {
     };
     box.appendChild(b);
   }
+  // 「载入…」格子：和音色卡片同尺寸，混在最后，点了弹文件选择
+  const load = document.createElement("button");
+  load.type = "button";
+  load.className = "timbre timbre-load";
+  load.dataset.v = "";
+  load.title = t("timbreLoadTip");
+  load.innerHTML = `<span class="t-cn">${t("timbreLoad")}</span><span class="t-en">${t("timbreLoad")}</span>` +
+    `<i class="plus"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></i>`;
+  load.onclick = async () => {
+    if (!state.bridge || !state.bridge.pickTimbre) { toast(t("timbreUnavailable"), true); return; }
+    try {
+      const key = await state.bridge.pickTimbre(curLang());
+      if (!key) return;
+      await loadCustomTimbres(key);
+      timbreSelect(key);
+      saveSettings();
+    } catch (e) {
+      toast(t("timbreUnavailable"), true);
+    }
+  };
+  box.appendChild(load);
 }
+
+/* 把导入的音色记进后端偏好并刷新卡片（新导入的排在最前，方便马上听到） */
+async function loadCustomTimbres(newKey) {
+  if (newKey && state.bridge && state.bridge.rememberTimbre) {
+    try {
+      const r = await state.bridge.rememberTimbre(newKey, curLang());
+      if (r && r.ok && Array.isArray(r.custom_timbres)) {
+        applyCustomTimbres(r.custom_timbres);
+        renderTimbres();
+        return;
+      }
+    } catch (e) { }
+  }
+  // 后端没记下（比如偏好文件读不出来）：至少让本次会话能用
+  if (newKey) {
+    const name = newKey.replace(/^import:/, "").split(/[\\/]/).pop();
+    state.customTimbres[newKey] = name;
+    renderTimbres();
+  }
+}
+
+function applyCustomTimbres(list) {
+  const out = {};
+  for (const it of list || []) {
+    if (it && it.key) out[it.key] = it.name || it.key;
+  }
+  state.customTimbres = out;
+}
+
 
 function showOutDir() {
   const el = $("#outDirInfo");
@@ -850,18 +1209,36 @@ async function startRun() {
   if (state.running) return;
   const opts = readOptions();
   if (!opts.detectOnly) {
-    const t = parseFloat(opts.target);
-    if (!(t > 0)) { toast(t("needTarget"), true); return; }
+    const tv = parseFloat(opts.target);
+    if (!isFinite(tv)) { toast(t("needTarget"), true); return; }
+    if (!(tv > 0)) { toast(t("needTarget"), true); return; }
+  }
+  // 原速 BPM：留空 = 自动检测；填了就必须是 1–1000 的正数。
+  // 以前这项只在后端校验，用户点了「开始」才看到报错——现在先在界面上拦住。
+  if (opts.manualBpm !== "") {
+    const mv = parseFloat(opts.manualBpm);
+    if (!(mv > 0) || mv > 1000) { toast(t("perBad"), true); return; }
   }
   // 有勾选 → 只处理勾选的；没勾选 → 处理全部
   const sel = selList();
   const list = sel.length ? sel : [...state.files.values()];
+  // 逐曲手动覆盖（原速 BPM / 手写分段）。**必须先校验完再调后端**：
+  // 后端一旦启动就会开始处理，前面几首已经在跑了再报错就来不及了。
+  const perFile = [];
+  for (const f of list) {
+    const one = perFilePayload(f);
+    if (one.error) {
+      toast(`${basename(f.path)}：${one.error}`, true);
+      return;
+    }
+    perFile.push(one);
+  }
   const paths = list.map(f => f.path);
   // 每个文件对应的「添加时的根」——后端靠它把原文件夹层级在输出目录里重建
   const roots = list.map(f => f.root || parentOf(f.path));
   let res;
   try {
-    res = await state.bridge.start(paths, opts, roots);
+    res = await state.bridge.start(paths, opts, roots, perFile);
   } catch (e) {
     toast(t("startFailed", { err: e }), true);
     return;

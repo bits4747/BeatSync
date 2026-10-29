@@ -226,5 +226,122 @@ try {
 
 <div id="toast" class="toast hidden"></div>
 <script src="app.js"></script>
+<script>
+/* 首屏自愈（白屏兜底）。
+   触发条件：WebView2 的 HTTP 缓存索引损坏时，资源返回 200 但内容为空/损坏，
+   app.js 一行都没执行，#app（这里是 .app）永远是空的——用户看到纯白窗口，
+   没有任何报错，只能自己去设 TMC_FORCE_TK 才救得回来。
+   做法：监听资源加载失败（error 事件**不冒泡**，必须在捕获阶段接）、
+   盯住主容器是否被填满，超时后自动 reload 一次（sessionStorage 计数防死循环），
+   第二次仍然空就自己渲染一段提示 + 一键切兼容界面的按钮。 */
+(function () {
+  var SHELL = ".app";              /* 主容器 */
+  var WATCH_KEY = "tmc-heal";
+  var timer = null, done = false;
+
+  function shellEmpty() {
+    var el = document.querySelector(SHELL);
+    return !el || el.children.length === 0;
+  }
+
+  function giveUp() {
+    if (done) return;
+    done = true;
+    if (timer) { clearTimeout(timer); timer = null; }
+    var zh = (document.documentElement.dataset.lang || "zh") !== "en";
+    var host = document.body || document.documentElement;
+    var box = document.createElement("div");
+    box.setAttribute("style",
+      "position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;" +
+      "justify-content:center;gap:14px;padding:32px;text-align:center;" +
+      "font:16px/1.6 system-ui,'Segoe UI',sans-serif;color:#46506a;background:#eceff5;");
+    var h = document.createElement("div");
+    h.setAttribute("style", "font-size:20px;font-weight:600;color:#101725;");
+    h.textContent = zh ? "界面没能加载出来" : "The interface could not load";
+    var p = document.createElement("div");
+    p.setAttribute("style", "max-width:520px;color:#46506a;");
+    p.textContent = zh
+      ? "大概是 WebView2 的缓存出了问题。可以先点下面的按钮重试；一直不行就改用兼容界面（不依赖 WebView2，功能一致）。"
+      : "This is usually a WebView2 cache problem. Try the button below; if it keeps failing, switch to the compatibility interface (no WebView2 needed, same features).";
+    var row = document.createElement("div");
+    row.setAttribute("style", "display:flex;gap:10px;flex-wrap:wrap;justify-content:center;");
+    var retry = document.createElement("button");
+    retry.textContent = zh ? "重新加载" : "Reload";
+    retry.setAttribute("style", "padding:8px 18px;border-radius:9px;border:1px solid #ccd3e2;" +
+      "background:#fff;cursor:pointer;font:inherit;");
+    retry.onclick = function () {
+      try { sessionStorage.removeItem(WATCH_KEY); } catch (e) { }
+      location.reload();
+    };
+    var tk = document.createElement("button");
+    tk.textContent = zh ? "改用兼容界面" : "Use the compatibility interface";
+    tk.setAttribute("style", "padding:8px 18px;border-radius:9px;border:none;cursor:pointer;" +
+      "font:inherit;color:#fff;background:linear-gradient(135deg,#5f7ef2,#38b6dd);");
+    tk.onclick = function () {
+      try {
+        if (window.pywebview && window.pywebview.api && window.pywebview.api.launch_tk) {
+          window.pywebview.api.launch_tk();
+        } else {
+          retry.click();
+        }
+      } catch (e) { retry.click(); }
+    };
+    row.appendChild(retry);
+    row.appendChild(tk);
+    box.appendChild(h); box.appendChild(p); box.appendChild(row);
+    host.appendChild(box);
+  }
+
+  function arm(ms) {
+    if (done) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(function () {
+      timer = null;
+      if (done || !shellEmpty()) return;
+      var n = 0;
+      try { n = parseInt(sessionStorage.getItem(WATCH_KEY) || "0", 10) || 0; } catch (e) { n = 1; }
+      if (n < 1) {
+        try { sessionStorage.setItem(WATCH_KEY, String(n + 1)); } catch (e) { }
+        location.reload();
+      } else {
+        giveUp();
+      }
+    }, ms);
+  }
+
+  /* 资源加载失败：error 不冒泡，只能在捕获阶段听。失败后给 2 秒就够判断了。 */
+  window.addEventListener("error", function (ev) {
+    var el = ev.target;
+    if (!el || !el.tagName) return;
+    var tag = el.tagName.toLowerCase();
+    if (tag === "script" || tag === "link") arm(2000);
+  }, true);
+
+  /* MutationObserver：正常情况下 app.js 一执行就会往 .app 里塞内容，
+     一旦有了内容就收工，不再干扰。 */
+  function watch() {
+    if (done || !shellEmpty()) { if (!shellEmpty()) { done = true; if (timer) clearTimeout(timer); } return; }
+    arm(8000);
+    if (!window.MutationObserver) return;
+    try {
+      var mo = new MutationObserver(function () {
+        if (!shellEmpty()) { done = true; if (timer) clearTimeout(timer); mo.disconnect(); }
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+    } catch (e) { }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", watch);
+  } else {
+    watch();
+  }
+  /* 正常加载成功也清掉计数，下次真的坏了还允许再自愈一次 */
+  window.addEventListener("load", function () {
+    if (!shellEmpty()) { done = true; if (timer) clearTimeout(timer); }
+    try { sessionStorage.removeItem(WATCH_KEY); } catch (e) { }
+  });
+})();
+</script>
 </body>
 </html>

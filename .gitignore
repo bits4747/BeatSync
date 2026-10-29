@@ -18,6 +18,13 @@ _smoke_result.json
 # numba JIT 缓存（首次运行自动重建）
 _ncache/
 
+# 打包产物与日志（packaging/ 下只提交脚本与资源，不提交构建结果）
+build/
+dist/
+dist_installer/
+*.spec.bak
+*.log
+
 # IDE / 系统
 .vscode/
 .idea/

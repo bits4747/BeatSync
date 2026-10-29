@@ -1,0 +1,85 @@
+name: Package
+
+# 只做「能不能打出安装包」的验证，不发布内容。
+# 触发方式：手动。切 tag 时不自动跑——发布要人确认产物，且 Inno Setup 的编译
+# 结果必须落到真实 Windows 上验一遍才算数（见 CONTRIBUTING 的发布流程）。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "覆盖安装包版本号（留空则用 packaging/BeatSync.iss 里的 MyAppVersion）"
+        required: false
+        default: ""
+
+jobs:
+  windows:
+    name: Windows exe + installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pywebview pystray Pillow pythonnet clr_loader
+
+      - name: Build exe (PyInstaller)
+        # 在 packaging/ 里跑，产物落在 packaging/dist（iss 里的 Source 是相对
+        # 脚本自身目录的，两边保持一致，谁也不用猜对方的工作目录）。
+        working-directory: packaging
+        run: python -m PyInstaller --noconfirm --clean BeatSync.spec
+
+      - name: Check the exe bundle is complete
+        shell: pwsh
+        run: |
+          # 打包版最容易出的两类静默故障：界面资源没进 _internal、托盘图标依赖缺失。
+          # 这里在构建阶段就卡住，不留到用户装完才发现。
+          $need = @(
+            "packaging/dist/BeatSync/BeatSync.exe",
+            "packaging/dist/BeatSync/BeatSync.exe.config",
+            "packaging/dist/BeatSync/_internal/frontend/index.html",
+            "packaging/dist/BeatSync/_internal/PIL",
+            "packaging/dist/BeatSync/_internal/pystray"
+          )
+          $miss = @()
+          foreach ($p in $need) { if (-not (Test-Path $p)) { $miss += $p } }
+          if ($miss.Count -gt 0) {
+            Write-Error ("打包产物缺少：" + ($miss -join ", "))
+            exit 1
+          }
+          Write-Host "产物完整"
+
+      - name: Bump installer version (optional)
+        if: inputs.version != ''
+        shell: pwsh
+        run: |
+          $f = "packaging/BeatSync.iss"
+          $t = Get-Content $f -Raw -Encoding UTF8
+          $t = $t -replace '#define MyAppVersion "[^"]*"', '#define MyAppVersion "${{ inputs.version }}"'
+          Set-Content -Path $f -Value $t -Encoding UTF8 -NoNewline
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          & $iscc "packaging\BeatSync.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "packaging/dist_installer/BeatSyncSetup.exe")) {
+            Write-Error "安装包没有产出"
+            exit 1
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BeatSyncSetup
+          path: packaging/dist_installer/BeatSyncSetup.exe
+          if-no-files-found: error

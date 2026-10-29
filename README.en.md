@@ -11,6 +11,20 @@ English | [中文](README.md)
 
 BeatSync avoids large tempo changes — **the metronome always clicks at the target tempo, and the music is only shifted the smallest possible amount.**
 
+## Tracks that change tempo
+
+Everything above assumes one steady tempo from start to finish. **Plenty of tracks change speed partway through** — slow intro, faster verse, bridge drops back down. Stretching the whole file to a single tempo guarantees the intro or the outro drifts off the beat.
+
+BeatSync handles this two ways:
+
+- **Automatic segmentation** (default): the program finds the tempo changes itself, measures each section, shifts each one by the smallest possible amount, and crossfades the joins. If the sections differ by less than 15% it stays as one piece, so a steady track never gets chopped up for no reason.
+- **Manual segmentation**: you state where each section ends and what tempo it is (click "多段" under the file name and fill in an end time plus a BPM per row). The program follows **your** numbers exactly — no detection, no automatic splitting. Useful when your score already spells out the tempo, or when automatic segmentation gets a section wrong.
+
+Two related options:
+
+- **Per-file source tempo**: a single misdetected track no longer drags down the batch — type the tempo into that row's "原速" box.
+- **Tap tempo**: tap "点这里" along with the music and BeatSync derives the BPM from your intervals (median, so one missed tap does not ruin it).
+
 ## How tempo matching works
 
 Move the music to **n times or 1/n times** the target tempo (n is a whole number).

@@ -83,7 +83,7 @@ pytest tests/ -v
 
 1. `pyproject.toml` 的 `version`
 2. `CHANGELOG.md` 顶部新增的那一节标题
-3. `_packaging/BeatSync.iss` 的 `MyAppVersion`（安装包版本，脚本在仓库外）
+3. `packaging/BeatSync.iss` 的 `MyAppVersion`（安装包版本）
 
 版本号怎么涨（修缺陷 / 加功能 / 不兼容大改）见 `CHANGELOG.md` 开头的规则。
 `CHANGELOG.md` 只记录**面向用户的行为**，内部重构不必逐条写。

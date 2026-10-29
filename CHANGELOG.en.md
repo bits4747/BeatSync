@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.4.2**. Every release bumps the version
+**Versioning rules**: current version **1.5.0**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -15,9 +15,71 @@ and adds a section below:
 
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
-`_packaging/BeatSync.iss`.
+`packaging/BeatSync.iss`.
 
 ---
+
+## [1.5.0] — 2026-10-30
+
+### Added
+
+- **Per-track original BPM, with multiple segments**. In a batch each track now has
+  its own "Original" BPM box; the "多段" (segments) button next to it lets you
+  fill in "this section ends at N seconds and was originally M BPM" line by line.
+  The program follows exactly what you enter — it no longer looks for tempo
+  changes and no longer runs tempo detection; it just lays a constant grid at
+  that tempo and computes the smallest valid stretch. If a section's entered BPM
+  is far off that section's actual onsets, the report suggests re-listening to it
+  but **still generates the file** (you said what you wanted). Only the last
+  segment may leave its end time blank (meaning "to the end of the track"); if any
+  segment falls outside the slowdown/speedup limits the whole track is skipped —
+  it never silently falls back to whole-track stretching, which would leave the
+  two sides of a join at different speeds.
+- **Tap tempo**. A button on each track row: tap along with the music three or
+  more times and the BPM comes from the **median** of your tap intervals, so one
+  missed or late tap does not skew the result. Tapping resets after 3 seconds of
+  silence.
+- **Custom metronome timbre**. Load any short audio (a drum hit, a finger snap)
+  as the click. Leading silence is trimmed automatically (otherwise every click
+  lands slightly late and the phase is wrong), the sample is capped at 0.2 s,
+  resampled to the track's sample rate and normalised to full scale. Chosen
+  timbres are remembered. The CLI accepts it too: `--metronome D:\samples\click.wav`.
+- **First-paint self-healing**. A corrupted WebView2 cache index occasionally
+  leaves the window blank with the UI never mounting. The page now notices within
+  8 seconds that no content appeared and reloads itself once; if that also fails
+  it shows a message with "Reload" and "Use the compatible UI" buttons instead of
+  leaving the user staring at a white window.
+
+### Fixed
+
+- **An unreadable settings file is no longer overwritten with defaults**. The old
+  behaviour: once `ui_prefs.json` was corrupt or locked, the program silently fell
+  back to defaults, and the next click in the UI wrote those defaults back to
+  disk — wiping all the user's settings. Now nothing is saved for that session and
+  the unreadable file is renamed to `ui_prefs.json.bad-<timestamp>` as a backup.
+  The UI states plainly that settings could not be read this time.
+- **Ties now break toward speeding up rather than slowing down**. The old ranking
+  was perfectly neutral between "speed up by x%" and "slow down by x%", but a
+  phase vocoder has to splice more analysis frames when slowing down, and smeared
+  transients are more audible than dropped frames. Slowing down now carries a 0.06
+  log penalty (roughly "prefer 4% more speedup over 4% more slowdown"), applied
+  only when the two directions are genuinely equidistant.
+- **`pip install` produced a package with no UI files**. `pyproject.toml` declared
+  top-level `py-modules` (not packages), so `package-data` never applied and the
+  wheel had no `frontend/`; the desktop app then could not find `index.html` and
+  failed to start. Switched to `data-files`, and the loader falls back to
+  `sys.prefix` when the source tree is unavailable; icon lookup gets the same
+  fallback (settings file location is deliberately unaffected).
+
+### Engineering
+
+- **Packaging scripts are now in the repository**: `packaging/BeatSync.iss`,
+  `BeatSync.spec`, `BeatSync.exe.config` and `ChineseSimplified.isl`, plus a new
+  manually-triggered `.github/workflows/package.yml` that can build the installer
+  on GitHub Actions. These scripts used to live outside the repository, so anyone
+  cloning it could not reproduce the released build.
+- Tests went from 95 to 121: new regression groups for manual segment parsing and
+  planning, custom click trimming/resampling, and settings-file backup-on-corrupt.
 
 ## [1.4.2] — 2026-10-28
 
