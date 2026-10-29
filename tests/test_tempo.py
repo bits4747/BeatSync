@@ -730,6 +730,37 @@ def test_collapse_keeps_non_integer_ratio_sections():
     assert len(out) == 3, f"非整数比应保留分段，实际 {len(out)} 段"
 
 
+def test_is_layer_ratio_accepts_octave_and_dotted():
+    """同一段被数成不同层只可能是八度或附点层（小分子小分母的有理比）。"""
+    for a, b in ((120.0, 90.0), (90.0, 120.0), (62.0, 124.0), (124.0, 62.0),
+                 (95.3, 127.07), (60.0, 80.0), (128.0, 96.0)):
+        assert tc._is_layer_ratio(a, b), f"{a}/{b} 应视为层关系"
+
+
+def test_is_layer_ratio_rejects_real_tempo_change():
+    """真变拍的比值不是小分子小分母——万有引力实测的四个速度都该被拒。"""
+    for a, b in ((127.984, 110.487), (137.482, 127.984), (110.487, 101.583),
+                 (102.8, 140.4)):
+        assert not tc._is_layer_ratio(a, b), f"{a}/{b} 不该视为层关系"
+    # 相差不到 1% 的两个实测值本身就是同一个速度（测速抖动），不是「层关系」
+    # 判据要排除的对象——它落在 1/1 的容差内，本就该合并。
+    assert tc._is_layer_ratio(137.482, 138.005)
+
+
+def test_collapse_keeps_true_multi_tempo_within_family():
+    """万有引力形态：四个真速度被 SNAP_MAX=±35% 全吸进同一家族，仍须保留分段。
+
+    127.98/110.49/137.48/101.58 两两比值 1.159/1.078/1.083 都不是小分子小
+    分母，层比闸门必须拦住；塌缩会把整首音乐送错速度、节拍器每拍敲错数。
+    """
+    levels = [(127.98, 0.0, 60.0), (110.49, 60.0, 90.0),
+              (137.48, 90.0, 160.0), (101.58, 160.0, 200.0)]
+    merged = _merged_from(levels)
+    out = tc._collapse_same_family(merged, 180.0, tc.DEFAULT_MAX_SLOWDOWN,
+                                   tc.DEFAULT_MAX_SPEEDUP)
+    assert len(out) == 4, f"真多速应保留 4 段，实际 {len(out)} 段"
+
+
 def test_collapse_touches_nothing_under_three_sections():
     """少于 3 段谈不上「来回横跳」，一律不动（两段变速必须保留）。"""
     merged = _mk_merged(120.0, 90.0)

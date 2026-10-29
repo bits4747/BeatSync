@@ -1181,8 +1181,11 @@ OUTBEATS_MAX_STEP = 0.060     # 单块相位修正量上限（秒）——比例
 OUTBEATS_DEADBAND = 0.02      # 块质心偏差小于 2%P 视为常值偏置，不积分（见 _output_beats）
 SEG_SHAPE_MIN_S = 10.0       # 判「来回横跳」时只用不短于它的段（短段测速不可靠）
 SEG_SHAPE_FRAC = 0.06        # 同上，同时要求段长至少占全曲这个比例
-LAYER_REFINE_TOL = 0.005     # 家族选层后精修层速度的搜索半径（±0.5%）
+LAYER_REFINE_TOL = 0.02      # 家族选层后精修层速度的搜索半径（±2%，见 _refine_layer_speed）
 HALVE_MIN_PARITY = 0.93      # 把实测速度减半前，要求实测网格上奇偶拍能量比低于它
+COLLAPSE_DOM_COVER = 0.60    # 塌缩前，长段里最大一簇（±5%）的时长占比下限（见 _dominant_cover）
+LAYER_RATIO_MAX = 6          # 「只差一个层」允许的最大分子/分母（见 _is_layer_ratio）
+LAYER_RATIO_TOL = 0.02       # 同上，有理比容差
 
 
 def _min_cost_layer(bpm: float, target: float, max_slowdown: float,
@@ -1922,6 +1925,60 @@ def _layer_explains_all(onset, sr: int, L: float, spans):
     return True
 
 
+def _dominant_cover(bpms, wts, tol: float = 0.05) -> float:
+    """长段里最大一簇（相对 ±tol）的时长占比。
+
+    塌缩的前提是「整首就一个速度」：只有当一个速度能解释**大部分时长**时，
+    各段之间测速的差异才可能是层级抖动/测速误差。真有多个速度时（万有引力
+    128/138/110/102），最大簇只占 30%~40%。
+
+    实测（2026-10-28，全库 44 首，±5%）：单速曲 0.60~1.00（多数 ≥0.94）；
+    真变拍曲「万有引力」0.37、「在这里停一下」0.35、「天堂与泥土」0.53、
+    「卧室」0.52。阈值 0.60 只让这几首保留分段，其余 40 首行为不变。
+    """
+    tot = float(sum(wts)) or 1.0
+    best = 0.0
+    for b in bpms:
+        if b <= 0:
+            continue
+        s = sum(w for v, w in zip(bpms, wts) if v > 0 and abs(v / b - 1.0) <= tol)
+        if s / tot > best:
+            best = s / tot
+    return best
+
+
+def _is_layer_ratio(a: float, b: float, nmax: int = LAYER_RATIO_MAX,
+                    tol: float = LAYER_RATIO_TOL) -> bool:
+    """两个实测速度是否只差一个**层**：比值接近 n/m（n、m ≤ nmax）。
+
+    音乐里同一段被数成不同层，只可能是八度（2、1/2）或附点层（3/2、2/3、
+    4/3、3/4）这类**简单有理比**。用「小分子小分母」而不是任意整数比，
+    才能把「层抖动」与「真变拍」分开：
+      · 120 / 90 = 4/3 —— 层抖动，该合并；
+      · 128 / 110.5 = 1.159、138 / 128 = 1.078、110.5 / 102 = 1.083 ——
+        都不是小分子小分母（最近的是 7/6、14/13、13/12），是四个真速度。
+    """
+    if a <= 0 or b <= 0:
+        return False
+    x = max(a, b) / min(a, b)
+    for n in range(1, nmax + 1):
+        for m in range(1, nmax + 1):
+            r = n / m
+            if abs(x - r) <= tol * r:
+                return True
+    return False
+
+
+def _all_layer_ratios(bpms) -> bool:
+    """所有长段速度是否两两只差一个层（见 `_is_layer_ratio`）。"""
+    vals = [float(v) for v in bpms if v and v > 0]
+    for i in range(len(vals)):
+        for j in range(i + 1, len(vals)):
+            if not _is_layer_ratio(vals[i], vals[j]):
+                return False
+    return True
+
+
 def _refine_layer_speed(onset, sr: int, L: float, t0: float, t1: float,
                         tol: float = LAYER_REFINE_TOL):
     """把家族选出的层速度在 onset 包络上精修（相位自由，只定周期）。
@@ -1933,9 +1990,22 @@ def _refine_layer_speed(onset, sr: int, L: float, t0: float, t1: float,
     两者每拍差 0.5ms、465 拍累计 240ms——听感就是「前半段还凑合、后半段
     越来越错拍」（用户 2026-10-26 报的就是这个）。
 
-    所以选定层后必须回到 onset 上把周期精修回来。搜索半径只有 ±0.5%，远
-    小于家族内相邻层的 4/3 倍距，不可能翻层，只修掉选层偏差；拟合不可靠时
-    原值返回。
+    所以选定层后必须回到 onset 上把周期精修回来。
+
+    半径 ±2%（2026-10-28 由 ±0.5% 放宽）：家族层是「一组实测值里最低那个」再吸附
+    到整数家族，最坏情况下与真值差多少并不由 ±0.5% 决定。实测「满月」：真值
+    61.99875，候选层里 `low` 取到了 95.2692（一个 16 秒短段的实测值），
+    `_snap_family(95.2692, base=129.115)` 落到 61.56535（偏低 0.70%），
+    ±0.5% 半径根本够不到真值，只修到 61.837（仍偏低 0.26%）→ rate=0.9703 把音乐
+    送到 60.159 BPM，而节拍器按名义 60.000 敲，每拍差 2.65ms、270 拍累计 715ms，
+    听感是「整首没踩准」（用户 2026-10-28 报的就是这个，尤其没人声的伴奏段落）。
+
+    为什么 ±2% 不会跳层：家族内相邻层的最小倍距是 4/3（log2≈0.415），±2% 连
+    它的二十分之一都不到；实测八首（满月/万有引力/乏善可陈/艳红/地图/夏夜晚风/
+    奢香夫人/红尘客栈）放宽后只有满月变化（61.837→62.004，误差 0.26%→0.009%），
+    其余七首误差不变或更小。
+
+    拟合不可靠时原值返回。
     """
     P0 = 60.0 / L
     if onset is None or len(onset) < 8 or not (0.2 <= P0 <= 2.5):
@@ -2005,6 +2075,22 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
     if base is None:
         return merged
 
+    # ①b 层抖动还是真变拍？两条判据任一成立才允许塌缩：
+    #   · 主簇覆盖 ≥ COLLAPSE_DOM_COVER：一个速度能解释大部分时长，其余段是
+    #     少数派的层级抖动（「满月」16 秒的 95.27 对 246 秒的 124）。
+    #   · 层比两两都是小分子小分母：同一段被数成不同层只会是八度（2、1/2）
+    #     或附点层（3/2、2/3、4/3、3/4）；120|90|120|90 这种各占一半的层抖动
+    #     主簇覆盖只有 0.50，但比值恰好 4/3，仍该合并。
+    #
+    # 为什么不能只用家族覆盖：SNAP_MAX=±35% 太宽，四个相差 1.36 倍的速度也
+    # 能被算成「同一整数家族」（万有引力 128/138/110/102 全吸进 base=110.487，
+    # 覆盖 100%）。为什么不能只用其中一条：见上面两条各自的失效场景。
+    _long_bpms = [sp.bpm for _s0, _s1, sp in longs]
+    _long_wts = [s1 - s0 for s0, s1, _sp in longs]
+    if (_dominant_cover(_long_bpms, _long_wts) < COLLAPSE_DOM_COVER
+            and not _all_layer_ratios(_long_bpms)):
+        return merged
+
     if onset is None or sr <= 0:
         # 无包络（单元测试直调）：命中率无从验证，取家族内最低实测层、
         # 规整网格兜底。
@@ -2060,7 +2146,7 @@ def _collapse_same_family(merged, target: float, max_slowdown: float,
         # 候选层来自「代价并列取最低」，等价于取实测值的最小值——系统性偏低，
         # 会以 rate=a2/L 的形式把音乐送到偏离目标的 BPM 上（节拍器周期恒为
         # 60/a2，于是每拍累积固定偏差，后半段越来越错拍）。先精修层速度，
-        # 再按精修后的层重做闸门与网格；精修半径 ±0.5% 远小于层间距，翻不了层。
+        # 再按精修后的层重做闸门与网格；半径 ±2% 远小于层间距（4/3），翻不了层。
         L_ref = _refine_layer_speed(onset, sr, L, t0, t1)
         if abs(L_ref - L) > 1e-9:
             if not _layer_explains_all(onset, sr, L_ref, spans):

@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.4.0**. Every release bumps the version
+**Versioning rules**: current version **1.4.1**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -18,6 +18,37 @@ The same version number must stay consistent in three places: this file,
 `_packaging/BeatSync.iss`.
 
 ---
+
+## [1.4.1] — 2026-10-28
+
+### Fixed
+
+- **A constant-tempo song measured at different octave layers left the metronome
+  drifting behind in the second half** ("the stretching is right, but the clicks
+  are off"). The family layer takes the *lowest* measured section tempo, which
+  can come from a short section, and the refinement radius was only ±0.5% — not
+  enough to reach the true tempo. The 0.26% residual accumulated to 739 ms over
+  270 beats. The radius is now ±2% (still far below the 4/3 spacing between
+  adjacent family layers): the layer for that song moved 61.837 → 62.004, the
+  rendered beat period 997.27 ms → 999.99 ms, and the whole-song drift
+  −739 ms → −2.5 ms.
+- **Songs with genuine tempo changes were collapsed into a single tempo**
+  ("it is 128 / 178 / 137 / 115, but you only found one"). The family snapping
+  tolerance of ±35% was wide enough to treat four speeds 1.36× apart as one
+  integer family. A new "layer ratio" gate only allows collapsing when every
+  pair of long-section tempos is a small-numerator/denominator ratio (octave 2,
+  dotted layers 3/2, 4/3, ...).
+
+### Notes
+
+- The layer-ratio gate and the dominant-cluster duration share are combined with
+  **or**: the first covers layer jitter split evenly across sections
+  (120|90|120|90, ratio exactly 4/3), the second covers a minority short section
+  dragging the layer (a 16 s section at 95.27 against 246 s at 124). Sections are
+  kept only when both agree the song is not constant-tempo.
+- Library-wide A/B over 44 songs: 3 songs correctly gained real sections
+  (genuine tempo changes), the other 41 only saw 0.001%–0.06% layer refinement
+  (moving towards integer values).
 
 ## [1.4.0] — 2026-10-27
 
