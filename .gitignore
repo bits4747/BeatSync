@@ -14,6 +14,9 @@ conversion_report.csv
 gui_trace.log
 app_error.log
 _smoke_result.json
+# `--smoke` 会在仓库根跑一次真实转换，产物落在默认输出目录
+tempo_converted/
+_smoke_test*.wav
 
 # numba JIT 缓存（首次运行自动重建）
 _ncache/
