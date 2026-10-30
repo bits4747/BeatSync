@@ -193,6 +193,20 @@ try {
     </section>
   </main>
 
+  <!-- 试听播放条：原曲 / 变速后共用这一条。
+       刻意不放进文件行里——转换过程中每完成一首都会重建那一行，
+       行内播放器会被连根拔掉而声音还在放，进度和时长就全丢了。 -->
+  <section id="playerBar" class="player card hidden">
+    <span id="plKind" class="pl-kind src">原曲</span>
+    <span id="plName" class="pl-name">—</span>
+    <button id="plClose" class="fi-btn" type="button" data-title-zh="关闭播放条" data-title-en="Close the player" title="关闭播放条">
+      <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+    <input id="plSeek" class="pl-seek" type="range" min="0" max="1000" value="0" step="1"
+           data-title-zh="拖动可以跳到任意位置" data-title-en="Drag to jump anywhere" title="拖动可以跳到任意位置">
+    <span class="pl-time"><b id="plCur">0:00</b> / <span id="plDur">0:00</span></span>
+  </section>
+
   <!-- 操作栏 -->
   <section class="actions card">
     <button id="btnStart" class="btn primary big" disabled data-t="start">开始处理</button>

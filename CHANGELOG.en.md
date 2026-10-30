@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.6.0**. Every release bumps the version
+**Versioning rules**: current version **1.7.0**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -18,6 +18,37 @@ The same version number must stay consistent in three places: this file,
 `packaging/BeatSync.iss`.
 
 ---
+
+## [1.7.0] — 2026-10-31
+
+### Added
+
+- **The converted result is now previewable in the app.** Each row has two play
+  buttons: "Original" and "Converted". Previously only the source could be
+  played, so checking whether the metronome lined up or a beat got missed meant
+  digging the output out of a folder and opening it in another player. Until a
+  file is converted the "Converted" button is greyed out — it stays visible so
+  people know the feature exists.
+- **Playback has a seekable progress bar.** A single player bar at the bottom
+  shows the version tag ("Original" / "Converted") and file name on the left,
+  a progress bar in the middle, and "current / total" time on the right
+  (e.g. `0:37 / 3:12`). Seeking matters because previewing is mostly about
+  jumping straight to the section whose tempo changed. While dragging only the
+  readout updates; the actual jump happens on release, otherwise scrubbing
+  produces a burst of noise.
+- The bar is a native range input, so arrow keys work too; it stays disabled
+  until the duration is known so dragging never silently does nothing.
+
+### Fixed
+
+- The player bar is global and deliberately **not** inside a file row. Every
+  finished file rebuilds its row during a run, which would rip an inline player
+  out while the audio keeps playing and lose the position and duration.
+- Removing the track that is currently playing (single delete, delete selected,
+  clear finished) stops playback, instead of leaving audio running with no
+  visible control.
+- Switching the interface language re-renders the player bar's version tag and
+  the inline button labels.
 
 ## [1.6.0] — 2026-10-30
 

@@ -119,6 +119,12 @@ const ZH = {
   removeTip: "移除",
   previewTip: "试听",
   previewFail: "这首放不出来（格式不支持，或文件已被移动）",
+  plOriginal: "原曲",
+  plConverted: "变速后",
+  plOriginalTip: "试听原曲（可拖进度条）",
+  plConvertedTip: "试听变速后的成品（可拖进度条）",
+  plNoOut: "还没转换，转换完成后这里就能试听",
+  plStop: "停止",
 
   // 逐曲手动设置
   perLabel: "原速",
@@ -255,6 +261,12 @@ const EN = {
   removeTip: "Remove",
   previewTip: "Preview",
   previewFail: "Cannot play this track (unsupported format, or the file moved)",
+  plOriginal: "Original",
+  plConverted: "Converted",
+  plOriginalTip: "Preview the original (drag the bar to seek)",
+  plConvertedTip: "Preview the converted result (drag the bar to seek)",
+  plNoOut: "Not converted yet — this becomes playable once it finishes",
+  plStop: "Stop",
 
   perLabel: "Original tempo",
   perAuto: "Auto",
@@ -301,7 +313,8 @@ const state = {
   bridge: null,
   mock: false,
   previewAudio: null,
-  playing: null,      // {item, audio, btn}：正在试听的那一首（同时只允许一首）
+  player: null,       // {item, kind, audio, btn}：正在试听的那一首（同时只允许一首）
+  seeking: false,     // 正在拖进度条：此时别让 timeupdate 反写滑块，否则滑块会被拽回去
   lang: "zh",         // 当前界面语言；默认中文
   // 用户导入的自定义节拍器音色：{ "import:完整路径": "显示名" }
   // 与 ui_prefs 里的 customTimbres 对应（换机器/换路径时那条就失效了，
@@ -368,6 +381,13 @@ function refreshDynamicText() {
   showOutDir();
   renderTimbres();
   syncThemeIcons();
+  // 播放条上的「原曲 / 变速后」标签是运行期写进去的，切语言要重刷一次
+  // （行内按钮不用管：上面 renderFiles() 已经按新语言重建了）
+  const pb = state.player;
+  if (pb) {
+    const tag = $("#plKind");
+    if (tag) tag.textContent = t(pb.kind === "out" ? "plConverted" : "plOriginal");
+  }
   if (!state.running) {
     $("#progressLabel").textContent = t("ready");
   }
@@ -570,6 +590,13 @@ function parentOf(p) {
   return i > 0 ? s.slice(0, i) : s;
 }
 
+/* 从列表里删掉一首之前必须先停掉它的试听：
+   否则行没了、播放条还在、声音还在放，用户找不到地方停。 */
+function forgetItem(item) {
+  const p = state.player;
+  if (p && p.item === item) stopPlayback();
+}
+
 function addPaths(paths, root) {
   let added = 0;
   for (const p of paths || []) {
@@ -683,6 +710,7 @@ function fileRow(item) {
   btnDel.title = t("removeTip");
   btnDel.innerHTML = '<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
   btnDel.onclick = () => {
+    forgetItem(item);
     state.files.delete(String(item.path).toLowerCase());
     renderFiles();
   };
@@ -738,50 +766,171 @@ function fileRow(item) {
 const TAP_RESET = 3000;
 const TAP_MIN_GAP = 200;
 
-/* ---------------- 逐曲试听 ---------------- */
-// 同一时刻只播一首：点第二首的播放会先把上一首停掉，否则两首歌叠在一起没法跟着点。
-function stopPlayback() {
-  const a = state.playing;
-  if (!a) return;
-  a.audio.pause();
-  a.audio.src = "";
-  state.playing = null;
-  if (a.btn) {
-    a.btn.classList.remove("on");
-    a.btn.innerHTML = PLAY_ICON;
-  }
+/* ---------------- 试听播放器（原曲 / 变速后） ---------------- */
+/* 同一时刻只播一路：点第二首（或同一首的另一个版本）先把上一路停掉，
+   否则两首歌叠在一起没法跟着点拍。
+   播放条是全局唯一的一条，**不放在文件行里**：转换过程中每完成一首都会
+   renderFiles() 重建行，行内的播放器会被连根拔掉，而声音还在放，状态就散了。 */
+const PLAY_ICON = '<svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>';
+
+function isPlaying(item, kind) {
+  return !!(state.player && state.player.item === item && state.player.kind === kind);
 }
 
-const PLAY_ICON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>';
-const STOP_ICON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" stroke="none"><rect x="7" y="6" width="10" height="12" rx="1.5"/></svg>';
+/* 播放条上的时间：分钟:秒（用户要的就是「播放到几分几秒」） */
+function fmtTime(sec) {
+  const s = Math.max(0, Math.floor(Number(sec) || 0));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return m + ":" + (r < 10 ? "0" + r : String(r));
+}
 
-async function togglePlay(item, btn) {
-  // 已经在放这首 → 停下来
-  if (state.playing && state.playing.item === item) {
-    stopPlayback();
-    return;
+function stopPlayback() {
+  const p = state.player;
+  state.player = null;
+  state.seeking = false;
+  if (p) {
+    p.audio.onended = null;
+    p.audio.onerror = null;
+    p.audio.ontimeupdate = null;
+    p.audio.onloadedmetadata = null;
+    p.audio.ondurationchange = null;
+    try { p.audio.pause(); } catch (e) { }
+    p.audio.src = "";
   }
+  const bar = $("#playerBar");
+  if (bar) bar.classList.add("hidden");
+  // 行内按钮的「正在放」状态跟着复位（行可能是重建出来的，用选择器兜一遍）
+  document.querySelectorAll(".per-play.on").forEach((b) => {
+    b.classList.remove("on");
+    const lbl = b.querySelector(".pp-txt");
+    if (lbl && b.dataset.label) lbl.textContent = b.dataset.label;
+    if (b.dataset.tip) b.title = b.dataset.tip;
+  });
+}
+
+/* 让行内按钮显示当前状态（行是重建出来的，所以状态只能从 state.player 反推） */
+function syncPlayBtn(btn, item, kind) {
+  const on = isPlaying(item, kind);
+  btn.classList.toggle("on", on);
+  const lbl = btn.querySelector(".pp-txt");
+  if (lbl && btn.dataset.label) lbl.textContent = on ? t("plStop") : btn.dataset.label;
+  btn.title = on ? t("plStop") : (btn.dataset.tip || "");
+}
+
+/* 行内的一个试听按钮：kind = "src"（原曲）/ "out"（变速后） */
+function mkPlayBtn(item, kind) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  const on = isPlaying(item, kind);
+  btn.className = "fi-btn per-play" + (on ? " on" : "");
+  const hasOut = !!(item.info && item.info.out);
+  btn.dataset.label = t(kind === "out" ? "plConverted" : "plOriginal");
+  btn.dataset.tip = kind === "out"
+    ? (hasOut ? t("plConvertedTip") : t("plNoOut"))
+    : t("plOriginalTip");
+  btn.innerHTML = PLAY_ICON + '<span class="pp-txt"></span>';
+  const lbl = btn.querySelector(".pp-txt");
+  lbl.textContent = on ? t("plStop") : btn.dataset.label;
+  btn.title = on ? t("plStop") : btn.dataset.tip;
+  // 还没转换完：按钮留着（让用户知道有这个功能）但点不动
+  if (kind === "out" && !hasOut) btn.disabled = true;
+  btn.onclick = (ev) => {
+    ev.stopPropagation();
+    if (btn.disabled) return;
+    playItem(item, kind, btn);
+  };
+  return btn;
+}
+
+async function playItem(item, kind, btn) {
+  if (isPlaying(item, kind)) { stopPlayback(); return; }
   stopPlayback();
-  const r = await state.bridge.audioUrl(item.path);
+  const path = kind === "out" ? (item.info && item.info.out) : item.path;
+  if (!path) { toast(t("plNoOut"), true); return; }
+  const r = await state.bridge.audioUrl(path);
   if (!r || !r.ok) {
     toast(r && r.error ? r.error : t("previewFail"), true);
     return;
   }
   const audio = new Audio(r.url);
-  audio.preload = "auto";
+  audio.preload = "metadata";
   audio.onended = () => stopPlayback();
   audio.onerror = () => { stopPlayback(); toast(t("previewFail"), true); };
+  audio.ontimeupdate = () => { if (!state.seeking) paintProgress(audio); };
+  audio.onloadedmetadata = () => paintProgress(audio);
+  audio.ondurationchange = () => paintProgress(audio);
   try {
     await audio.play();
   } catch (e) {
     toast(t("previewFail"), true);
     return;
   }
-  state.playing = { item, audio, btn };
-  if (btn) {
-    btn.classList.add("on");
-    btn.innerHTML = STOP_ICON;
+  state.player = { item, kind, audio, btn };
+  showPlayerBar(item, kind, audio);
+  if (btn) syncPlayBtn(btn, item, kind);
+}
+
+/* 把当前时间 / 总时长 / 进度滑块刷成 audio 的状态 */
+function paintProgress(audio) {
+  const bar = $("#playerBar");
+  if (!bar || bar.classList.contains("hidden")) return;
+  const cur = audio.currentTime || 0;
+  const dur = audio.duration;
+  $("#plCur").textContent = fmtTime(cur);
+  $("#plDur").textContent = fmtTime(isFinite(dur) ? dur : 0);
+  const seek = $("#plSeek");
+  if (isFinite(dur) && dur > 0) {
+    seek.disabled = false;
+    seek.value = String(Math.round(cur / dur * 1000));
+  } else {
+    // 时长还没解出来（部分格式要等一会）——先禁用拖动，免得拖了没反应
+    seek.disabled = true;
+    seek.value = "0";
   }
+}
+
+function showPlayerBar(item, kind, audio) {
+  const bar = $("#playerBar");
+  bar.classList.remove("hidden");
+  const tag = $("#plKind");
+  tag.textContent = t(kind === "out" ? "plConverted" : "plOriginal");
+  tag.className = "pl-kind " + (kind === "out" ? "out" : "src");
+  const nm = $("#plName");
+  nm.textContent = basename(item.path);
+  nm.title = kind === "out" ? String(item.info.out) : item.path;
+  $("#plSeek").value = "0";
+  $("#plCur").textContent = "0:00";
+  $("#plDur").textContent = "0:00";
+  paintProgress(audio);
+}
+
+/* 进度条：拖动时先只更新数字（state.seeking 挡住 timeupdate 反写），
+   松手再真正跳转——否则边拖边 seek 会一路爆音。 */
+function initPlayerUI() {
+  const seek = $("#plSeek");
+  if (!seek) return;
+  const durOf = () => {
+    const a = state.player && state.player.audio;
+    const d = a && a.duration;
+    return isFinite(d) && d > 0 ? d : 0;
+  };
+  seek.addEventListener("input", () => {
+    const d = durOf();
+    if (!d) return;
+    state.seeking = true;
+    $("#plCur").textContent = fmtTime(Number(seek.value) / 1000 * d);
+  });
+  const commit = () => {
+    const a = state.player && state.player.audio;
+    const d = durOf();
+    if (a && d) a.currentTime = Number(seek.value) / 1000 * d;
+    state.seeking = false;
+  };
+  // change 在松手时发；有的输入法/触屏只发 pointerup，补一次（重复设置同一位置无害）
+  seek.addEventListener("change", commit);
+  seek.addEventListener("pointerup", commit);
+  $("#plClose").onclick = () => stopPlayback();
 }
 
 function tapTempo(item, chip) {
@@ -793,7 +942,7 @@ function tapTempo(item, chip) {
     chip.classList.add("tapping");
     setTimeout(() => chip.classList.remove("tapping"), 400);
     // 第一次点击先告诉用户该怎么用：没在放歌就提示先去点播放（tap 必须跟着音乐才有意义）
-    const playing = state.playing && state.playing.item === item;
+    const playing = state.player && state.player.item === item;
     toast(t(playing ? "tapPlaying" : "tapNoPlay"));
     return;
   }
@@ -846,13 +995,10 @@ function perEditor(item) {
     saveSettings();
   };
 
-  // 试听播放按钮：tap 测速必须先放歌才跟得上拍子，所以按钮放在 tap 左边
-  const play = document.createElement("button");
-  play.type = "button";
-  play.className = "fi-btn per-play";
-  play.title = t("previewTip");
-  play.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>';
-  play.onclick = (ev) => { ev.stopPropagation(); togglePlay(item, play); };
+  // 两个试听按钮：原曲 / 变速后。tap 测速必须先放歌才跟得上拍子，所以放在 tap 左边。
+  // 「变速后」在转换完成前是禁用态（按钮留着，让用户先知道有这么个东西）。
+  const playSrc = mkPlayBtn(item, "src");
+  const playOut = mkPlayBtn(item, "out");
 
   const tap = document.createElement("button");
   tap.type = "button";
@@ -876,7 +1022,7 @@ function perEditor(item) {
     renderFiles();
   };
 
-  box.append(label, input, play, tap, segBtn);
+  box.append(label, input, playSrc, playOut, tap, segBtn);
   // 徽标只在**真的填了**分段时出现：点开「多段」但没填内容，不算生效。
   const n = segFilled(item);
   if (n) {
@@ -1455,6 +1601,7 @@ window.__appEvent = __appEvent;
 
 /* ---------------- 事件绑定 ---------------- */
 function bindUI() {
+  initPlayerUI();
   // 文件
   $("#btnAddFiles").onclick = async () => {
     const files = await state.bridge.selectFiles();
@@ -1479,7 +1626,7 @@ function bindUI() {
   $("#btnDelSel").onclick = () => {
     const n = [...state.files.values()].filter(f => f.checked).length;
     if (!n) { toast(t("selectFirst"), true); return; }
-    for (const [k, f] of [...state.files.entries()]) if (f.checked) state.files.delete(k);
+    for (const [k, f] of [...state.files.entries()]) if (f.checked) { forgetItem(f); state.files.delete(k); }
     renderFiles();
     toast(t("deletedN", { n }));
   };
@@ -1495,7 +1642,11 @@ function bindUI() {
       toast(t("nothingDone"), true);
       return;
     }
-    for (const k of doomed) state.files.delete(k);
+    for (const k of doomed) {
+      const it = state.files.get(k);
+      if (it) forgetItem(it);
+      state.files.delete(k);
+    }
     renderFiles();
     toast(t("clearedDone", { n: doomed.length, left: state.files.size }));
   };

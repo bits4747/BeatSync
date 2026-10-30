@@ -100,7 +100,9 @@ body {
 .app {
   height: 100vh;
   display: grid;
-  grid-template-rows: auto 1fr auto auto;
+  /* topbar / main / 播放条 / 操作栏 / 日志 —— 播放条是第 3 行，
+     所以这里必须是 5 段；少写一段会让日志被挤到隐式行里、整页滚不动。 */
+  grid-template-rows: auto 1fr auto auto auto;
   gap: 12px;
   padding: 14px 16px;
 }
@@ -319,8 +321,16 @@ html[data-lang="en"] .timbre .t-en { display: inline; flex: 1; }
   width: auto; height: 26px; padding: 0 9px;
 }
 .per-tap .tap-txt { font-size: 13.5px; white-space: nowrap; line-height: 1; }
-.per-play { padding: 0 7px; width: 26px; }
+/* 两个试听按钮（原曲 / 变速后）现在带文字，同样要放开 .fi-btn 的 26px 定宽。
+   文字比 tap 短（2-3 字），padding 给少一点，别把整行挤换行。 */
+.per-play {
+  display: inline-flex; align-items: center; gap: 4px;
+  width: auto; height: 26px; padding: 0 8px;
+}
+.per-play .pp-txt { font-size: 13.5px; white-space: nowrap; line-height: 1; }
 .per-play.on { color: var(--accent); background: var(--sel-bg); }
+.per-play:disabled { opacity: .45; cursor: default; }
+.per-play:disabled:hover { color: var(--faint); background: transparent; }
 .per-badge {
   font-size: 13.5px; padding: 2px 8px; border-radius: 999px;
   color: var(--accent); border: 1px solid var(--sel-border); background: var(--sel-bg);
@@ -527,6 +537,33 @@ input[type="range"]::-moz-range-thumb {
   background: var(--accent); border: 2px solid var(--panel); cursor: pointer;
 }
 .rel-label b { color: var(--text); }
+
+/* ---------- 试听播放条 ---------- */
+/* 原曲 / 变速后共用一条：左边是版本标签 + 文件名，中间进度条，右边「当前 / 总时长」。
+   进度条用原生 range 而不是自己画 div——原生 range 自带键盘（左右箭头）与触屏拖动，
+   自己画的还要额外处理 pointer capture，得不偿失。 */
+.player {
+  flex-direction: row; align-items: center; gap: 12px;
+  padding: 9px 14px;
+}
+.pl-kind {
+  flex: none; font-size: 13.5px; font-weight: 600;
+  padding: 3px 10px; border-radius: 999px; border: 1px solid;
+  white-space: nowrap;
+}
+.pl-kind.src { color: var(--accent); border-color: var(--sel-border); background: var(--sel-bg); }
+.pl-kind.out { color: var(--ok); border-color: rgba(61, 220, 151, .35); background: rgba(61, 220, 151, .1); }
+.pl-name {
+  flex: none; max-width: 240px; font-size: 15px; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pl-seek { flex: 1; min-width: 120px; height: 4px; cursor: pointer; accent-color: var(--accent); }
+.pl-seek:disabled { cursor: default; opacity: .5; }
+.pl-time {
+  flex: none; font-size: 15px; color: var(--muted);
+  font-variant-numeric: tabular-nums;   /* 等宽数字：跳动时不会把后面的 / 挤来挤去 */
+}
+.pl-time b { color: var(--text); font-weight: 600; }
 
 /* ---------- 操作栏 ---------- */
 .actions {
