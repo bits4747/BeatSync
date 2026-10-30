@@ -251,6 +251,24 @@ TRAY = tray_icon.TrayCradle(icon_path=None, lang="zh")
 _QUITTING = False
 
 
+def _custom_timbre_list(prefs) -> list:
+    """把偏好里的自定义音色路径转成前端要的 [{key, name}]，只留仍存在的文件。
+
+    换机器/移动/删除文件后那条就该消失，而不是留在列表里点了没声音。
+    """
+    out = []
+    for p in (prefs.get("custom_timbres") or []):
+        if not isinstance(p, str):
+            continue
+        try:
+            f = Path(p)
+            if f.is_file():
+                out.append({"key": tc.custom_timbre(p), "name": f.name})
+        except OSError:
+            continue
+    return out
+
+
 def _pct(value, fallback: float) -> float:
     """把前端传来的百分数（如 25 表示 25%）转成小数（0.25），并夹到 0~100%。"""
     try:
@@ -700,11 +718,7 @@ class Api:
             "note": tc.tr("关闭窗口时收进系统托盘", "Hide to the system tray on close", L),
             # 自定义节拍器音色：只回传仍然存在的文件（换机器/移动/删除后
             # 那条就该消失，而不是留在列表里点了没声音）。
-            "custom_timbres": [
-                {"key": tc.custom_timbre(p), "name": Path(p).name}
-                for p in (PREFS.get("custom_timbres") or [])
-                if isinstance(p, str) and Path(p).is_file()
-            ],
+            "custom_timbres": _custom_timbre_list(PREFS),
         }
 
     def remember_timbre(self, key, lang=None):
@@ -724,10 +738,30 @@ class Api:
         if PREFS_HEALTH["ok"] or not PREFS_HEALTH["exists"]:
             PREFS = tray_icon.save_prefs({"custom_timbres": old}, APP_DIR)
             PREFS_HEALTH = tray_icon.prefs_health()
-        return {"ok": True, "custom_timbres": [
-            {"key": tc.custom_timbre(x), "name": Path(x).name}
-            for x in old if Path(x).is_file()
-        ]}
+        return {"ok": True, "custom_timbres": _custom_timbre_list(PREFS)}
+
+    def forget_timbre(self, key, lang=None):
+        """从偏好里移除一个自定义音色（只摘掉记录，不删用户的音频文件）。
+
+        内置的 6 种音色不在偏好里，调用方不该传——传了也只会返回 ok=True 而不动任何
+        东西，免得前端把内置卡片误标成可删。
+        """
+        global PREFS, PREFS_HEALTH
+        L = lang or tc.get_lang()
+        p = tc.custom_timbre_path(key)
+        if p is None:
+            return {"ok": False, "custom_timbres": _custom_timbre_list(PREFS)}
+        s = str(p)
+        old = [x for x in (PREFS.get("custom_timbres") or [])
+               if isinstance(x, str) and x.lower() != s.lower()]
+        if PREFS_HEALTH["ok"] or not PREFS_HEALTH["exists"]:
+            PREFS = tray_icon.save_prefs({"custom_timbres": old}, APP_DIR)
+            PREFS_HEALTH = tray_icon.prefs_health()
+        else:
+            # 偏好读不出来时不能写盘（会覆盖），但本次会话仍要让它消失
+            PREFS = dict(PREFS)
+            PREFS["custom_timbres"] = old
+        return {"ok": True, "custom_timbres": _custom_timbre_list(PREFS)}
 
     def set_close_to_tray(self, value, lang=None):
         """保存「关闭窗口时收进托盘」开关。返回落盘后的完整偏好。

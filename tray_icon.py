@@ -32,7 +32,7 @@ PREFS_FILE = "ui_prefs.json"
 
 # 默认值刻意是 True：用户提这个需求的原话是「关闭软件后收到系统托盘，不完全退出」，
 # 也就是他期望的默认行为。仍然给开关，方便想「点 × 就退出」的人关掉。
-DEFAULT_PREFS = {"close_to_tray": True}
+DEFAULT_PREFS = {"close_to_tray": True, "custom_timbres": []}
 
 # 上一次 load_prefs 是否真的从磁盘读到了内容（而不是退回默认值）。
 # 见 prefs_health() 与 save_prefs 的注释：读不出来时不能拿默认值覆盖磁盘。
@@ -196,6 +196,15 @@ def load_prefs(app_dir=None) -> dict:
             # 只认真正的布尔；字符串 "false" 之类容易被误解成 True，直接忽略。
             if isinstance(val, bool):
                 out[key] = val
+        elif isinstance(default, list):
+            # 自定义音色路径列表：只要字符串项，去重（Windows 路径不分大小写）。
+            if isinstance(val, list):
+                seen, keep = set(), []
+                for x in val:
+                    if isinstance(x, str) and x.strip() and x.lower() not in seen:
+                        seen.add(x.lower())
+                        keep.append(x)
+                out[key] = keep
         elif isinstance(val, type(default)):
             out[key] = val
     return out
@@ -252,6 +261,10 @@ def save_prefs(patch: dict, app_dir=None) -> dict:
             if isinstance(default, bool):
                 if isinstance(val, (bool, int)):
                     cur[key] = bool(val)
+            elif isinstance(default, list):
+                # 只收字符串项，别的（None/数字/嵌套）一概不进文件。
+                if isinstance(val, list):
+                    cur[key] = [x for x in val if isinstance(x, str)]
             elif isinstance(val, type(default)):
                 cur[key] = val
     try:

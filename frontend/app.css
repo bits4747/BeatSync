@@ -234,6 +234,11 @@ html[data-lang="en"] .timbre .t-en { display: inline; flex: 1; }
 .empty p { font-size: 17px; color: var(--muted); }
 .empty span { font-size: 14.5px; }
 .empty svg { opacity: .55; }
+/* 「每首歌可单独设…」比上面两行低一个视觉层级：它是提示，不是操作引导。 */
+.empty .empty-tip {
+  margin-top: 6px; font-size: 13px; color: var(--faint);
+  padding: 3px 10px; border-radius: 999px; background: var(--chip, rgba(0,0,0,.04));
+}
 
 .file-list { list-style: none; display: flex; flex-direction: column; gap: 7px; }
 
@@ -483,6 +488,16 @@ label.switch { display: flex; align-items: center; gap: 9px; cursor: pointer; pa
 }
 .timbre .play:hover { color: var(--accent-2); background: var(--sel-bg); }
 .timbre.playing .play { color: var(--accent-2); }
+/* 自定义音色的删除按钮：默认压得很淡（避免一排卡片全是红叉），鼠标移到卡片上才显形。
+   触屏/键盘用户拿不到 hover，所以用 :focus-within 兜底，Tab 上去也能看见。 */
+.timbre .del {
+  flex: none; width: 18px; height: 18px; border-radius: 6px;
+  display: grid; place-items: center;
+  color: var(--faint); background: transparent;
+  opacity: 0; transition: opacity .15s, color .15s, background .15s;
+}
+.timbre:hover .del, .timbre:focus-within .del { opacity: 1; }
+.timbre .del:hover { color: var(--danger, #e5484d); background: rgba(229, 72, 77, .12); }
 
 /* 相对音量输入框（原为滑块） */
 .metro-panel .inl { margin-top: 7px; }

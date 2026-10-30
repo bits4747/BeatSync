@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.5.0**. Every release bumps the version
+**Versioning rules**: current version **1.5.1**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -18,6 +18,38 @@ The same version number must stay consistent in three places: this file,
 `packaging/BeatSync.iss`.
 
 ---
+
+## [1.5.1] — 2026-10-30
+
+### Added
+
+- **Custom click sounds can be removed.** Hovering a sound button reveals a
+  small "×"; clicking it only drops that sound from the list and **never
+  deletes your audio file** (the tooltip says so too). If the removed sound was
+  the selected one, the selection falls back to woodblock instead of leaving a
+  dangling "selected value is no longer in the list" state. The compatibility
+  interface (tkinter) gets the same "Remove" button, greyed out while a built-in
+  sound is selected.
+- **The empty list now mentions the per-track options.** Per-track original
+  tempo, multi-section tempo and tap tempo all render inside a track's row, so
+  with zero tracks added none of those controls appear at all — which makes the
+  release look like it changed nothing. The empty state now carries a line
+  reading "Each track then gets its own tempo, multi-section tempo and tap
+  tempo".
+
+### Fixed
+
+- **Custom click sounds were never actually remembered.** Both the reader and
+  the writer of `ui_prefs.json` only walk the keys declared in `DEFAULT_PREFS`,
+  and `custom_timbres` was not among them — so
+  `save_prefs({"custom_timbres": [...]})` silently dropped it. Importing a sound
+  looked fine and worked for the rest of the session, then vanished on restart,
+  with no error anywhere. It is now part of `DEFAULT_PREFS` (defaulting to an
+  empty list); entries are validated as strings and de-duplicated
+  case-insensitively (Windows paths), and bad data is discarded rather than
+  handed downstream. Four regression tests were added, plus seven in
+  `test_app.py` covering `forget_timbre` and the "removing never deletes your
+  file" promise.
 
 ## [1.5.0] — 2026-10-30
 

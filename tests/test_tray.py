@@ -20,14 +20,16 @@ import tray_icon as tray
 # --------------------------------------------------------------------- 偏好文件
 def test_prefs_default_is_close_to_tray(tmp_path: Path):
     """没写过偏好时默认收托盘——这是用户提需求时的期望行为。"""
-    assert tray.load_prefs(tmp_path) == {"close_to_tray": True}
+    prefs = tray.load_prefs(tmp_path)
+    assert prefs["close_to_tray"] is True
+    assert prefs["custom_timbres"] == []
 
 
 def test_save_then_load_roundtrip(tmp_path: Path):
     tray.save_prefs({"close_to_tray": False}, tmp_path)
     assert tray.load_prefs(tmp_path)["close_to_tray"] is False
     assert json.loads((tmp_path / tray.PREFS_FILE).read_text(encoding="utf-8")) == {
-        "close_to_tray": False
+        "close_to_tray": False, "custom_timbres": []
     }
 
 
@@ -49,7 +51,42 @@ def test_save_prefs_accepts_int_like_bool(tmp_path: Path):
 def test_load_prefs_survives_broken_file(tmp_path: Path, payload: str):
     """损坏/类型不对的偏好一律回默认值，绝不让程序启动失败。"""
     (tmp_path / tray.PREFS_FILE).write_text(payload, encoding="utf-8")
-    assert tray.load_prefs(tmp_path) == {"close_to_tray": True}
+    prefs = tray.load_prefs(tmp_path)
+    assert prefs["close_to_tray"] is True
+    assert prefs["custom_timbres"] == []
+
+
+def test_custom_timbres_roundtrip(tmp_path: Path):
+    """自定义音色路径必须真的落盘。
+
+    回归用：`save_prefs` / `load_prefs` 都只处理 `DEFAULT_PREFS` 里声明过的键，
+    `custom_timbres` 一度没在里面，于是「导入音色」写盘时被静默丢弃，
+    下次启动列表就空了——界面上看不出任何错误。
+    """
+    tray.save_prefs({"custom_timbres": ["C:/a.wav", "C:/b.wav"]}, tmp_path)
+    assert tray.load_prefs(tmp_path)["custom_timbres"] == ["C:/a.wav", "C:/b.wav"]
+    raw = json.loads((tmp_path / tray.PREFS_FILE).read_text(encoding="utf-8"))
+    assert raw["custom_timbres"] == ["C:/a.wav", "C:/b.wav"]
+
+
+def test_custom_timbres_dedup_case_insensitive(tmp_path: Path):
+    """Windows 路径不分大小写，同一文件两个写法只留一条。"""
+    tray.save_prefs({"custom_timbres": ["C:/A.wav", "C:/a.wav", "C:/b.wav"]}, tmp_path)
+    assert tray.load_prefs(tmp_path)["custom_timbres"] == ["C:/A.wav", "C:/b.wav"]
+
+
+def test_custom_timbres_drops_non_strings(tmp_path: Path):
+    """偏好文件是用户可手改的，塞数字/对象进去不能让下游炸。"""
+    (tmp_path / tray.PREFS_FILE).write_text(
+        json.dumps({"custom_timbres": ["C:/a.wav", 123, None, {"x": 1}, ""]}),
+        encoding="utf-8")
+    assert tray.load_prefs(tmp_path)["custom_timbres"] == ["C:/a.wav"]
+
+
+def test_custom_timbres_wrong_type_falls_back_to_empty(tmp_path: Path):
+    (tmp_path / tray.PREFS_FILE).write_text(
+        json.dumps({"custom_timbres": "C:/a.wav"}), encoding="utf-8")
+    assert tray.load_prefs(tmp_path)["custom_timbres"] == []
 
 
 def test_save_prefs_is_atomic(tmp_path: Path):

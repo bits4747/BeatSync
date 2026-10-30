@@ -205,6 +205,8 @@ TIMBRE_LABELS = {
     "边击 (sidestick)": "sidestick",
     "拍手 (clap)": "clap",
 }
+# 移除自定义音色后回落到哪个内置音色。木鱼是默认（core 里的 DEFAULT_TIMBRE 也是它）。
+TIMBRE_FALLBACK = "woodblock"
 # 英文对照表：键顺序与值（音色 key）与中文表严格一致，仅显示文字不同。
 TIMBRE_LABELS_EN = {
     "None": None,
@@ -459,6 +461,7 @@ class App:
         self._custom_timbres = dict(s.get("custom_timbres") or {})
         self._refresh_timbre_values()
         self.var_timbre.set(self._label_for_timbre_key(s["timbre_key"]))
+        self._sync_timbre_del_btn()
         self.var_gain.set(s["gain"])
         self.var_engine.set(_label_for_key(engine_labels(), s["engine_key"]))
         self.var_format.set(s["fmt"])
@@ -519,8 +522,37 @@ class App:
         self._refresh_timbre_values()
         self.var_timbre.set(lab)
         self.var_metronome.set(True)
+        self._sync_timbre_del_btn()
         self._set_status_text(self.T(f"已载入节拍器音色：{Path(p).name}",
                                      f"Loaded click sound: {Path(p).name}"))
+
+    def _sync_timbre_del_btn(self):
+        """选中项是内置音色时把「移除」置灰——内置的删不掉，点了只会让人困惑。"""
+        btn = getattr(self, "btn_timbre_del", None)
+        if btn is None:
+            return
+        key = self._cur_timbre_key()
+        btn.state(["!disabled"] if key and tc.is_custom_timbre(key) else ["disabled"])
+
+    def _remove_custom_timbre(self):
+        """把当前选中的自定义音色从下拉框里摘掉（不删用户的音频文件）。
+
+        选中项随后回落到木鱼：留在自定义项上会导致「下拉框显示的值已经不在列表里」，
+        生成时后端拿到一个不认识的 key 会退回默认音色，界面却还标着它。
+        """
+        key = self._cur_timbre_key()
+        if not key or not tc.is_custom_timbre(key):
+            return
+        p = tc.custom_timbre_path(key)
+        name = p.name if p is not None else key
+        for lab, k in list(self._custom_timbres.items()):
+            if k == key:
+                del self._custom_timbres[lab]
+        self._refresh_timbre_values()
+        self.var_timbre.set(_label_for_key(timbre_labels(), TIMBRE_FALLBACK))
+        self._sync_timbre_del_btn()
+        self._set_status_text(self.T(f"已移除节拍器音色：{name}",
+                                     f"Removed click sound: {name}"))
 
     def _set_status_text(self, text: str):
         """把状态文字按当前语言重新呈现。中文是基准态，逐字保留；
@@ -618,6 +650,12 @@ class App:
         self.cmb_timbre.pack(side="left")
         ttk.Button(timbre_cell, text=self.T("载入…", "Load…"), width=6,
                    command=self._pick_custom_timbre).pack(side="left", padx=(4, 0))
+        # 删除只在选中的是自定义音色时才有意义；内置 6 种不在偏好里，删不掉也不用删。
+        self.btn_timbre_del = ttk.Button(
+            timbre_cell, text=self.T("移除", "Remove"), width=6,
+            command=self._remove_custom_timbre)
+        self.btn_timbre_del.pack(side="left", padx=(4, 0))
+        self.cmb_timbre.bind("<<ComboboxSelected>>", lambda e: self._sync_timbre_del_btn())
         ttk.Label(g, text=self.T("变速引擎:", "Time-stretch engine:")).grid(row=2, column=2, sticky="e", padx=4)
         el = engine_labels()
         self.var_engine = tk.StringVar(value=list(el)[0])

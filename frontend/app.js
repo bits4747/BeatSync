@@ -12,6 +12,9 @@ const TIMBRES = [
   { k: "clap", cn: "拍手", en: "Clap" },
 ];
 
+// 删掉自定义音色后要回落到哪个内置音色。木鱼是默认音色（index.html 里标 .on 的也是它）。
+const FALLBACK_TIMBRE = "woodblock";
+
 /* ---------------- 语言（中文 / 英文） ---------------- */
 /* 界面默认中文，右上角按钮切换，选择存 localStorage。
    静态文案走 data-t（index.html 里两种语言都写在 DOM 上，由 CSS 决定显示哪个，
@@ -35,6 +38,7 @@ const ZH = {
   addFolder: "＋ 添加文件夹",
   emptyTitle: "拖入音频文件 / 文件夹",
   emptyHint: "或点击右上角按钮添加（wav · mp3 · flac · ogg · aiff 等）",
+  emptyPerTrack: "加入后每首歌可单独设原速、多段变速、手动测速",
   labelTarget: "目标速度",
   labelSource: "原速",
   hintAuto: "留空 = 自动检测",
@@ -136,6 +140,7 @@ const ZH = {
   timbreLoad: "载入…",
   timbreLoadTip: "用一段自己的音频当节拍器音（会截取音头）",
   timbreUnavailable: "这个自定义音色找不到了（可能被移动或删除）",
+  timbreDelTip: "从列表里移除这个音色（不会删除你的音频文件）",
   themeDark: "主题：夜间（点击切换到日间）",
   themeLight: "主题：日间（点击切换到夜间）",
   themeToggle: "切换日间 / 夜间模式",
@@ -164,6 +169,7 @@ const EN = {
   addFolder: "＋ Add folder",
   emptyTitle: "Drop audio files / folders here",
   emptyHint: "or use the buttons at the top right (wav · mp3 · flac · ogg · aiff …)",
+  emptyPerTrack: "Each track then gets its own tempo, multi-section tempo and tap tempo",
   labelTarget: "Target tempo",
   labelSource: "Original tempo",
   hintAuto: "Leave blank to auto-detect",
@@ -263,6 +269,7 @@ const EN = {
   timbreLoad: "Load…",
   timbreLoadTip: "Use your own audio as the click sound (only the attack is kept)",
   timbreUnavailable: "This custom sound is gone (moved or deleted)",
+  timbreDelTip: "Remove this sound from the list (your audio file is not deleted)",
   themeDark: "Theme: dark (click for light)",
   themeLight: "Theme: light (click for dark)",
   themeToggle: "Toggle light / dark mode",
@@ -393,6 +400,7 @@ const realBridge = () => ({
   // 自定义节拍器音色
   pickTimbre: (lang) => window.pywebview.api.pick_timbre_file(lang),
   rememberTimbre: (key, lang) => window.pywebview.api.remember_timbre(key, lang),
+  forgetTimbre: (key, lang) => window.pywebview.api.forget_timbre(key, lang),
 });
 
 function mockBridge() {
@@ -459,6 +467,12 @@ function mockBridge() {
     setCloseToTray: async (v) => ({ ok: true, close_to_tray: !!v }),
     pickTimbre: async () => "",
     rememberTimbre: async () => ({ ok: false }),
+    // 预览模式下没有后端偏好可写，就地过滤一遍，让删除按钮的行为看得见
+    forgetTimbre: async (key) => {
+      delete state.customTimbres[key];
+      return { ok: true, custom_timbres: Object.entries(state.customTimbres)
+        .map(([k, name]) => ({ key: k, name })) };
+    },
   };
 }
 
@@ -1108,13 +1122,22 @@ function renderTimbres() {
       ? `<span class="t-cn">♪ ${escapeHtml(tb.cn)}</span><span class="t-en">♪ ${escapeHtml(tb.en)}</span>`
       : `<span class="t-cn">${tb.cn}</span><span class="t-en">${tb.en}</span>`;
     b.innerHTML = nameHtml +
-      `<i class="play" title="${t("previewTip")}"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor"><polygon points="6 3 20 12 6 21"/></svg></i>`;
+      `<i class="play" title="${t("previewTip")}"><svg viewBox="0 0 24 24" width="11" height="11" fill="currentColor"><polygon points="6 3 20 12 6 21"/></svg></i>` +
+      (tb.custom
+        ? `<i class="del" title="${t("timbreDelTip")}"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></i>`
+        : "");
     b.onclick = () => { timbreSelect(tb.k); saveSettings(); playPreview(b, tb.k); };
     b.querySelector(".play").onclick = (e) => {
       e.stopPropagation();
       timbreSelect(tb.k); saveSettings();
       playPreview(b, tb.k);
     };
+    if (tb.custom) {
+      b.querySelector(".del").onclick = (e) => {
+        e.stopPropagation();
+        removeTimbre(tb.k);
+      };
+    }
     box.appendChild(b);
   }
   // 「载入…」格子：和音色卡片同尺寸，混在最后，点了弹文件选择
@@ -1166,6 +1189,31 @@ function applyCustomTimbres(list) {
     if (it && it.key) out[it.key] = it.name || it.key;
   }
   state.customTimbres = out;
+}
+
+/* 删掉一个自定义音色：只从列表里摘掉，不删用户的音频文件。
+   如果删的正是当前选中的那个，回落到内置的木鱼——否则会出现「选中的音色在列表里
+   已经不存在」的悬空状态，后端拿到一个它不认识的 key 会退回默认，界面却还标着它。 */
+async function removeTimbre(key) {
+  if (!key) return;
+  const wasCurrent = (state.wantTimbre || "") === key;
+  if (state.bridge && state.bridge.forgetTimbre) {
+    try {
+      const r = await state.bridge.forgetTimbre(key, curLang());
+      if (r && r.ok) applyCustomTimbres(r.custom_timbres);
+    } catch (e) {
+      toast(t("timbreUnavailable"), true);
+      return;
+    }
+  } else {
+    delete state.customTimbres[key];
+  }
+  if (wasCurrent) {
+    state.wantTimbre = FALLBACK_TIMBRE;
+    timbreSelect(FALLBACK_TIMBRE);
+  }
+  renderTimbres();
+  saveSettings();
 }
 
 
