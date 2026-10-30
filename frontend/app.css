@@ -312,6 +312,15 @@ html[data-lang="en"] .timbre .t-en { display: inline; flex: 1; }
 .per-label { color: var(--faint); }
 .fi-per .per-bpm { width: 88px; padding: 3px 8px; font-size: 14.5px; text-align: center; }
 .per-tap.tapping { color: var(--accent); background: var(--sel-bg); }
+/* tap 按钮现在带文字：光一个音符图标没人知道那是「跟着音乐点」。
+   .fi-btn 定死了 26px 方框，这里必须把宽度放开，否则文字会被压没（只剩个音符）。 */
+.per-tap {
+  display: inline-flex; align-items: center; gap: 5px;
+  width: auto; height: 26px; padding: 0 9px;
+}
+.per-tap .tap-txt { font-size: 13.5px; white-space: nowrap; line-height: 1; }
+.per-play { padding: 0 7px; width: 26px; }
+.per-play.on { color: var(--accent); background: var(--sel-bg); }
 .per-badge {
   font-size: 13.5px; padding: 2px 8px; border-radius: 999px;
   color: var(--accent); border: 1px solid var(--sel-border); background: var(--sel-bg);

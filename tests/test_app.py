@@ -111,3 +111,82 @@ def test_remember_timbre_caps_at_eight(api, tmp_path: Path):
     kept = app.PREFS["custom_timbres"]
     assert len(kept) == 8
     assert kept[0].endswith("c9.wav")
+
+
+# ------------------------------------------------- 试听（本机回环 HTTP 服务）
+# tap 测速要跟着音乐点，所以界面必须有播放按钮；播放走的是本机服务而不是 file://。
+def test_audio_url_serves_the_file(api, tmp_path: Path):
+    """登记的音频能被取回，字节数与磁盘一致。"""
+    import urllib.request
+
+    p = _wav(tmp_path)
+    res = api.audio_url(str(p))
+    assert res["ok"] is True
+    body = urllib.request.urlopen(res["url"], timeout=10).read()
+    assert body == p.read_bytes()
+
+
+def test_audio_url_supports_range(api, tmp_path: Path):
+    """拖动进度条要 Range：回 206 且 Content-Range 正确。"""
+    import urllib.request
+
+    p = _wav(tmp_path)
+    url = api.audio_url(str(p))["url"]
+    req = urllib.request.Request(url, headers={"Range": "bytes=4-11"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        assert r.status == 206
+        assert r.headers["Content-Range"].startswith("bytes 4-11/")
+        assert r.read() == p.read_bytes()[4:12]
+
+
+def test_audio_url_refuses_non_audio(api, tmp_path: Path):
+    """不是音频后缀就不给播（别让这个服务变成任意文件读取口子）。"""
+    q = tmp_path / "notes.txt"
+    q.write_text("hi", encoding="utf-8")
+    assert api.audio_url(str(q))["ok"] is False
+
+
+def test_audio_url_refuses_missing(api, tmp_path: Path):
+    """文件已被移动/删除：明确报错，而不是给一个点了没反应的地址。"""
+    res = api.audio_url(str(tmp_path / "gone.mp3"))
+    assert res["ok"] is False
+    assert res["error"]
+
+
+def test_audio_url_handles_unicode_path(api, tmp_path: Path):
+    """中文/空格路径必须能播——这是最常见的真实路径。"""
+    import urllib.request
+
+    p = _wav(tmp_path, "中文 名 字.wav")
+    res = api.audio_url(str(p))
+    assert res["ok"] is True
+    assert urllib.request.urlopen(res["url"], timeout=10).read() == p.read_bytes()
+
+
+def test_preview_server_404_for_unregistered():
+    """只服务显式登记过的路径，别的路径一律 404。"""
+    import audio_server
+    import urllib.error
+    import urllib.request
+
+    srv = audio_server.PreviewServer()
+    try:
+        url = srv.register(_wav_stub())
+        assert url
+        with pytest.raises(urllib.error.HTTPError) as ei:
+            urllib.request.urlopen(f"http://127.0.0.1:{srv.port}/etc/passwd", timeout=10)
+        assert ei.value.code == 404
+    finally:
+        srv.stop()
+
+
+def _wav_stub() -> str:
+    """给上面那个用例造一个临时 wav（用 tmp_path 会跟 fixture 搅在一起）。"""
+    import tempfile
+
+    d = tempfile.mkdtemp()
+    p = Path(d) / "s.wav"
+    p.write_bytes(b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00"
+                  b"\x01\x00\x01\x00\x44\xac\x00\x00\x88\x58\x01\x00"
+                  b"\x02\x00\x10\x00data\x00\x00\x00\x00")
+    return str(p)

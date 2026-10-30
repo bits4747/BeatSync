@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.5.1**. Every release bumps the version
+**Versioning rules**: current version **1.6.0**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,37 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `packaging/BeatSync.iss`.
+
+---
+
+## [1.6.0] — 2026-10-30
+
+### Added
+
+- **Preview any track from its row.** Each row now has a play button: click to
+  play, click again to stop, and starting another track stops the previous one
+  (no overlapping playback). Tap tempo only makes sense while the music is
+  playing, so without a play button users had to hunt the song down in another
+  player and switch back to count beats. Playback is served over a loopback
+  address, supports seeking, and only serves files registered from the list —
+  it is not a generic file-read endpoint.
+- **The tap button now says "Tap tempo"** instead of showing a bare note icon
+  that nobody could identify. The first click also explains itself: "hit play
+  on the left first" when nothing is playing, "playing — tap along" otherwise.
+
+### Changed
+
+- **Original tempo is per track only.** The global "Original BPM (blank =
+  auto-detect)" field in the right-hand panel is gone (old: global default plus
+  per-track overrides → new: per-track only). Having both made it unclear which
+  one was in effect, and once per-track existed the global box was rarely used.
+- **"Sections" only counts as active when something is filled in.** Previously,
+  merely opening the sections button left it highlighted as "section speed
+  active" even with no rows filled. Now the button highlights only when at
+  least one section is actually filled, and the badge reads "N section(s)
+  filled". Opening it without filling anything means no effect (auto-detect
+  still applies) and no longer triggers a "section 1 is invalid" error when you
+  press Start.
 
 ---
 

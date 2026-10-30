@@ -96,21 +96,15 @@ try {
       <div class="card-head"><h2 data-t="cardSettings">转换设置</h2></div>
       <div class="settings-body">
 
-        <!-- 第 1 行：目标速度 + 原速 -->
-        <div class="grid2">
-          <div class="field">
-            <label><span data-t="labelTarget">目标速度</span> <em>BPM</em></label>
-            <div class="stepper">
-              <button id="bpmMinus" type="button" aria-label="减少" data-aria-zh="减少" data-aria-en="Decrease">−</button>
-              <input id="targetBpm" type="number" min="20" max="300" step="0.1" value="180">
-              <button id="bpmPlus" type="button" aria-label="增加" data-aria-zh="增加" data-aria-en="Increase">＋</button>
-            </div>
+        <!-- 第 1 行：目标速度（原速改成逐曲设置，见每首歌那一行） -->
+        <div class="field">
+          <label><span data-t="labelTarget">目标速度</span> <em>BPM</em></label>
+          <div class="stepper">
+            <button id="bpmMinus" type="button" aria-label="减少" data-aria-zh="减少" data-aria-en="Decrease">−</button>
+            <input id="targetBpm" type="number" min="20" max="300" step="0.1" value="180">
+            <button id="bpmPlus" type="button" aria-label="增加" data-aria-zh="增加" data-aria-en="Increase">＋</button>
           </div>
-          <div class="field">
-            <label><span data-t="labelSource">原速</span> <em>BPM</em> <span class="hint" data-t="hintAuto">留空 = 自动检测</span></label>
-            <input id="manualBpm" class="text-in" type="number" min="20" max="300" step="0.1"
-                   placeholder="自动检测" data-ph-zh="自动检测" data-ph-en="Auto-detect" autocomplete="off">
-          </div>
+          <span class="hint" data-t="hintSourcePer">原速请在每首歌那一行单独填写（留空 = 自动检测）</span>
         </div>
 
         <!-- 第 2 行：变速上限两个输入框 -->

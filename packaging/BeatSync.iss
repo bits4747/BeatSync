@@ -24,7 +24,7 @@
 
 #define MyAppName "BeatSync"
 #define MyAppNameCN "BeatSync 音乐速度转换器"
-#define MyAppVersion "1.5.1"
+#define MyAppVersion "1.6.0"
 #define MyAppExeName "BeatSync.exe"
 ; AppId 的裸 GUID（不带 [Setup] 里那两个转义花括号），供 [Code] 拼注册表键名用。
 #define MyAppId "C09E041D-E804-46F0-BCFA-9C30E400446F"

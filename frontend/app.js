@@ -42,6 +42,7 @@ const ZH = {
   labelTarget: "目标速度",
   labelSource: "原速",
   hintAuto: "留空 = 自动检测",
+  hintSourcePer: "原速请在每首歌那一行单独填写（留空 = 自动检测）",
   labelLimit: "变速上限",
   labelMaxSlow: "最多放慢",
   labelMaxFast: "最多加快",
@@ -117,12 +118,16 @@ const ZH = {
   revealTip: "在资源管理器中显示",
   removeTip: "移除",
   previewTip: "试听",
+  previewFail: "这首放不出来（格式不支持，或文件已被移动）",
 
   // 逐曲手动设置
   perLabel: "原速",
   perAuto: "自动",
   perTip: "只对这一首生效；留空则自动检测",
   tapTip: "跟着音乐点这个按钮（至少 3 下），按你点击的间隔算 BPM",
+  tapLabel: "Tap 测速",
+  tapPlaying: "正在播放，跟着拍子点",
+  tapNoPlay: "先点左边的播放按钮放歌，再跟着拍子点",
   tapNeed: "至少要连点 3 下才算得出 BPM",
   tapDone: "按你的点击算出 {n} BPM",
   segOpen: "多段",
@@ -135,6 +140,7 @@ const ZH = {
   segBad: "第 {n} 段的时间或 BPM 填得不对",
   segOrder: "第 {n} 段的结束时间要比上一段更靠后",
   segOn: "分段变速生效中",
+  segFilled: "已填 {n} 段",
   resetPer: "恢复自动",
   perBad: "这一首的原速 BPM 要在 1–1000 之间",
   timbreLoad: "载入…",
@@ -173,6 +179,7 @@ const EN = {
   labelTarget: "Target tempo",
   labelSource: "Original tempo",
   hintAuto: "Leave blank to auto-detect",
+  hintSourcePer: "Set the original tempo per track (blank = auto-detect)",
   labelLimit: "Speed change limit",
   labelMaxSlow: "Max slowdown",
   labelMaxFast: "Max speed-up",
@@ -247,11 +254,15 @@ const EN = {
   revealTip: "Show in File Explorer",
   removeTip: "Remove",
   previewTip: "Preview",
+  previewFail: "Cannot play this track (unsupported format, or the file moved)",
 
   perLabel: "Original tempo",
   perAuto: "Auto",
   perTip: "Applies to this file only; leave blank to auto-detect",
   tapTip: "Tap along with the music (at least 3 times); the BPM comes from your tap intervals",
+  tapLabel: "Tap tempo",
+  tapPlaying: "Playing — tap along",
+  tapNoPlay: "Hit play on the left first, then tap along",
   tapNeed: "Tap at least 3 times to get a BPM",
   tapDone: "{n} BPM from your taps",
   segOpen: "Sections",
@@ -264,6 +275,7 @@ const EN = {
   segBad: "Section {n}: the time or BPM is not valid",
   segOrder: "Section {n} must end after the previous one",
   segOn: "Manual sections active",
+  segFilled: "{n} section(s) filled",
   resetPer: "Back to auto",
   perBad: "The original tempo for this file must be between 1 and 1000",
   timbreLoad: "Load…",
@@ -289,6 +301,7 @@ const state = {
   bridge: null,
   mock: false,
   previewAudio: null,
+  playing: null,      // {item, audio, btn}：正在试听的那一首（同时只允许一首）
   lang: "zh",         // 当前界面语言；默认中文
   // 用户导入的自定义节拍器音色：{ "import:完整路径": "显示名" }
   // 与 ui_prefs 里的 customTimbres 对应（换机器/换路径时那条就失效了，
@@ -385,6 +398,7 @@ const realBridge = () => ({
   selectOutDir: () => window.pywebview.api.select_out_dir(),
   expand: (paths) => window.pywebview.api.expand(paths),
   preview: (t) => window.pywebview.api.preview_timbre(t),
+  audioUrl: (path) => window.pywebview.api.audio_url(path),
   // 第三个参数 roots（每个文件所属的根）**必须透传**：后端靠它在指定输出目录时
   // 重建原文件夹层级。少了它，后端会把每个文件当成单独添加（根=各自父目录）→ 全平铺。
   // 第四个参数 perFile（逐曲覆盖）同理必须透传，且与 paths 一一对应。
@@ -419,6 +433,8 @@ function mockBridge() {
     selectOutDir: async () => "D:\\音乐\\已转换",
     expand: async (paths) => ["D:\\音乐\\待转换\\A.mp3", "D:\\音乐\\待转换\\B.wav", "D:\\音乐\\待转换\\C.flac"],
     preview: async (t) => { beep(t === "beep" ? 1000 : 900, 0.18); return ""; },
+    // 预览模式没有后端解码服务，直接告诉前端放不了（点了会弹提示，不会静默）
+    audioUrl: async () => ({ ok: false, error: t("previewFail") }),
     // 与真实桥接签名一致（第三个参数 roots 也要收下），预览模式下存到
     // window.__lastRoots，便于在浏览器里核对"根是否真的传到了后端"。
     start: (paths, opts, roots, perFile) => {
@@ -722,6 +738,52 @@ function fileRow(item) {
 const TAP_RESET = 3000;
 const TAP_MIN_GAP = 200;
 
+/* ---------------- 逐曲试听 ---------------- */
+// 同一时刻只播一首：点第二首的播放会先把上一首停掉，否则两首歌叠在一起没法跟着点。
+function stopPlayback() {
+  const a = state.playing;
+  if (!a) return;
+  a.audio.pause();
+  a.audio.src = "";
+  state.playing = null;
+  if (a.btn) {
+    a.btn.classList.remove("on");
+    a.btn.innerHTML = PLAY_ICON;
+  }
+}
+
+const PLAY_ICON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>';
+const STOP_ICON = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" stroke="none"><rect x="7" y="6" width="10" height="12" rx="1.5"/></svg>';
+
+async function togglePlay(item, btn) {
+  // 已经在放这首 → 停下来
+  if (state.playing && state.playing.item === item) {
+    stopPlayback();
+    return;
+  }
+  stopPlayback();
+  const r = await state.bridge.audioUrl(item.path);
+  if (!r || !r.ok) {
+    toast(r && r.error ? r.error : t("previewFail"), true);
+    return;
+  }
+  const audio = new Audio(r.url);
+  audio.preload = "auto";
+  audio.onended = () => stopPlayback();
+  audio.onerror = () => { stopPlayback(); toast(t("previewFail"), true); };
+  try {
+    await audio.play();
+  } catch (e) {
+    toast(t("previewFail"), true);
+    return;
+  }
+  state.playing = { item, audio, btn };
+  if (btn) {
+    btn.classList.add("on");
+    btn.innerHTML = STOP_ICON;
+  }
+}
+
 function tapTempo(item, chip) {
   const now = performance.now();
   const st = item._tap || (item._tap = { ts: [], last: 0 });
@@ -730,7 +792,9 @@ function tapTempo(item, chip) {
     st.last = now;
     chip.classList.add("tapping");
     setTimeout(() => chip.classList.remove("tapping"), 400);
-    toast(t("tapTip"));
+    // 第一次点击先告诉用户该怎么用：没在放歌就提示先去点播放（tap 必须跟着音乐才有意义）
+    const playing = state.playing && state.playing.item === item;
+    toast(t(playing ? "tapPlaying" : "tapNoPlay"));
     return;
   }
   st.ts.push(now);
@@ -782,33 +846,61 @@ function perEditor(item) {
     saveSettings();
   };
 
+  // 试听播放按钮：tap 测速必须先放歌才跟得上拍子，所以按钮放在 tap 左边
+  const play = document.createElement("button");
+  play.type = "button";
+  play.className = "fi-btn per-play";
+  play.title = t("previewTip");
+  play.innerHTML = '<svg viewBox="0 0 24 24" width="13" height="13" fill="currentColor" stroke="none"><path d="M8 5v14l11-7z"/></svg>';
+  play.onclick = (ev) => { ev.stopPropagation(); togglePlay(item, play); };
+
   const tap = document.createElement("button");
   tap.type = "button";
   tap.className = "fi-btn per-tap";
   tap.title = t("tapTip");
-  tap.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>';
+  tap.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg><span class="tap-txt"></span>';
+  tap.querySelector(".tap-txt").textContent = t("tapLabel");
   tap.onclick = (ev) => { ev.stopPropagation(); tapTempo(item, tap); };
 
   const segBtn = document.createElement("button");
   segBtn.type = "button";
-  segBtn.className = "btn ghost xs per-seg" + (item.segs ? " on" : "");
+  segBtn.className = "btn ghost xs per-seg" + (segFilled(item) ? " on" : "");
   segBtn.textContent = item.segOpen ? t("segClose") : t("segOpen");
   segBtn.title = t("segTitle");
   segBtn.onclick = (ev) => {
     ev.stopPropagation();
     item.segOpen = !item.segOpen;
+    // 点开只是展开编辑区，**不代表分段生效**——一行都没填就不该亮徽标，
+    // 否则用户会以为已经按分段在变速了（实际仍走自动检测）。
     if (item.segOpen && !item.segs) item.segs = [{ t1: "", bpm: "" }];
     renderFiles();
   };
 
-  box.append(label, input, tap, segBtn);
-  if (item.segs) {
+  box.append(label, input, play, tap, segBtn);
+  // 徽标只在**真的填了**分段时出现：点开「多段」但没填内容，不算生效。
+  const n = segFilled(item);
+  if (n) {
     const badge = document.createElement("span");
     badge.className = "per-badge";
-    badge.textContent = t("segOn");
+    badge.textContent = t("segFilled", { n });
+    badge.title = t("segOn");
     box.appendChild(badge);
   }
   return box;
+}
+
+/* 已经填了内容的段数（结束时间和 BPM 都有才算一段）。
+   注意：最后一段的结束时间允许留空（表示一直到结尾），所以那一行只要有 BPM 就算填了。 */
+function segFilled(item) {
+  if (!item.segs || !item.segs.length) return 0;
+  let n = 0;
+  item.segs.forEach((s, i) => {
+    const hasBpm = String(s.bpm == null ? "" : s.bpm).trim() !== "";
+    const hasEnd = String(s.t1 == null ? "" : s.t1).trim() !== "";
+    const last = i === item.segs.length - 1;
+    if (hasBpm && (hasEnd || last)) n++;
+  });
+  return n;
 }
 
 function segEditor(item) {
@@ -914,6 +1006,8 @@ function perFilePayload(item) {
       const n = i + 1;
       const rawEnd = String(s.t1 == null ? "" : s.t1).trim();
       const rawBpm = String(s.bpm == null ? "" : s.bpm).trim();
+      // 整行都空 = 用户只是点开了「多段」还没填，不算生效也不算错误（与 segFilled 一致）
+      if (rawEnd === "" && rawBpm === "") continue;
       const bv = parseFloat(rawBpm);
       if (!(bv > 0) || bv > 1000) return { error: t("segBad", { n }) };
       if (rawEnd === "") {
@@ -957,7 +1051,6 @@ function readOptions() {
   const timbre = (document.querySelector(".timbre.on") || {}).dataset?.v || "woodblock";
   return {
     target: $("#targetBpm").value,
-    manualBpm: $("#manualBpm").value.trim(),
     detectOnly: $("#detectOnly").checked,
     segments: $("#segments").checked ? "auto" : "off",
     engine: document.querySelector("#engineSeg .on")?.dataset.v || "phasevocoder",
@@ -982,7 +1075,6 @@ function loadSettings() {
   let s = {};
   try { s = JSON.parse(localStorage.getItem("tmc-settings") || "{}"); } catch (e) { }
   if (s.target) $("#targetBpm").value = s.target;
-  if (s.manualBpm) $("#manualBpm").value = s.manualBpm;
   if (s.detectOnly) $("#detectOnly").checked = true;
   // 默认开启（自动分段）。旧版本存的是布尔 false（那时默认就是关），不能当成
   // 「用户主动关掉」——只有新版存下的字符串 "off"/"0" 才算显式关闭。
@@ -1261,12 +1353,7 @@ async function startRun() {
     if (!isFinite(tv)) { toast(t("needTarget"), true); return; }
     if (!(tv > 0)) { toast(t("needTarget"), true); return; }
   }
-  // 原速 BPM：留空 = 自动检测；填了就必须是 1–1000 的正数。
-  // 以前这项只在后端校验，用户点了「开始」才看到报错——现在先在界面上拦住。
-  if (opts.manualBpm !== "") {
-    const mv = parseFloat(opts.manualBpm);
-    if (!(mv > 0) || mv > 1000) { toast(t("perBad"), true); return; }
-  }
+  // 原速 BPM 已改为逐曲填写（每首歌那一行），逐曲值在下面 perFilePayload 里校验。
   // 有勾选 → 只处理勾选的；没勾选 → 处理全部
   const sel = selList();
   const list = sel.length ? sel : [...state.files.values()];
@@ -1443,7 +1530,6 @@ function bindUI() {
 
   $("#detectOnly").onchange = saveSettings;
   $("#segments").onchange = saveSettings;
-  $("#manualBpm").onchange = saveSettings;
 
   // 音色渲染与试听（抽成 renderTimbres，切换语言时整块重刷）
   renderTimbres();

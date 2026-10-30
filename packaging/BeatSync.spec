@@ -31,6 +31,9 @@ hiddenimports += ['tempo_converter_gui', 'tkinter', 'tkinter.ttk', 'tkinter.mess
 # import 期按字符串**动态导入**，静态分析抓不到。漏了它，打包版会在 import librosa
 # 阶段抛「cannot cache function '__o_fold': no locator available」而失去转换能力。
 hiddenimports += ['numba_locator']
+# 试听用的本机回环 HTTP 服务。静态 import 本来就能被分析到，这里显式声明是为了
+# 万一将来改成函数内 import 也不会静默丢掉（丢了的表现是点播放按钮毫无反应）。
+hiddenimports += ['audio_server']
 tmp_ret = collect_all('librosa')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('numba')

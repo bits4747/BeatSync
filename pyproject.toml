@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beatsync"
-version = "1.5.1"
+version = "1.6.0"
 description = "把音乐变速到目标 BPM，并叠加精确对齐的节拍器"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -50,7 +50,7 @@ beatsync = "tempo_converter:main"
 # 桌面版找不到 index.html 直接起不来。
 # numba_locator 是 numba 的自定义缓存定位器，numba 按字符串动态导入它，
 # 不在这个列表里的话 pip 装出来的版本导入 librosa 会失败。
-py-modules = ["tempo_converter", "tempo_converter_app", "tempo_converter_gui", "tray_icon", "numba_locator"]
+py-modules = ["tempo_converter", "tempo_converter_app", "tempo_converter_gui", "tray_icon", "numba_locator", "audio_server"]
 
 [tool.setuptools.data-files]
 # 装到 <prefix>/frontend 与 <prefix>/assets。tempo_converter_app._resource_dir()

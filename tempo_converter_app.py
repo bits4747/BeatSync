@@ -27,6 +27,8 @@ import time
 import traceback
 from pathlib import Path
 
+import audio_server
+
 # ---------------------------------------------------------------------------
 # numba 缓存目录：**必须在 import librosa/numba 之前**设置。
 #
@@ -249,6 +251,9 @@ _TRAY_OK, _TRAY_WHY = tray_icon.probe_available()
 # 与「从托盘菜单选的退出」——后者必须真的让窗口关掉，不能又被拦回来。
 TRAY = tray_icon.TrayCradle(icon_path=None, lang="zh")
 _QUITTING = False
+
+# 试听播放用的本机服务。懒启动：用户不点播放就一个线程都不开。
+PREVIEW = audio_server.PreviewServer()
 
 
 def _custom_timbre_list(prefs) -> list:
@@ -707,6 +712,22 @@ class Api:
         self.stop_event.set()
         return True
 
+    # ---------- 试听 ----------
+    def audio_url(self, path, lang=None):
+        """给界面一个能播放的地址（本机回环 HTTP，支持拖动进度条）。
+
+        为什么不让前端直接用 `file://`：界面本身是 file:// 加载的，再喂一个
+        file:// 音频会被 WebView2 的跨源策略拒掉；中文路径还要百分号编码。
+        这里只登记**用户列表里已有的文件**，服务端也只服务登记过的绝对路径。
+        """
+        L = lang or tc.get_lang()
+        url = PREVIEW.register(path)
+        if not url:
+            return {"ok": False, "error": tc.tr(
+                "这个文件没法试听（格式不支持或文件已不在）",
+                "Cannot preview this file (unsupported format or missing)", L)}
+        return {"ok": True, "url": url}
+
     # ---------- 关闭到托盘 ----------
     def get_ui_prefs(self, lang=None):
         """前端启动时读一次当前偏好（含托盘能不能用），用来决定开关是否置灰。"""
@@ -984,6 +1005,7 @@ def main() -> int:
     webview.start(icon=_icon_path())
     # 主循环退出后清一下托盘，防止非 daemon 的 pystray 线程把进程挂住。
     TRAY.stop()
+    PREVIEW.stop()
     return 0
 
 
