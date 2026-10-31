@@ -5,7 +5,7 @@ English | [中文](CHANGELOG.md)
 This project follows [Semantic Versioning](https://semver.org/).
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-**Versioning rules**: current version **1.7.0**. Every release bumps the version
+**Versioning rules**: current version **1.7.1**. Every release bumps the version
 and adds a section below:
 
 - `1.0.x` — bug fixes only; no behaviour or output changes
@@ -16,6 +16,48 @@ and adds a section below:
 The same version number must stay consistent in three places: this file,
 `version` in `pyproject.toml`, and `MyAppVersion` in the installer script
 `packaging/BeatSync.iss`.
+
+---
+
+## [1.7.1] — 2026-11-01
+
+### Fixed
+
+- **Steady-tempo tracks are no longer split into multiple sections.** A real
+  track whose two halves differ by only 1.14× (87.0 and 76.0 BPM) was being cut
+  into 5 sections, each stretched at a different rate; the metronome's click
+  density doubled at the seams, which sounds like "the same song speeding up and
+  slowing down". It is now processed at a single tempo.
+- The root cause has two layers. First, **tempo detection lands on octave
+  layers**: librosa's estimator carries a prior that pulls toward 120 BPM, so the
+  same music can read 87.0 or 152.0 (exactly 2×). The old "is the difference
+  between sections big enough to be worth splitting" check compared raw numbers,
+  so 87 versus 152 gave a ratio of 1.76, sailing past the 1.15 threshold — the
+  two octave layers of one beat were treated as a real tempo change. Sections are
+  now folded into a single octave band (`_fold_to_band`, exactly one octave wide)
+  before comparing: 86.26 vs 76.04 gives 1.135, below the threshold, so the
+  track is not split.
+- Second, **per-section detection itself can land on non-integer ratios**: over
+  the same intervals `detect_tempo` reported 130.31 and 126.34, while the onset
+  autocorrelation (which uses no prior at all) reported 87.43 and 75.88 — the
+  former are 3/2 artefacts. Sections of at least 30 seconds are now cross-checked
+  against the autocorrelation (`_ac_tempo`); if the autocorrelation peak is high
+  enough (≥ 0.20) and the two are not on the same layer or an adjacent octave
+  layer (`_tempo_layer_agrees` accepts only ×2 and ÷2), the section is treated as
+  unreliable and merged into its neighbour.
+- **Real tempo changes are unaffected**: 100→140 and 90→150 are still split into
+  two sections. The two new tests are a pair — one guards against "should have
+  merged but didn't", the other against "should have split but got merged". On
+  the same 13-track album, the other 12 tracks produce identical section plans
+  before and after the fix.
+- Three long-dormant issues were fixed along the way: the merge loop in
+  `_segment_plans` was capped at 8 rounds (a 29-section track ran out of rounds
+  with 21 sections still left, so the sections that actually needed merging never
+  got their turn — the cap now scales with the section count); only one merge per
+  round became "merge everything that qualifies in one round"; and when more than
+  half the sections need merging, the track collapses to a single whole-song
+  measurement instead of iterating. Together these cut this 5-minute track from
+  27 seconds of repeated detection to 19 seconds — **faster than before the fix**.
 
 ---
 

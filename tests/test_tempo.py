@@ -709,6 +709,76 @@ def test_segments_worthwhile_guard():
     assert tc._segments_worthwhile(mk(100.0)) is False
 
 
+def test_segments_worthwhile_ignores_octave_layers():
+    """同一拍子的八度层不是变拍：87 与 152、76 与 174 都不该判「值得分段」。
+
+    实测诱因：某首歌真值前半 87.0、后半 76.0（相差 1.14 倍，低于 SEG_MIN_SPREAD），
+    但测速报成 86.26 / 152.09 / 152.00 三个层，比值 1.76 直接越过 1.15 的门槛，
+    于是被切成 5 段——用户听到的就是节拍器在接缝处密度翻倍。
+    """
+    class _P:
+        def __init__(self, bpm):
+            self.bpm = bpm
+
+    def mk(*bpms):
+        return [(0.0, 1.0, _P(b)) for b in bpms]
+
+    assert tc._segments_worthwhile(mk(87.0, 152.0)) is False
+    assert tc._segments_worthwhile(mk(76.0, 174.0)) is False
+    assert tc._segments_worthwhile(mk(86.26, 152.09, 152.00)) is False
+
+
+def test_fold_to_band():
+    """_fold_to_band 只把速度折进同一八度带，不改测速结果本身。"""
+    assert abs(tc._fold_to_band(87.0, 60.0, 120.0) - 87.0) < 1e-9
+    assert abs(tc._fold_to_band(174.0, 60.0, 120.0) - 87.0) < 1e-9
+    assert abs(tc._fold_to_band(152.0, 60.0, 120.0) - 76.0) < 1e-9
+    assert abs(tc._fold_to_band(43.5, 60.0, 120.0) - 87.0) < 1e-9
+    assert tc._fold_to_band(0.0, 60.0, 120.0) == 0.0
+
+
+def test_tempo_layer_agrees_only_octaves():
+    """拍速交叉验证只认 2 的幂：×3 与 3/2 不算相容。"""
+    assert tc._tempo_layer_agrees(152.0, 76.0) is True      # 差一个八度层
+    assert tc._tempo_layer_agrees(87.0, 87.4) is True       # 同层
+    assert tc._tempo_layer_agrees(130.31, 87.43) is False   # 3/2，实测假值形态
+    assert tc._tempo_layer_agrees(180.0, 60.0) is False     # ×3
+    assert tc._tempo_layer_agrees(0.0, 87.0) is True        # 无从判定，不否决
+
+
+def test_ac_tempo_finds_true_rate():
+    """段级自相关（无 librosa 先验）在干净素材上应当直接命中真实拍速。"""
+    for bpm in (76.0, 87.0, 120.0, 152.0):
+        y = _accent_track(bpm, 30.0)
+        mel = None
+        import librosa
+        mel = np.abs(librosa.feature.melspectrogram(y=y, sr=SR, hop_length=256,
+                                                    fmax=0.5 * SR))
+        onset = librosa.onset.onset_strength(S=librosa.power_to_db(mel), sr=SR,
+                                             hop_length=256)
+        got, peak = tc._ac_tempo(onset, SR)
+        assert peak >= tc.AC_MIN_PEAK, f"{bpm} BPM 素材的自相关峰只有 {peak:.3f}"
+        assert abs(got - bpm) <= max(1.0, bpm * 0.03), f"自相关报 {got:.2f}，真值 {bpm}"
+
+
+def test_segment_plans_keeps_real_tempo_change():
+    """加自相关闸门后，真正的变拍（100→140）仍必须切成两段——不许过度合并。
+
+    与 test_segments_worthwhile_ignores_octave_layers 是一对：那条防「该并的没并」，
+    这条防「该切的被并掉」。
+    """
+    y, half = _two_section_track()
+    plans, infeasible = tc._segment_plans(y, SR, 180.0, False,
+                                          tc.DEFAULT_MAX_SLOWDOWN,
+                                          tc.DEFAULT_MAX_SPEEDUP, lang="zh")
+    assert infeasible is None
+    assert len(plans) == 2, f"100→140 应变两段，实际 {len(plans)} 段"
+    edges = [p[0] for p in plans[1:]]
+    assert min(abs(e - half) for e in edges) <= 1.0, (
+        f"边界 {[round(e, 2) for e in edges]} 偏离 {half}s 超过 1s")
+    assert tc._segments_worthwhile(plans) is True
+
+
 def test_segments_mode_normalisation():
     """opt.segments 接受 bool 与 "auto"/"on"/"off" 三态字符串。"""
     class _O:

@@ -1401,6 +1401,8 @@ def detect_tempo_segments(y_mono, sr: int, dedup_s=2.0, merge_ratio=0.10,
 
 SEG_GRID_MIN_SCORE = 1.10   # 段内拍网格「命中比」低于此值 → 认为该段拍子没跟上
 SEG_MIN_SPREAD = 1.15       # auto 模式：最快/最慢段速度比低于此值不值得分段
+AC_MIN_PEAK = 0.20          # 段级自相关峰低于此值 → 周期性不足，不采信它的估速
+AC_MIN_SEG_S = 30.0         # 段短于此值不做自相关交叉验证（短段峰太低，不可靠）
 SEG_MIN_SEG_S = 8.0         # 分段最短时长（太短的段测速不可靠，并入邻段）
 # 相邻段测得速度只差这么一点（相对）、且每拍点击数相同时，认为两段输出等价 → 合并。
 # 为什么需要：段间测速本身有 ±1~3% 抖动（同一段音乐换切点就会差这么多），不合并就会
@@ -1662,6 +1664,86 @@ def _seg_hit_frac(onset, sr: int, bpm: float, t0: float, t1: float,
     return best
 
 
+def _fold_to_band(bpm: float, lo: float, hi: float) -> float:
+    """把 bpm 折到 [lo, hi) 这个八度带内（按 2 的幂缩放）。
+
+    只用来做「速度差是否显著」的比较，不改变测速结果本身。八度层的差不是真变速：
+    同一段音乐测成 76 或 152 是同一拍子的两个层，折叠后都落在同一个数上。
+    """
+    if bpm <= 0 or lo <= 0 or hi <= lo:
+        return bpm
+    v = float(bpm)
+    while v >= hi:
+        v /= 2.0
+    while v < lo:
+        v *= 2.0
+    return v
+
+
+def _ac_tempo(onset, sr: int, hop: int = 256, lo: float = 55.0, hi: float = 200.0):
+    """段级 onset 自相关估速（无先验），返回 (bpm, peak)。
+
+    为什么需要它：`librosa.feature.tempo` 的先验是 `start_bpm=120, std_bpm=1.0`
+    （见 librosa/feature/rhythm.py 的 `logprior = -0.5*((log2(bpms)-log2(start_bpm))
+    /std_bpm)**2`），会把逐帧速度往 120 家族拉。实测一首真实曲子（前半 87.0、
+    后半 76.0）时，`detect_tempo` 对 243.5–262.1s 报 130.31、对 445.9–462.8s
+    报 126.34 —— 都是先验造成的假值；同一批区间用自相关得到 87.43 与 75.88，
+    全部落在真值层上。所以用它给 `detect_tempo` 做交叉验证。
+
+    自相关不吃先验：真拍滞后处的峰只由音乐本身决定。峰高 peak 是该滞后的归一化
+    自相关值（0~1），用来判断「这段有没有可信的周期性」——静音段、散拍段峰很低，
+    此时不该否决 `detect_tempo`（返回 peak 小，调用方不采信）。
+
+    抛物线插值把滞后精修到亚帧，5 分钟曲的整段估速仍在毫秒级。
+    """
+    seg = np.asarray(onset, dtype=np.float64)
+    if seg.size < 32:
+        return 0.0, 0.0
+    seg = seg - float(seg.mean())
+    energy = float(np.dot(seg, seg))
+    if energy <= 1e-12:
+        return 0.0, 0.0
+    fps = sr / hop
+    lag_lo = max(2, int(round(fps * 60.0 / hi)))
+    lag_hi = min(seg.size - 2, int(round(fps * 60.0 / lo)))
+    if lag_hi <= lag_lo:
+        return 0.0, 0.0
+    # 用 FFT 算整条自相关再切片：直接对每个滞后做点积是 O(n·lag) 的纯 Python 循环，
+    # 5 分钟曲（约 5 万帧）光这一项就要几秒；FFT 是 O(n log n)，结果逐位等价。
+    n_fft = 1 << int(np.ceil(np.log2(2 * seg.size)))
+    spec = np.fft.rfft(seg, n=n_fft)
+    ac_full = np.fft.irfft(spec * np.conj(spec), n=n_fft)[:seg.size]
+    ac = ac_full[lag_lo:lag_hi + 1] / energy
+    best = (-2.0, 0.0)
+    for i in range(1, ac.size - 1):
+        if ac[i] < ac[i - 1] or ac[i] < ac[i + 1] or ac[i] <= best[0]:
+            continue
+        denom = ac[i - 1] - 2.0 * ac[i] + ac[i + 1]
+        off = 0.5 * (ac[i - 1] - ac[i + 1]) / denom if abs(denom) > 1e-12 else 0.0
+        lag = (lag_lo + i) + off
+        if lag > 0:
+            best = (float(ac[i]), 60.0 * fps / lag)
+    if best[0] <= 0:
+        return 0.0, 0.0
+    return float(best[1]), float(best[0])
+
+
+def _tempo_layer_agrees(bpm: float, ac_bpm: float, tol: float = 0.05) -> bool:
+    """`detect_tempo` 的 bpm 与自相关值是否相容（同层，或差一个八度层）。
+
+    只认倍频关系（×2、÷2）：倍频层的拍点集互为子集，每拍点击数能补回来，所以
+    「测成 152 而真值 76」仍算相容（v1.1.0 定则：家族内低层最接近真实拍速，
+    但这里只做验证、不改层）。×3/÷3 与 3/2 这类分数关系会让点击错频，不算相容
+    ——实测假值 130.31 与真值 87.43 正好是 1.49≈3/2，必须被识别为不相容。
+    """
+    if bpm <= 0 or ac_bpm <= 0:
+        return True                       # 无从判定，不否决
+    for k in (1.0, 0.5, 2.0):
+        if abs(ac_bpm / (bpm * k) - 1.0) <= tol:
+            return True
+    return False
+
+
 def _segments_mode(opt) -> str:
     """把 opt.segments（bool 或 "auto"/"on"/"off"）规整成三态字符串。
 
@@ -1688,11 +1770,20 @@ def _segments_worthwhile(plans) -> bool:
 
     分段会对每段各做一次变速与拼接，本身有代价（接缝、音质）；只差百分之几的
     「速度漂移」不值得切，宁可整曲单速。
+
+    比较前先把每段速度折到**同一个八度内**（`_fold_to_band(v, 60.0, 120.0)`）：
+    八度层的差不是真变速。实测某首 87.0 → 76.0 的曲子被切成 86.26 与 152.09
+    两段时，裸比值 1.763 直接越过 1.15 的门槛；折叠到同一八度后是 86.26 与
+    76.04（比值 1.135），门槛才看的是音乐本身快慢，而不是测速落在哪一层。
+    带子必须正好一个八度宽：任何比它宽的带里，同一对速度仍可能跨两个层。
     """
     bpms = [sp.bpm for (_t0, _t1, sp) in plans if sp is not None]
     if len(bpms) < 2:
         return False
-    lo, hi = min(bpms), max(bpms)
+    folded = [_fold_to_band(v, 60.0, 120.0) for v in bpms if v > 0]
+    if len(folded) < 2:
+        return False
+    lo, hi = min(folded), max(folded)
     return lo > 0 and (hi / lo) >= SEG_MIN_SPREAD
 
 
@@ -1794,6 +1885,8 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
 
     infos = []
     detected_cache = {}
+    score_cache = {}
+    ac_cache = {}
 
     def _detect_seg(a: int, b: int):
         """同一段音频（同一 a/b 切片）只测一次速。
@@ -1814,7 +1907,33 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
             detected_cache[key] = got
         return got
 
-    for _round in range(8):
+    def _score_seg(t0: float, t1: float, beats_rel):
+        """同一区间只算一次网格得分（与 _detect_seg 同理，未合并的段结果不变）。
+
+        beats_rel 是**相对段首**的拍点，绝对时间在这里由 t0 补上——调用方不要再加一次。
+        """
+        key = (round(t0, 3), round(t1, 3))
+        got = score_cache.get(key)
+        if got is None:
+            got = _seg_align_score(onset, rms, sr, np.asarray(beats_rel) + t0, t0, t1)
+            score_cache[key] = got
+        return got
+
+    def _ac_seg(t0: float, t1: float):
+        """同一区间的自相关估速只算一次（与 _detect_seg 同理）。"""
+        key = (round(t0, 3), round(t1, 3))
+        got = ac_cache.get(key)
+        if got is None:
+            fa = int(round(t0 * sr / 256))
+            fb = max(fa + 1, int(round(t1 * sr / 256)))
+            got = _ac_tempo(onset[fa:fb], sr)
+            ac_cache[key] = got
+        return got
+
+    # 每轮只合并一段，所以轮数上限必须随初始段数走：固定 8 轮时，29 段的曲子在
+    # 第 8 轮还剩 21 段就被迫退出，真正的弱段（往往排在后面）根本没轮到。
+    # 上限取 2*len(segs)+8 足够收敛（每轮至少消掉一段，实际远早于此退出）。
+    for _round in range(2 * len(segs) + 8):
         infos = []
         for (t0, t1) in segs:
             a, b = int(t0 * sr), int(t1 * sr)
@@ -1824,7 +1943,7 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
                     if bpm > 0 else None)
             infos.append({"t0": t0, "t1": t1, "bpm": float(bpm), "beats": rel,
                           "plan": plan,
-                          "score": _seg_align_score(onset, rms, sr, rel + t0, t0, t1)})
+                          "score": _score_seg(t0, t1, rel)})
         if len(infos) < 2:
             break
         # 快速通道：首轮各段都有可行方案时，先做一次「同家族来回抖动」判定。
@@ -1843,35 +1962,80 @@ def _segment_plans(y_mono, sr: int, target: float, strict: bool = False,
         bad_plan = [i for i, s in enumerate(infos) if s["plan"] is None]
         if bad_plan and not merge_infeasible:
             break                     # on 模式：越限即整首跳过，不做合并
-        weak = [i for i, s in enumerate(infos) if s["score"] < SEG_GRID_MIN_SCORE]
-        if bad_plan:
-            i = bad_plan[0]
-        elif weak:
-            i = min(weak, key=lambda k: infos[k]["score"])
-        else:
+        # 速度不可信的段（自相关与 detect_tempo 不相容）与弱网格段一样并入邻段：
+        # 分段的前提是「每段的速度都测对了」，测错的段留着只会让接缝处速度跳变。
+        # 自相关只在够长的段上可靠（短段的峰普遍只有 0.1~0.2），所以短段一律放行。
+        weak = []
+        for i, s in enumerate(infos):
+            if s["score"] < SEG_GRID_MIN_SCORE:
+                weak.append(i)
+                continue
+            if (s["t1"] - s["t0"]) < AC_MIN_SEG_S:
+                continue
+            ac_bpm, ac_peak = _ac_seg(s["t0"], s["t1"])
+            if ac_peak >= AC_MIN_PEAK and not _tempo_layer_agrees(s["bpm"], ac_bpm):
+                weak.append(i)
+        if not bad_plan and not weak:
             break
-        # 选并入方向：越限段看速度是否更接近；弱网格段看邻段网格是否更可信
-        cand = []
-        if i > 0:
-            if infos[i]["plan"] is None:
-                d = abs(math.log2(infos[i]["bpm"] / infos[i - 1]["bpm"])) \
-                    if infos[i]["bpm"] > 0 and infos[i - 1]["bpm"] > 0 else 0.0
-            else:
-                d = -infos[i - 1]["score"]
-            cand.append((d, i - 1))
-        if i < len(infos) - 1:
-            if infos[i]["plan"] is None:
-                d = abs(math.log2(infos[i]["bpm"] / infos[i + 1]["bpm"])) \
-                    if infos[i]["bpm"] > 0 and infos[i + 1]["bpm"] > 0 else 0.0
-            else:
-                d = -infos[i + 1]["score"]
-            cand.append((d, i + 1))
-        if not cand:
+        # 过半的段都该并 → 直接并成整曲，一次测速定案。
+        # 逐轮并要跑 log2(段数) 轮，而每轮的段越来越长（最后一轮就是整曲），
+        # 实测 29 段的曲子要额外 27 次测速、累计重测 91 分钟音频（曲长才 9.6 分钟），
+        # 全是同一段音乐被反复测。过半的段都不成立时结论注定是「整曲一层」，
+        # 跳到最后一步即可；真正变拍的曲子里各段速度都对得上，不会过半，走正常路径。
+        if len(set(bad_plan) | set(weak)) * 2 > len(infos):
+            a, b = int(round(infos[0]["t0"] * sr)), int(round(infos[-1]["t1"] * sr))
+            bpm, beats = _detect_seg(a, b)
+            plan = (choose_stretched_tempo(bpm, target, strict, max_slowdown, max_speedup)
+                    if bpm > 0 else None)
+            if plan is None:
+                # 整曲也没有可行方案 → 与「一路并到只剩一段」同形：交回单段无方案，
+                # 由调用方决定跳过还是按整曲处理（on 模式下就是跳过整首）。
+                return [(0.0, total, None)], None
+            return [(infos[0]["t0"], infos[-1]["t1"],
+                     SegmentPlan(infos[0]["t0"], infos[-1]["t1"], float(bpm),
+                                 np.asarray(beats, dtype=np.float64), plan))], None
+        # 一轮把**所有**该并的段都并掉，而不是只并一段。
+        # 为什么：每并一次都要对合并后的段重新测速（`_detect_seg`），而测速是这里
+        # 最贵的一步（5 分钟曲单次最长 3 秒）。原来每轮只并一段，29 段的曲子要跑
+        # 二十多轮、同一批长段被反复重测，实测 31 秒里 26 秒耗在重复测速上。
+        # 一次扫完相邻该并的段，轮数从「段数级」降到「几个」，结果不变——因为
+        # 判据只看当前各段自己的分数与速度，不依赖别的段先并完。
+        todo = sorted(set(bad_plan) | set(weak))
+        drop = set()
+        joins = []
+        for i in todo:
+            if i in drop:
+                continue
+            # 选并入方向：越限段看速度是否更接近；弱网格段看邻段网格是否更可信
+            cand = []
+            if i > 0 and (i - 1) not in drop:
+                if infos[i]["plan"] is None:
+                    d = abs(math.log2(infos[i]["bpm"] / infos[i - 1]["bpm"])) \
+                        if infos[i]["bpm"] > 0 and infos[i - 1]["bpm"] > 0 else 0.0
+                else:
+                    d = -infos[i - 1]["score"]
+                cand.append((d, i - 1))
+            if i < len(infos) - 1:
+                if infos[i]["plan"] is None:
+                    d = abs(math.log2(infos[i]["bpm"] / infos[i + 1]["bpm"])) \
+                        if infos[i]["bpm"] > 0 and infos[i + 1]["bpm"] > 0 else 0.0
+                else:
+                    d = -infos[i + 1]["score"]
+                cand.append((d, i + 1))
+            if not cand:
+                continue
+            j = min(cand)[1]
+            lo, hi = min(i, j), max(i, j)
+            # 同一轮里已经参与过合并的段不再动：合并会改掉它的速度与得分，
+            # 拿旧值再判一次没有意义（下一轮会重新测）。
+            if any(k in drop for k in range(lo, hi + 1)):
+                continue
+            drop.update(range(lo, hi + 1))
+            joins.append((infos[lo]["t0"], infos[hi]["t1"]))
+        if not joins:
             break
-        j = min(cand)[1]
-        lo, hi = min(i, j), max(i, j)
-        segs = sorted([(s["t0"], s["t1"]) for k, s in enumerate(infos) if k not in (lo, hi)]
-                      + [(infos[lo]["t0"], infos[hi]["t1"])])
+        segs = sorted([(s["t0"], s["t1"]) for k, s in enumerate(infos) if k not in drop]
+                      + joins)
 
     if len(infos) < 2:
         return [(0.0, total, None)], None
